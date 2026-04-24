@@ -1,9 +1,9 @@
 # ===== CELL 2 =====
 # B2 — Init folders
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
-import torch
 import os
+import torch
 from pathlib import Path
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
 DRIVE_ROOT = "/content/drive/MyDrive/video_auto_project/jobs"
 
