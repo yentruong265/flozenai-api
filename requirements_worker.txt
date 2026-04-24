@@ -1,0 +1,17 @@
+requests
+boto3
+pillow
+numpy
+opencv-python-headless
+moviepy
+edge-tts
+openai
+torch
+diffusers
+transformers
+accelerate
+safetensors
+sentencepiece
+imageio
+imageio-ffmpeg
+nest_asyncio
