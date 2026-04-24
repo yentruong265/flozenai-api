@@ -1,5 +1,7 @@
 # ===== CELL 2 =====
 # B2 — Init folders
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+import torch
 import os
 from pathlib import Path
 
