@@ -1,3 +1,4 @@
+import runpod
 import os
 import shutil
 import tempfile
@@ -140,3 +141,9 @@ def handler(event):
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ===== RUNPOD ENTRYPOINT (CỰC QUAN TRỌNG) =====
+runpod.serverless.start({
+    "handler": handler
+})

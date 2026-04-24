@@ -15,3 +15,4 @@ sentencepiece
 imageio
 imageio-ffmpeg
 nest_asyncio
+runpod
