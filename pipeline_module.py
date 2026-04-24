@@ -603,6 +603,8 @@ import math
 import shutil
 import random
 import asyncio
+import nest_asyncio
+nest_asyncio.apply()
 import numpy as np
 import torch
 import edge_tts
@@ -1380,6 +1382,24 @@ async def save_tts(
     return meta
 
 
+
+def run_async_safely(coro):
+    """
+    Run async coroutine safely inside Runpod/Jupyter/any environment
+    where an event loop may already be running.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    if loop.is_running():
+        nest_asyncio.apply(loop)
+
+    return loop.run_until_complete(coro)
+
+
 # 🔥 NEW: helper để B7 gọi 1 audio duy nhất cho toàn video
 async def generate_full_narration(plan: Dict[str, Any], output_dir: str):
     narration_text = sanitize_tts_text(plan.get("full_narration_text", ""), max_chars=4000)
@@ -1718,8 +1738,7 @@ def run_job(job_config, job_id):
         "eta_sec": max(20, total_scenes * 4),
     })
 
-    loop = asyncio.get_event_loop()
-    narration_path, narration_meta = loop.run_until_complete(
+    narration_path, narration_meta = run_async_safely(
         generate_full_narration(adaptive_plan, AUDIO_DIR)
     )
 
