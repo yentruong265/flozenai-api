@@ -255,7 +255,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
 
         # tts controls
         "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
-        "tts_pitch": _safe_str(job_config.get("tts_pitch"), "0Hz"),
+        "tts_pitch": _safe_str(job_config.get("tts_pitch"), "+0Hz"),
         "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.05, min_value=0.7, max_value=1.5),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
@@ -1326,7 +1326,7 @@ def synthesize_single_tts_openai(text, out_path, voice=None):
     }
 
 
-async def synthesize_single_tts_edge(text, out_path, rate="+0%", pitch="0Hz", edge_voice=EDGE_TTS_DEFAULT_VOICE):
+async def synthesize_single_tts_edge(text, out_path, rate="+0%", pitch="+0Hz", edge_voice=EDGE_TTS_DEFAULT_VOICE):
     text = sanitize_tts_text(text)
     if not text:
         raise ValueError("voice_text is empty")
@@ -1359,7 +1359,7 @@ async def save_tts(
         raise ValueError("voice_text is empty")
 
     rate = rate or "+0%"
-    pitch = pitch or "0Hz"
+    pitch = pitch or "+0Hz"
     selected_voice = normalize_openai_voice(voice or DEFAULT_PRIMARY_VOICE)
 
     if OPENAI_API_KEY:
