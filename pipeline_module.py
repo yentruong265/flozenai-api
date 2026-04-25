@@ -1326,7 +1326,7 @@ def synthesize_single_tts_openai(text, out_path, voice=None):
     }
 
 
-async def synthesize_single_tts_edge(text, out_path, rate="0%", pitch="0Hz", edge_voice=EDGE_TTS_DEFAULT_VOICE):
+async def synthesize_single_tts_edge(text, out_path, rate="+0%", pitch="0Hz", edge_voice=EDGE_TTS_DEFAULT_VOICE):
     text = sanitize_tts_text(text)
     if not text:
         raise ValueError("voice_text is empty")
