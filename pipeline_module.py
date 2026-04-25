@@ -254,7 +254,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "tts_engine": tts_engine,
 
         # tts controls
-        "tts_rate": _safe_str(job_config.get("tts_rate"), "0%"),
+        "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
         "tts_pitch": _safe_str(job_config.get("tts_pitch"), "0Hz"),
         "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.05, min_value=0.7, max_value=1.5),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
@@ -1358,7 +1358,7 @@ async def save_tts(
     if not text:
         raise ValueError("voice_text is empty")
 
-    rate = rate or "0%"
+    rate = rate or "+0%"
     pitch = pitch or "0Hz"
     selected_voice = normalize_openai_voice(voice or DEFAULT_PRIMARY_VOICE)
 
