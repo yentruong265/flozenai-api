@@ -775,8 +775,46 @@ def resolve_single_voice(job_config=None) -> str:
 
 
 def normalize_style_preset(style_value: str) -> str:
-    style_value = str(style_value or "").strip()
-    return style_value if style_value in STYLE_PRESETS else DEFAULT_STYLE_PRESET
+    """
+    Normalize style from frontend into one of STYLE_PRESETS.
+    This keeps the user's selected style whenever possible.
+    """
+    raw = str(style_value or "").strip().lower()
+    raw = raw.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "auto": "",
+        "tu_dong": "",
+        "tự_động": "",
+
+        "realistic": "cinematic_realistic",
+        "cinematic": "cinematic_realistic",
+        "cinematic_realism": "cinematic_realistic",
+        "photo_realistic": "cinematic_realistic",
+        "photorealistic": "cinematic_realistic",
+        "cinematic_realistic": "cinematic_realistic",
+
+        "dramatic": "dramatic_cinematic",
+        "drama": "dramatic_cinematic",
+        "dramatic_cinematic": "dramatic_cinematic",
+
+        "zen": "zen_soft",
+        "soft_zen": "zen_soft",
+        "zen_soft": "zen_soft",
+
+        "storybook": "warm_storybook",
+        "warm": "warm_storybook",
+        "warm_storybook": "warm_storybook",
+
+        "watercolor": "watercolor_poetic",
+        "poetic": "watercolor_poetic",
+        "watercolor_poetic": "watercolor_poetic",
+    }
+
+    normalized = aliases.get(raw, raw)
+    return normalized if normalized in STYLE_PRESETS else DEFAULT_STYLE_PRESET
+
+
 
 
 def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380) -> str:
@@ -834,6 +872,87 @@ def chunk_story(story_text: str, target_words: int = 40) -> List[str]:
             merged.append(c)
 
     return [c for c in merged if c][:18]
+
+
+
+def force_scene_chunks_by_words(story_text: str, min_scenes: int = 4, max_scenes: int = 8) -> List[str]:
+    """
+    Fallback splitter for short / one-paragraph prompts.
+    It ensures production video has multiple scenes even when chunk_story returns only 1 chunk.
+    """
+    text = re.sub(r"\s+", " ", (story_text or "").strip())
+    if not text:
+        return []
+
+    # Respect explicit user scene markers first.
+    explicit = re.split(
+        r"(?:^|\s)(?:cảnh\s*\d+[:：\-]|scene\s*\d+[:：\-])",
+        text,
+        flags=re.IGNORECASE
+    )
+    explicit = [x.strip(" .,:;|-") for x in explicit if x and x.strip(" .,:;|-")]
+    if len(explicit) >= 2:
+        return explicit[:max_scenes]
+
+    # Try sentence split.
+    sentences = re.split(r"(?<=[\.\!\?\…])\s+|\n+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) >= min_scenes:
+        return sentences[:max_scenes]
+
+    words = text.split()
+    if len(words) <= 12:
+        return [text]
+
+    target_scenes = min(max_scenes, max(min_scenes, min(8, max(2, len(words) // 18))))
+    words_per_scene = max(8, int(len(words) / target_scenes + 0.999))
+
+    chunks = []
+    for i in range(0, len(words), words_per_scene):
+        chunk = " ".join(words[i:i + words_per_scene]).strip()
+        if chunk:
+            chunks.append(chunk)
+
+    # If the last chunk is too short, merge it.
+    if len(chunks) > 1 and len(chunks[-1].split()) < 6:
+        chunks[-2] = (chunks[-2] + " " + chunks[-1]).strip()
+        chunks.pop()
+
+    return chunks[:max_scenes]
+
+
+def clean_ai_scene_list(ai_plan: Dict[str, Any], min_scenes: int = 4, max_scenes: int = 8) -> List[Dict[str, Any]]:
+    scenes = (ai_plan or {}).get("scenes", [])
+    if not isinstance(scenes, list):
+        return []
+
+    cleaned = []
+    for idx, s in enumerate(scenes, 1):
+        if not isinstance(s, dict):
+            continue
+        item = dict(s)
+        item["scene_id"] = int(item.get("scene_id") or idx)
+        cleaned.append(item)
+
+    return cleaned[:max_scenes]
+
+
+def get_ai_scene_narration(scene: Dict[str, Any], fallback_text: str = "") -> str:
+    """
+    Extract narration from AI scene. The planner should return narration_text,
+    but this function is defensive for production.
+    """
+    for key in ["narration_text", "voice_text", "source_chunk", "script", "caption"]:
+        val = str(scene.get(key, "") or "").strip()
+        if val:
+            return sanitize_tts_text(val, max_chars=700)
+
+    subject = str(scene.get("main_subject", "") or "").strip()
+    action = str(scene.get("action", "") or "").strip()
+    location = str(scene.get("location", "") or "").strip()
+    mood = str(scene.get("mood", "") or "").strip()
+    combined = " ".join([subject, action, location, mood]).strip()
+    return sanitize_tts_text(combined or fallback_text, max_chars=700)
 
 
 def local_pick_style(story_text: str) -> str:
@@ -1109,72 +1228,115 @@ def plan_video_with_ai(
     job_config: Dict[str, Any],
     locked_style: str = ""
 ) -> Dict[str, Any]:
+    """
+    Ask OpenAI to become the video director:
+    - understand the user's requested content,
+    - split it into multiple visually different scenes,
+    - generate prompt-ready scene plans,
+    - keep the exact frontend style when style is locked.
+    """
     if not ENABLE_AI_B6:
         raise RuntimeError("AI planner disabled")
 
     client = get_openai_client()
 
-    locked_style = (locked_style or "").strip()
+    locked_style = normalize_style_preset(locked_style) if locked_style else ""
     style_locked = bool(locked_style)
     is_vertical = is_vertical_aspect(job_config)
 
+    user_style_text = locked_style or "auto"
+    aspect_text = "9:16 vertical TikTok/Reels/Shorts" if is_vertical else "16:9 landscape YouTube/web"
+
+    min_scenes = int(job_config.get("min_scenes", 4) or 4)
+    max_scenes = int(job_config.get("max_scenes", 8) or 8)
+    min_scenes = max(2, min(min_scenes, 10))
+    max_scenes = max(min_scenes, min(max_scenes, 12))
+
     prompt = f"""
-You must return ONLY valid JSON.
+You are FlozenAI's production video director and prompt engineer.
+
+Return ONLY valid JSON.
 No markdown.
 No explanation.
 No code fence.
 
-The user selected style preset from portal: {locked_style or "auto"}.
-Style locked from portal: {style_locked}.
-Aspect ratio requested: {"9:16 vertical" if is_vertical else "16:9 landscape"}.
+USER REQUEST:
+{story_text}
 
-Important rules:
-1. If style is locked, you must keep that exact style preset.
-2. Do NOT change the style preset when style is locked.
-3. You are allowed to plan scenes only inside that style.
-4. For cinematic_realistic, every scene must look like real-life photography, everyday life, documentary-like realism.
-5. For cinematic_realistic, avoid illustration, painting, cartoon, anime, watercolor, storybook, fantasy visuals.
-6. Keep scenes visually concrete and practical, not abstract.
-7. Each scene should include a specific subject, a visible action, a realistic location, a camera angle, a lighting condition, and an emotional tone.
-8. Prefer short, concrete, visual phrases instead of abstract ideas.
-9. If the story is normal daily life, choose realistic people, realistic actions, realistic places.
-10. If aspect ratio is 9:16 vertical, plan scenes with portrait-safe framing.
-11. For 9:16 vertical, avoid close framing that crops the head or feet.
-12. For 9:16 vertical, prefer centered subject, full body or medium-long portrait framing, enough space above and below the subject.
-13. For 9:16 vertical, do NOT describe scenes as extreme close-up unless the text clearly requires facial emotion.
+FRONTEND SELECTED STYLE:
+{user_style_text}
 
-Return JSON with this schema:
+STYLE LOCKED:
+{style_locked}
+
+ASPECT RATIO:
+{aspect_text}
+
+CURRENT ROUGH TEXT CHUNKS:
+{json.dumps(scene_chunks, ensure_ascii=False)}
+
+IMPORTANT STYLE RULES:
+1. If STYLE LOCKED is true, video_style_preset MUST be exactly "{locked_style}".
+2. Do not override the user's selected frontend style.
+3. Every scene must visually follow the selected style preset.
+4. Allowed style presets: {list(STYLE_PRESETS.keys())}.
+
+IMPORTANT PLANNING RULES:
+5. Understand the user request and turn it into a coherent short video.
+6. Split the content into {min_scenes} to {max_scenes} visually different scenes.
+7. Even if the input is one paragraph, you MUST still create multiple scenes.
+8. Each scene must represent a different moment, action, camera framing, or visual idea.
+9. Each scene must include narration_text. This is the spoken narration for that scene.
+10. narration_text must follow the user's requested content; do not invent unrelated facts.
+11. visual_prompt must be specific enough for SDXL image generation.
+12. Avoid repeating the same visual_prompt across scenes.
+13. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
+14. Keep visual prompts concrete and practical, not abstract.
+15. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
+16. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
+17. If aspect ratio is 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
+18. Do not add text, subtitles, watermark, logo, or words inside generated images.
+
+STYLE-SPECIFIC RULES:
+19. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
+20. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
+21. For zen_soft: use calm, peaceful, minimal soft visual language.
+22. For warm_storybook: use warm storybook illustration.
+23. For watercolor_poetic: use poetic watercolor visual language.
+
+Return JSON exactly with this schema:
 {{
-  "video_style_preset": "one of {list(STYLE_PRESETS.keys())}",
-  "num_inference_steps": 24,
-  "guidance_scale": 6.5,
+  "video_style_preset": "{locked_style if style_locked else 'one of allowed style presets'}",
+  "num_inference_steps": 28,
+  "guidance_scale": 7.0,
   "global_negative_prompt_addon": "",
-  "director_notes": "",
+  "director_notes": "short note",
   "scenes": [
     {{
       "scene_id": 1,
+      "narration_text": "spoken narration for this scene, matching the user request",
+      "visual_prompt": "full image prompt for SDXL, concrete and style-consistent",
       "main_subject": "short specific visual subject",
       "action": "short visible action",
-      "expression": "short visible facial emotion",
-      "location": "short realistic location",
-      "details": ["detail 1", "detail 2"],
-      "shot": "camera shot",
+      "expression": "visible emotion if relevant",
+      "location": "specific realistic/appropriate setting",
+      "details": ["detail 1", "detail 2", "detail 3"],
+      "shot": "camera shot/framing",
       "lighting": "lighting condition",
-      "time_of_day": "morning / afternoon / night / etc",
-      "mood": "clear emotional tone",
+      "time_of_day": "morning / afternoon / night / neutral",
+      "mood": "emotional tone",
       "motion_mode": "gentle"
     }}
   ]
 }}
-
-Story:
-{story_text}
-
-Scene chunks:
-{json.dumps(scene_chunks, ensure_ascii=False)}
 """
 
-    resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+        temperature=0.45,
+    )
+
     text = _extract_text_from_responses_api(resp)
     if not text:
         text = str(resp)
@@ -1191,7 +1353,15 @@ Scene chunks:
 
     if style_locked:
         data["video_style_preset"] = locked_style
+    else:
+        data["video_style_preset"] = normalize_style_preset(data.get("video_style_preset", ""))
 
+    # Production guardrail: enforce minimum useful scene count.
+    scenes = clean_ai_scene_list(data, min_scenes=min_scenes, max_scenes=max_scenes)
+    if len(scenes) < 2:
+        raise ValueError(f"AI planner returned too few scenes: {len(scenes)}")
+
+    data["scenes"] = scenes
     return data
 
 
@@ -1200,35 +1370,57 @@ def create_adaptive_video_plan(
     job_config: Dict[str, Any],
     target_words_per_scene: int = 40
 ) -> Dict[str, Any]:
-    scene_chunks = chunk_story(story_text, target_words=target_words_per_scene)
-    if not scene_chunks:
+    """
+    Create a production-grade video plan.
+
+    Key fix:
+    - OpenAI planner is allowed to define the REAL number of scenes.
+    - If AI creates 4-8 scenes, we use those scenes directly.
+    - The frontend-selected style is respected via lock_style_from_portal.
+    - If OpenAI fails, fallback still creates multiple scenes.
+    """
+    initial_chunks = chunk_story(story_text, target_words=target_words_per_scene)
+    if not initial_chunks:
+        initial_chunks = force_scene_chunks_by_words(story_text, min_scenes=4, max_scenes=8)
+    if not initial_chunks:
         raise ValueError("No scene chunks generated")
 
     used_ai = False
     ai_plan = None
     director_notes = ""
 
-    portal_style = (
+    portal_style_raw = (
         str(job_config.get("video_style_preset", "") or "").strip()
         or str(job_config.get("style", "") or "").strip()
     )
+    portal_style = normalize_style_preset(portal_style_raw) if portal_style_raw else ""
 
     style_locked = is_style_locked(job_config)
     is_vertical = is_vertical_aspect(job_config)
+
+    min_scenes = int(job_config.get("min_scenes", 4) or 4)
+    max_scenes = int(job_config.get("max_scenes", 8) or 8)
+    min_scenes = max(2, min(min_scenes, 10))
+    max_scenes = max(min_scenes, min(max_scenes, 12))
 
     if ENABLE_AI_B6 and OPENAI_API_KEY:
         try:
             ai_plan = plan_video_with_ai(
                 story_text=story_text,
-                scene_chunks=scene_chunks,
-                job_config=job_config,
-                locked_style=portal_style if style_locked else ""
+                scene_chunks=initial_chunks,
+                job_config={
+                    **job_config,
+                    "min_scenes": min_scenes,
+                    "max_scenes": max_scenes,
+                },
+                locked_style=portal_style if style_locked and portal_style else ""
             )
             used_ai = True
             director_notes = ai_plan.get("director_notes", "")
         except Exception as e:
             print("⚠️ AI planner fallback:", repr(e))
 
+    # Style selection: keep frontend style if locked, otherwise let AI choose.
     if style_locked and portal_style:
         requested_style = portal_style
     else:
@@ -1266,32 +1458,75 @@ def create_adaptive_video_plan(
 
     global_negative_prompt = f"{BASE_NEGATIVE_PROMPT}, {style_negative}, {addon}".strip(", ")
 
-    plan_scenes = (ai_plan or {}).get("scenes", [])
     selected_voice = resolve_single_voice(job_config=job_config)
 
-    # 🔥 FULL narration text cho toàn video
-    full_narration_text = " ".join(scene_chunks).strip()
+    plan_scenes = clean_ai_scene_list(ai_plan or {}, min_scenes=min_scenes, max_scenes=max_scenes)
+
+    # Critical fix:
+    # If AI planner returns multiple scenes, those scenes become the source of truth.
+    # Otherwise fallback creates multiple chunks from the story text.
+    if used_ai and len(plan_scenes) >= 2:
+        scene_source = []
+        for idx, scene in enumerate(plan_scenes, 1):
+            fallback = initial_chunks[min(idx - 1, len(initial_chunks) - 1)] if initial_chunks else story_text
+            narration = get_ai_scene_narration(scene, fallback_text=fallback)
+            if not narration:
+                narration = fallback
+            scene_source.append({
+                "chunk": narration,
+                "scene_plan": scene,
+            })
+    else:
+        fallback_chunks = initial_chunks
+        if len(fallback_chunks) < 2:
+            fallback_chunks = force_scene_chunks_by_words(story_text, min_scenes=min_scenes, max_scenes=max_scenes)
+        scene_source = [
+            {
+                "chunk": chunk,
+                "scene_plan": {},
+            }
+            for chunk in fallback_chunks[:max_scenes]
+        ]
+
+    if not scene_source:
+        raise ValueError("No scene source generated")
+
+    full_narration_text = " ".join([x["chunk"] for x in scene_source if x.get("chunk")]).strip()
     if not full_narration_text:
         full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
     scene_objects = []
-    for i, chunk in enumerate(scene_chunks, 1):
-        raw_scene_plan = plan_scenes[i - 1] if i - 1 < len(plan_scenes) else {}
+    for i, item in enumerate(scene_source, 1):
+        chunk = str(item.get("chunk", "") or "").strip()
+        raw_scene_plan = item.get("scene_plan", {}) or {}
+
         scene_plan = sanitize_scene_plan(raw_scene_plan, video_style_preset, chunk, is_vertical=is_vertical)
         profile = build_scene_profile_from_plan(scene_plan, i, video_style)
 
-        scene_objects.append({
-            "scene_id": i,
-            "profile": profile,
-            "voice": selected_voice,
-            "voice_text": chunk,   # giữ để debug / fallback
-            "visual_prompt": build_visual_prompt(
+        # Prefer AI's explicit visual_prompt; fallback to deterministic builder.
+        ai_visual_prompt = str(raw_scene_plan.get("visual_prompt", "") or "").strip()
+        if ai_visual_prompt:
+            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=380)
+            style_prompt = video_style.get("prompt_style", "")
+            visual_prompt = shorten_prompt_for_sdxl(
+                ", ".join([base_prompt, style_prompt, "style preset: " + video_style_preset]),
+                max_chars=380
+            )
+        else:
+            visual_prompt = build_visual_prompt(
                 chunk=chunk,
                 video_style=video_style,
                 scene_plan=scene_plan,
                 style_locked=style_locked,
                 is_vertical=is_vertical
-            ),
+            )
+
+        scene_objects.append({
+            "scene_id": i,
+            "profile": profile,
+            "voice": selected_voice,
+            "voice_text": chunk,
+            "visual_prompt": visual_prompt,
             "negative_prompt": global_negative_prompt,
             "source_chunk": chunk,
             "scene_plan": scene_plan,
@@ -1308,8 +1543,6 @@ def create_adaptive_video_plan(
         "global_negative_prompt": global_negative_prompt,
         "selected_voice": selected_voice,
         "scene_objects": scene_objects,
-
-        # 🔥 NEW: dùng cho B7 tạo 1 file audio duy nhất
         "full_narration_text": full_narration_text,
         "is_vertical": is_vertical,
     }
