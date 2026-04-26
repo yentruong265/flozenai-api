@@ -1,26 +1,32 @@
-# ===== CELL 2 =====
-# B2 — Init folders
+# pipeline_module.py — Production serverless version for RunPod
+# Converted from the tested notebook.
+# Entry point used by handler.py: run_job_serverless(job_config, job_id, base_dir, progress_callback)
+
 import os
 import torch
 from pathlib import Path
 from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
-DRIVE_ROOT = "/content/drive/MyDrive/video_auto_project/jobs"
-
-PENDING_DIR   = os.path.join(DRIVE_ROOT, "pending")
-RUNNING_DIR   = os.path.join(DRIVE_ROOT, "running")
+DRIVE_ROOT = os.getenv("JOB_ROOT", "/tmp/easyai_jobs")
+PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
+RUNNING_DIR = os.path.join(DRIVE_ROOT, "running")
 COMPLETED_DIR = os.path.join(DRIVE_ROOT, "completed")
-FAILED_DIR    = os.path.join(DRIVE_ROOT, "failed")
+FAILED_DIR = os.path.join(DRIVE_ROOT, "failed")
 
-for d in [PENDING_DIR, RUNNING_DIR, COMPLETED_DIR, FAILED_DIR]:
-    Path(d).mkdir(parents=True, exist_ok=True)
+_PROGRESS_CALLBACK = None
 
-print("✅ INIT DONE")
-print("PENDING_DIR   =", PENDING_DIR)
-print("RUNNING_DIR   =", RUNNING_DIR)
-print("COMPLETED_DIR =", COMPLETED_DIR)
-print("FAILED_DIR    =", FAILED_DIR)
+def init_job_dirs(base_dir=None):
+    global DRIVE_ROOT, PENDING_DIR, RUNNING_DIR, COMPLETED_DIR, FAILED_DIR
+    DRIVE_ROOT = str(base_dir or os.getenv("JOB_ROOT", "/tmp/easyai_jobs"))
+    PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
+    RUNNING_DIR = os.path.join(DRIVE_ROOT, "running")
+    COMPLETED_DIR = os.path.join(DRIVE_ROOT, "completed")
+    FAILED_DIR = os.path.join(DRIVE_ROOT, "failed")
+    for d in [PENDING_DIR, RUNNING_DIR, COMPLETED_DIR, FAILED_DIR]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    return {"DRIVE_ROOT": DRIVE_ROOT, "PENDING_DIR": PENDING_DIR, "RUNNING_DIR": RUNNING_DIR, "COMPLETED_DIR": COMPLETED_DIR, "FAILED_DIR": FAILED_DIR}
 
+init_job_dirs(DRIVE_ROOT)
 
 # ===== CELL 3 =====
 # B3 — JSON helpers + normalize job config (final reviewed)
@@ -66,7 +72,18 @@ def write_status(job_dir, job_id, status, extra=None):
     }
     if isinstance(extra, dict):
         payload.update(extra)
-    write_json(os.path.join(job_dir, "status.json"), payload)
+
+    try:
+        write_json(os.path.join(job_dir, "status.json"), payload)
+    except Exception as e:
+        print("WARN: could not write local status.json:", repr(e))
+
+    global _PROGRESS_CALLBACK
+    if _PROGRESS_CALLBACK:
+        try:
+            _PROGRESS_CALLBACK(payload)
+        except Exception as e:
+            print("WARN: progress callback failed:", repr(e))
 
 
 def _safe_str(v, default=""):
@@ -1360,6 +1377,8 @@ async def save_tts(
 
     rate = rate or "+0%"
     pitch = pitch or "+0Hz"
+    if str(pitch).strip() == "0Hz":
+        pitch = "+0Hz"
     selected_voice = normalize_openai_voice(voice or DEFAULT_PRIMARY_VOICE)
 
     if OPENAI_API_KEY:
@@ -1911,207 +1930,41 @@ def run_job(job_config, job_id):
     }
 
 
-# ===== CELL 8 =====
-# B8 — worker loop (reviewed, more robust)
-
-def worker_loop(poll_interval=5):
-    print("🚀 Worker started")
-    print("Watching:", PENDING_DIR)
-
-    while True:
-        job_file = None
-        job_path = None
-        job_id = None
-        running_dir = None
-
-        try:
-            job_file = pick_job()
-
-            if not job_file:
-                print("...waiting job")
-                time.sleep(poll_interval)
-                continue
-
-            job_path = os.path.join(PENDING_DIR, job_file)
-
-            # file có thể vừa bị move/xóa bởi thao tác khác
-            if not os.path.exists(job_path):
-                print(f"⚠️ Job disappeared before processing: {job_file}")
-                time.sleep(1)
-                continue
-
-            fallback_job_id = os.path.splitext(job_file)[0]
-            raw_job_config = read_json(job_path)
-            job_config = normalize_job_config(raw_job_config, fallback_job_id=fallback_job_id)
-            job_id = job_config["job_id"]
-
-            print(f"📦 Processing: {job_id}")
-
-            running_dir = os.path.join(RUNNING_DIR, job_id)
-            os.makedirs(running_dir, exist_ok=True)
-
-            running_job_json = os.path.join(running_dir, "job_config.json")
-
-            # move file gốc sang running trước
-            shutil.move(job_path, running_job_json)
-
-            # ghi lại config đã normalize để đảm bảo downstream luôn dùng config sạch
-            write_json(running_job_json, job_config)
-
-            write_status(running_dir, job_id, "running", {
-                "step": "job_received",
-                "retry_count": job_config["retry_count"],
-                "max_retry": job_config["max_retry"],
-                "started_at": now_str(),
-            })
-
-            result = run_job(job_config, job_id)
-
-            completed_dir = os.path.join(COMPLETED_DIR, job_id)
-            if os.path.exists(completed_dir):
-                shutil.rmtree(completed_dir, ignore_errors=True)
-
-            shutil.move(running_dir, completed_dir)
-
-            result["relative_video_path"] = f"completed/{job_id}/outputs/final_story_video_adaptive.mp4"
-
-            write_status(completed_dir, job_id, "completed", {
-                "step": "done",
-                "video_path": result.get("relative_video_path", ""),
-                "finished_at": now_str(),
-            })
-            write_json(os.path.join(completed_dir, "result.json"), result)
-
-            print(f"✅ DONE: {job_id}")
-
-        except Exception as e:
-            print(f"❌ ERROR: {e}")
-            traceback.print_exc()
-
-            fail_trace = traceback.format_exc()
-
-            try:
-                if not job_id:
-                    job_id = f"unknown_{int(time.time())}"
-
-                failed_dir = os.path.join(FAILED_DIR, job_id)
-                os.makedirs(failed_dir, exist_ok=True)
-
-                source_cfg = None
-
-                running_cfg_path = os.path.join(running_dir, "job_config.json") if running_dir else None
-
-                if running_cfg_path and os.path.exists(running_cfg_path):
-                    source_cfg = read_json(running_cfg_path)
-                elif job_path and os.path.exists(job_path):
-                    source_cfg = read_json(job_path)
-                else:
-                    source_cfg = {"job_id": job_id}
-
-                raw_retry_count = int(source_cfg.get("retry_count", 0) or 0)
-                raw_max_retry = int(source_cfg.get("max_retry", 2) or 2)
-                next_retry = raw_retry_count + 1
-
-                error_payload = {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": str(e),
-                    "traceback": fail_trace,
-                    "retry_count": next_retry,
-                    "max_retry": raw_max_retry,
-                    "failed_at": now_str(),
-                }
-
-                # còn lượt retry
-                if next_retry <= raw_max_retry:
-                    print(f"🔁 RETRY {next_retry}/{raw_max_retry}: {job_id}")
-
-                    source_cfg["retry_count"] = next_retry
-                    source_cfg["last_error"] = str(e)
-                    source_cfg["last_failed_at"] = now_str()
-
-                    retry_job_path = os.path.join(PENDING_DIR, f"{job_id}.json")
-                    write_json(retry_job_path, source_cfg)
-
-                    if running_dir and os.path.exists(running_dir):
-                        try:
-                            write_status(running_dir, job_id, "retrying", {
-                                "step": "retry_scheduled",
-                                "retry_count": next_retry,
-                                "max_retry": raw_max_retry,
-                                "last_error": str(e),
-                            })
-                        except Exception:
-                            pass
-
-                        shutil.rmtree(running_dir, ignore_errors=True)
-
-                    write_json(os.path.join(failed_dir, "last_error.json"), error_payload)
-
-                # hết lượt retry
-                else:
-                    print(f"🛑 MOVE TO FAILED: {job_id}")
-
-                    if running_dir and os.path.exists(running_dir):
-                        if os.path.exists(failed_dir):
-                            shutil.rmtree(failed_dir, ignore_errors=True)
-                        shutil.move(running_dir, failed_dir)
-                    else:
-                        os.makedirs(failed_dir, exist_ok=True)
-                        if job_path and os.path.exists(job_path):
-                            shutil.move(job_path, os.path.join(failed_dir, "job_config.json"))
-
-                    write_status(failed_dir, job_id, "failed", {
-                        "step": "error",
-                        "error": str(e),
-                        "finished_at": now_str(),
-                    })
-
-                    write_json(os.path.join(failed_dir, "error.json"), error_payload)
-                    write_json(os.path.join(failed_dir, "result.json"), {
-                        "job_id": job_id,
-                        "status": "failed",
-                        "error": str(e),
-                        "finished_at": now_str(),
-                    })
-
-            except Exception as inner_e:
-                print("❌ ERROR while handling failure:", inner_e)
-                traceback.print_exc()
-
-        time.sleep(poll_interval)
 
 
-# ===== SERVERLESS WRAPPER ADDED =====
+# ===== SERVERLESS ENTRYPOINT =====
 def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_callback=None):
-    import os
+    """
+    Production entry point called by handler.py.
 
-    global DRIVE_ROOT, PENDING_DIR, RUNNING_DIR, COMPLETED_DIR, FAILED_DIR
+    Returns a dict containing video_path so handler.py can upload it to R2.
+    """
+    global _PROGRESS_CALLBACK
 
-    DRIVE_ROOT = base_dir
-    PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
-    RUNNING_DIR = os.path.join(DRIVE_ROOT, "running")
-    COMPLETED_DIR = os.path.join(DRIVE_ROOT, "completed")
-    FAILED_DIR = os.path.join(DRIVE_ROOT, "failed")
-    for d in [PENDING_DIR, RUNNING_DIR, COMPLETED_DIR, FAILED_DIR]:
-        os.makedirs(d, exist_ok=True)
+    init_job_dirs(base_dir)
 
-    if progress_callback:
-        _orig_write_status = write_status
+    normalized = normalize_job_config(job_config or {}, fallback_job_id=job_id)
+    normalized["job_id"] = str(job_id or normalized.get("job_id") or "").strip()
 
-        def write_status_proxy(job_dir, _job_id, status, extra=None):
-            try:
-                _orig_write_status(job_dir, _job_id, status, extra)
-            except Exception:
-                pass
-            payload = {"job_id": _job_id, "status": status}
-            if isinstance(extra, dict):
-                payload.update(extra)
-            try:
-                progress_callback(payload)
-            except Exception:
-                pass
+    if not normalized["job_id"]:
+        raise ValueError("Missing job_id")
 
-        globals()["write_status"] = write_status_proxy
+    old_callback = _PROGRESS_CALLBACK
+    _PROGRESS_CALLBACK = progress_callback
 
-    return run_job(job_config, job_id)
+    try:
+        result = run_job(normalized, normalized["job_id"])
+
+        video_path = result.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            raise RuntimeError(f"run_job completed but video_path is missing: {video_path}")
+
+        return {
+            **result,
+            "ok": True,
+            "job_id": normalized["job_id"],
+            "video_path": video_path,
+        }
+
+    finally:
+        _PROGRESS_CALLBACK = old_callback
