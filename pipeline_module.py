@@ -278,8 +278,8 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
         # image generation
-        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 24, min_value=8, max_value=80),
-        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 6.5, min_value=1.0, max_value=20.0),
+        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 16, min_value=1, max_value=30),
+        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 0.0, min_value=0.0, max_value=10.0),
         "seed": _safe_int(job_config.get("seed"), 42),
 
         # retry
@@ -301,10 +301,12 @@ import re
 import gc
 import time
 import torch
+import threading
 from PIL import Image
 
-SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
+SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/sdxl-turbo").strip()
 _IMAGE_PIPE = None
+_IMAGE_PIPE_LOCK = threading.Lock()
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -422,18 +424,33 @@ def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, 
     return shorten_prompt_for_sdxl(negative_prompt, max_chars=360)
 
 
+def _is_turbo_model() -> bool:
+    return "turbo" in (SDXL_MODEL_ID or "").lower()
+
+
 def _get_guidance_scale(width: int, height: int, guidance_scale: float) -> float:
+    """
+    SDXL Turbo is fastest and works best with low/no classifier-free guidance.
+    For non-turbo SDXL, keep moderate guidance.
+    """
     g = float(guidance_scale)
+    if _is_turbo_model():
+        return max(0.0, min(g, 1.0))
+
     if _is_vertical_frame(width, height):
-        g = max(g, 7.2)
-    return min(g, 12.0)
+        g = max(g, 5.5)
+    return min(g, 10.0)
 
 
 def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
-    s = max(8, int(steps))
-    if _is_vertical_frame(width, height):
-        s = max(s, 30)
-    return min(s, 80)
+    """
+    Keep inference fast. The old version forced vertical videos to 30 steps,
+    which made 9:16 videos much slower.
+    """
+    s = max(1, int(steps))
+    if _is_turbo_model():
+        return min(max(s, 4), 16)
+    return min(max(s, 8), 30)
 
 
 def load_image_pipe(force_reload: bool = False):
@@ -1288,14 +1305,20 @@ IMPORTANT PLANNING RULES:
 8. Each scene must represent a different moment, action, camera framing, or visual idea.
 9. Each scene must include narration_text. This is the spoken narration for that scene.
 10. narration_text must follow the user's requested content; do not invent unrelated facts.
-11. visual_prompt must be specific enough for SDXL image generation.
-12. Avoid repeating the same visual_prompt across scenes.
-13. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
-14. Keep visual prompts concrete and practical, not abstract.
-15. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
-16. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
-17. If aspect ratio is 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
-18. Do not add text, subtitles, watermark, logo, or words inside generated images.
+11. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
+12. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
+13. If narration_text mentions a person, the visual_prompt must show that person.
+14. If narration_text mentions an action, the visual_prompt must show that visible action.
+15. If narration_text mentions a place, product, object, or situation, the visual_prompt must include it clearly.
+16. Each visual_prompt must be concrete enough for image generation: subject + action + location + camera framing + mood + lighting.
+17. Avoid repeating the same visual_prompt across scenes.
+18. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
+19. Keep visual prompts practical and literal, not abstract.
+20. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
+21. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
+22. If aspect ratio is 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
+23. Do not add text, subtitles, watermark, logo, or words inside generated images.
+24. For every scene, narration_text and visual_prompt must describe the SAME moment.
 
 STYLE-SPECIFIC RULES:
 19. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
@@ -1307,8 +1330,8 @@ STYLE-SPECIFIC RULES:
 Return JSON exactly with this schema:
 {{
   "video_style_preset": "{locked_style if style_locked else 'one of allowed style presets'}",
-  "num_inference_steps": 28,
-  "guidance_scale": 7.0,
+  "num_inference_steps": 16,
+  "guidance_scale": 0.0,
   "global_negative_prompt_addon": "",
   "director_notes": "short note",
   "scenes": [
@@ -1433,9 +1456,10 @@ def create_adaptive_video_plan(
     video_style_preset = normalize_style_preset(requested_style)
     video_style = dict(STYLE_PRESETS[video_style_preset])
 
-    default_steps = 28 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 24
-    default_guidance = 7.2 if (video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} and is_vertical) else (
-        7.0 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 6.5
+    # Fast production defaults. SDXL Turbo is the default model, so keep steps low.
+    default_steps = 16
+    default_guidance = 0.0 if _is_turbo_model() else (
+        5.5 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.0
     )
 
     num_inference_steps = int((ai_plan or {}).get("num_inference_steps", job_config.get("num_inference_steps", default_steps)))
@@ -1506,10 +1530,11 @@ def create_adaptive_video_plan(
         # Prefer AI's explicit visual_prompt; fallback to deterministic builder.
         ai_visual_prompt = str(raw_scene_plan.get("visual_prompt", "") or "").strip()
         if ai_visual_prompt:
-            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=380)
+            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=320)
             style_prompt = video_style.get("prompt_style", "")
+            literal_match = f"literal scene matching narration: {chunk[:140]}"
             visual_prompt = shorten_prompt_for_sdxl(
-                ", ".join([base_prompt, style_prompt, "style preset: " + video_style_preset]),
+                ", ".join([base_prompt, literal_match, style_prompt, "style preset: " + video_style_preset]),
                 max_chars=380
             )
         else:
@@ -1741,7 +1766,7 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
             yy, xx = np.ogrid[:h, :w]
             cx, cy = w / 2.0, h / 2.0
             dist = ((xx - cx) ** 2 / (cx ** 2) + (yy - cy) ** 2 / (cy ** 2))
-            vignette = np.clip(1.0 - 0.12 * dist, 0.86, 1.0)
+            vignette = np.clip(1.0 - 0.03 * dist, 0.97, 1.0)
             frame = np.clip(frame.astype(np.float32) * vignette[..., None], 0, 255).astype(np.uint8)
 
         return frame
@@ -1793,12 +1818,14 @@ def apply_visual_finish(clip, video_style_preset: str):
     return clip
 
 
-def apply_scene_transitions(clip, scene_profile: str, video_style_preset: str):
+def apply_scene_transitions(clip, scene_profile: str, video_style_preset: str, is_last_scene: bool = False):
     td = get_transition_duration(scene_profile, video_style_preset)
-    out = clip.with_effects([
-        vfx.FadeIn(td),
-        vfx.FadeOut(td),
-    ])
+    td = min(td, 0.16)
+    if is_last_scene:
+        # Never fade out the final scene, otherwise the back half can look dim/blurred.
+        out = clip.with_effects([vfx.FadeIn(min(td, 0.10))])
+    else:
+        out = clip.with_effects([vfx.FadeIn(td), vfx.FadeOut(td)])
     return out, td
 
 
@@ -1843,6 +1870,43 @@ def allocate_scene_durations_from_narration(scene_objects, total_audio_duration,
 
     return durations
 
+
+
+def _get_image_max_workers(job_config=None) -> int:
+    """
+    Configurable image generation workers.
+
+    Practical note:
+    - On one small GPU, too many workers can cause CUDA OOM.
+    - Default is 1 for safety.
+    - Set IMAGE_MAX_WORKERS=2 only after the container is stable with SDXL Turbo.
+    """
+    raw = None
+    if isinstance(job_config, dict):
+        raw = job_config.get("image_max_workers")
+    if raw in ("", None):
+        raw = os.getenv("IMAGE_MAX_WORKERS", "1")
+    try:
+        workers = int(float(raw))
+    except Exception:
+        workers = 1
+    return max(1, min(workers, 3))
+
+
+def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
+    generate_image(
+        prompt=scene["visual_prompt"],
+        out_path=img_path,
+        negative_prompt=scene["negative_prompt"],
+        width=width,
+        height=height,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        seed=seed + int(scene["scene_id"]),
+        retries=1 if _is_turbo_model() else 2,
+        scene_id=scene["scene_id"],
+    )
+    return img_path
 
 def run_job(job_config, job_id):
     """
@@ -1907,6 +1971,10 @@ def run_job(job_config, job_id):
     video_style = adaptive_plan["video_style"]
     num_inference_steps = int(adaptive_plan["num_inference_steps"])
     guidance_scale = float(adaptive_plan["guidance_scale"])
+    # Hard safety clamp for fast production mode.
+    num_inference_steps = min(max(num_inference_steps, 1), 16 if _is_turbo_model() else 30)
+    if _is_turbo_model():
+        guidance_scale = max(0.0, min(guidance_scale, 1.0))
     scene_objects = adaptive_plan["scene_objects"]
     selected_voice = adaptive_plan.get(
         "selected_voice",
@@ -1929,6 +1997,8 @@ def run_job(job_config, job_id):
         "selected_voice": selected_voice,
         "full_narration_text": adaptive_plan.get("full_narration_text", ""),
         "timeline_mode": "per_scene_audio",
+        "image_max_workers": _get_image_max_workers(job_config),
+        "image_model": SDXL_MODEL_ID,
     })
 
     write_json(os.path.join(META_DIR, "scene_profiles.json"), scene_objects)
@@ -1943,39 +2013,79 @@ def run_job(job_config, job_id):
         "eta_sec": max(45, total_scenes * 12),
     })
 
-    image_paths = []
+    image_paths = [None] * total_scenes
     images_started_at = time.time()
+    image_max_workers = _get_image_max_workers(job_config)
 
-    for scene in scene_objects:
-        img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
+    # SDXL Turbo is already much faster. Workers are configurable but capped
+    # to avoid CUDA OOM on 24GB GPUs.
+    if image_max_workers <= 1:
+        for idx, scene in enumerate(scene_objects):
+            img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
+            image_paths[idx] = _generate_one_scene_image(
+                scene=scene,
+                img_path=img_path,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+            )
 
-        generate_image(
-            prompt=scene["visual_prompt"],
-            out_path=img_path,
-            negative_prompt=scene["negative_prompt"],
-            width=width,
-            height=height,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed + scene["scene_id"],
-            retries=2,
-            scene_id=scene["scene_id"],
-        )
+            processed_images = sum(1 for x in image_paths if x)
+            eta_sec = estimate_eta(time.time() - images_started_at, processed_images, total_scenes, fallback_sec=max(12, total_scenes * 4))
+            progress_pct = int(12 + (processed_images / max(total_scenes, 1)) * 34)
 
-        image_paths.append(img_path)
-        processed_images = len(image_paths)
-        eta_sec = estimate_eta(time.time() - images_started_at, processed_images, total_scenes, fallback_sec=max(20, total_scenes * 8))
-        progress_pct = int(12 + (processed_images / max(total_scenes, 1)) * 34)
+            write_status(job_dir, job_id, "running", {
+                "step": "generate_images",
+                "scene_count": total_scenes,
+                "processed_images": processed_images,
+                "image_max_workers": image_max_workers,
+                "video_style_preset": video_style_preset,
+                "selected_voice": selected_voice,
+                "progress_pct": progress_pct,
+                "eta_sec": eta_sec,
+            })
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        write_status(job_dir, job_id, "running", {
-            "step": "generate_images",
-            "scene_count": total_scenes,
-            "processed_images": processed_images,
-            "video_style_preset": video_style_preset,
-            "selected_voice": selected_voice,
-            "progress_pct": progress_pct,
-            "eta_sec": eta_sec,
-        })
+        future_to_idx = {}
+        with ThreadPoolExecutor(max_workers=image_max_workers) as executor:
+            for idx, scene in enumerate(scene_objects):
+                img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
+                fut = executor.submit(
+                    _generate_one_scene_image,
+                    scene,
+                    img_path,
+                    width,
+                    height,
+                    num_inference_steps,
+                    guidance_scale,
+                    seed,
+                )
+                future_to_idx[fut] = idx
+
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                image_paths[idx] = fut.result()
+
+                processed_images = sum(1 for x in image_paths if x)
+                eta_sec = estimate_eta(time.time() - images_started_at, processed_images, total_scenes, fallback_sec=max(12, total_scenes * 4))
+                progress_pct = int(12 + (processed_images / max(total_scenes, 1)) * 34)
+
+                write_status(job_dir, job_id, "running", {
+                    "step": "generate_images",
+                    "scene_count": total_scenes,
+                    "processed_images": processed_images,
+                    "image_max_workers": image_max_workers,
+                    "video_style_preset": video_style_preset,
+                    "selected_voice": selected_voice,
+                    "progress_pct": progress_pct,
+                    "eta_sec": eta_sec,
+                })
+
+    if any(not p for p in image_paths):
+        raise RuntimeError("Some scene images were not generated")
 
     write_status(job_dir, job_id, "running", {
         "step": "generate_tts_per_scene",
@@ -2130,8 +2240,8 @@ def run_job(job_config, job_id):
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        threads=2,
-        preset="medium",
+        threads=4,
+        preset=os.getenv("FFMPEG_PRESET", "veryfast"),
     )
 
     for v in video_clips:
@@ -2174,6 +2284,8 @@ def run_job(job_config, job_id):
         "selected_voice": selected_voice,
         "used_ai_planner": adaptive_plan["used_ai_planner"],
         "timeline_mode": "per_scene_audio",
+        "image_max_workers": _get_image_max_workers(job_config),
+        "image_model": SDXL_MODEL_ID,
         "total_audio_duration": round(total_audio_duration, 3),
         "finished_at": now_str(),
     }
