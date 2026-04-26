@@ -1652,7 +1652,7 @@ def run_async_safely(coro):
     return loop.run_until_complete(coro)
 
 
-# 🔥 NEW: helper để B7 gọi 1 audio duy nhất cho toàn video
+# Legacy helper: tạo 1 audio duy nhất cho toàn video; B7 mới không dùng helper này để tránh lệch timeline
 async def generate_full_narration(plan: Dict[str, Any], output_dir: str):
     narration_text = sanitize_tts_text(plan.get("full_narration_text", ""), max_chars=4000)
     if not narration_text:
@@ -1845,6 +1845,18 @@ def allocate_scene_durations_from_narration(scene_objects, total_audio_duration,
 
 
 def run_job(job_config, job_id):
+    """
+    Production run_job — FIX TIMELINE DRIFT.
+
+    Key change:
+    - OLD: create one full narration audio, then estimate scene durations.
+    - NEW: create one audio per scene, then each clip uses its real audio duration.
+
+    This prevents:
+    - too many scenes in the first half,
+    - one last scene being held for the second half,
+    - final scene fade/blur covering the back half of the video.
+    """
     job_dir = os.path.join(RUNNING_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -1866,7 +1878,6 @@ def run_job(job_config, job_id):
     story_text = str(job_config.get("story_text", "") or "").strip()
     prompt = str(job_config.get("prompt", "") or "").strip()
 
-    # ✅ FIX: fallback về prompt như B7 cũ
     if not story_text:
         story_text = prompt
 
@@ -1877,14 +1888,9 @@ def run_job(job_config, job_id):
     height = int(job_config.get("height", 432))
     fps = int(job_config.get("fps", 24))
     target_words_per_scene = int(job_config.get("target_words_per_scene", 40))
-    target_total_video_sec = job_config.get("target_total_video_sec", job_config.get("target_total_sec", None))
     max_scene_duration = float(job_config.get("max_scene_duration", 12.0))
-    video_length_mode = str(job_config.get("video_length_mode", job_config.get("duration_mode", "auto")) or "auto").strip()
     seed = int(job_config.get("seed", 42) or 42)
 
-    # =========================
-    # 1. PLAN
-    # =========================
     write_status(job_dir, job_id, "running", {
         "step": "plan_video",
         "progress_pct": 6,
@@ -1922,13 +1928,11 @@ def run_job(job_config, job_id):
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
         "full_narration_text": adaptive_plan.get("full_narration_text", ""),
+        "timeline_mode": "per_scene_audio",
     })
 
     write_json(os.path.join(META_DIR, "scene_profiles.json"), scene_objects)
 
-    # =========================
-    # 2. GENERATE IMAGES
-    # =========================
     write_status(job_dir, job_id, "running", {
         "step": "generate_images",
         "scene_count": total_scenes,
@@ -1959,15 +1963,9 @@ def run_job(job_config, job_id):
         )
 
         image_paths.append(img_path)
-
         processed_images = len(image_paths)
-        eta_sec = estimate_eta(
-            time.time() - images_started_at,
-            processed_images,
-            total_scenes,
-            fallback_sec=max(20, total_scenes * 8),
-        )
-        progress_pct = int(12 + (processed_images / max(total_scenes, 1)) * 38)
+        eta_sec = estimate_eta(time.time() - images_started_at, processed_images, total_scenes, fallback_sec=max(20, total_scenes * 8))
+        progress_pct = int(12 + (processed_images / max(total_scenes, 1)) * 34)
 
         write_status(job_dir, job_id, "running", {
             "step": "generate_images",
@@ -1979,74 +1977,95 @@ def run_job(job_config, job_id):
             "eta_sec": eta_sec,
         })
 
-    # =========================
-    # 3. GENERATE ONE NARRATION AUDIO
-    # =========================
     write_status(job_dir, job_id, "running", {
-        "step": "generate_tts",
+        "step": "generate_tts_per_scene",
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
-        "progress_pct": 55,
+        "progress_pct": 50,
         "eta_sec": max(20, total_scenes * 4),
     })
 
-    narration_path, narration_meta = run_async_safely(
-        generate_full_narration(adaptive_plan, AUDIO_DIR)
-    )
+    audio_clips = []
+    tts_scene_log = []
+    tts_started_at = time.time()
 
-    if not os.path.exists(narration_path) or os.path.getsize(narration_path) <= 0:
-        raise RuntimeError(f"Full narration output missing or empty: {narration_path}")
+    for idx, scene in enumerate(scene_objects, start=1):
+        scene_id = int(scene.get("scene_id", idx))
+        voice_text = sanitize_tts_text(scene.get("voice_text") or scene.get("source_chunk") or "", max_chars=900)
+        if not voice_text:
+            voice_text = sanitize_tts_text(story_text, max_chars=900)
 
-    narration_clip = AudioFileClip(narration_path)
-    total_audio_duration = float(narration_clip.duration or 0)
+        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id:02d}.mp3")
+        tts_meta = run_async_safely(save_tts(
+            text=voice_text,
+            out_path=audio_path,
+            voice=scene.get("voice") or selected_voice,
+            rate=job_config.get("tts_rate", "+0%"),
+            pitch=job_config.get("tts_pitch", "+0Hz"),
+        ))
 
-    if total_audio_duration <= 0:
-        raise RuntimeError("Narration audio duration is zero")
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
+            raise RuntimeError(f"Scene TTS output missing or empty: {audio_path}")
 
-    tts_debug = {
-        "tts_mode": "single_full_narration",
-        "voice_used": narration_meta.get("voice_used"),
-        "tts_engine": narration_meta.get("engine", "unknown"),
-        "text_len": narration_meta.get("text_len"),
-        "audio_file": os.path.basename(narration_path),
-        "audio_duration": round(total_audio_duration, 3),
+        audio_clip = AudioFileClip(audio_path)
+        duration = float(audio_clip.duration or 0)
+        if duration <= 0:
+            try:
+                audio_clip.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Scene audio duration is zero: {audio_path}")
+
+        if max_scene_duration and duration > max_scene_duration + 3.0:
+            print(f"WARN: scene {scene_id} audio duration {duration:.2f}s is longer than max_scene_duration {max_scene_duration:.2f}s. Keeping real audio duration to avoid sync drift.")
+
+        audio_clips.append(audio_clip)
+        tts_scene_log.append({
+            "scene_id": scene_id,
+            "audio_file": os.path.basename(audio_path),
+            "audio_duration": round(duration, 3),
+            "voice_used": tts_meta.get("voice_used", selected_voice),
+            "tts_engine": tts_meta.get("engine", "unknown"),
+            "text_len": len(voice_text),
+            "word_count": len(voice_text.split()),
+            "voice_text": voice_text,
+        })
+
+        eta_sec = estimate_eta(time.time() - tts_started_at, idx, total_scenes, fallback_sec=max(10, total_scenes * 3))
+        progress_pct = int(50 + (idx / max(total_scenes, 1)) * 20)
+
+        write_status(job_dir, job_id, "running", {
+            "step": "generate_tts_per_scene",
+            "generated_audio": idx,
+            "scene_count": total_scenes,
+            "selected_voice": selected_voice,
+            "progress_pct": progress_pct,
+            "eta_sec": eta_sec,
+        })
+
+    total_audio_duration = sum(float(a.duration or 0) for a in audio_clips)
+    write_json(os.path.join(META_DIR, "tts_debug.json"), {
+        "tts_mode": "per_scene_audio",
         "scene_count": total_scenes,
-    }
-    write_json(os.path.join(META_DIR, "tts_debug.json"), tts_debug)
+        "selected_voice": selected_voice,
+        "total_audio_duration": round(total_audio_duration, 3),
+        "scenes": tts_scene_log,
+    })
 
-    # =========================
-    # 4. BUILD VIDEO CLIPS (NO PER-SCENE AUDIO)
-    # =========================
     write_status(job_dir, job_id, "running", {
         "step": "build_video",
         "selected_voice": selected_voice,
-        "progress_pct": 80,
+        "progress_pct": 72,
         "eta_sec": max(12, total_scenes * 2),
     })
-
-    scene_durations = allocate_scene_durations_from_narration(
-        scene_objects=scene_objects,
-        total_audio_duration=total_audio_duration,
-        min_scene_sec=1.6,
-        max_scene_sec=max_scene_duration,
-    )
-
-    # nếu user vẫn ép total duration, scale lại theo target
-    if target_total_video_sec is not None and scene_durations:
-        current_total = sum(scene_durations)
-        if current_total > 0:
-            ratio = float(target_total_video_sec) / current_total
-            scene_durations = [
-                clamp(d * ratio, 1.0, max_scene_duration + 2.0)
-                for d in scene_durations
-            ]
 
     video_clips = []
     scene_duration_log = []
     build_started_at = time.time()
 
-    for idx, (scene, img_path, duration) in enumerate(zip(scene_objects, image_paths, scene_durations), start=1):
-        duration = max(float(duration), 1.0)
+    for idx, (scene, img_path, audio_clip) in enumerate(zip(scene_objects, image_paths, audio_clips), start=1):
+        scene_id = int(scene.get("scene_id", idx))
+        duration = max(float(audio_clip.duration or 0), 1.0)
 
         vclip = make_motion_clip(
             image_path=img_path,
@@ -2059,16 +2078,20 @@ def run_job(job_config, job_id):
         )
 
         vclip = apply_visual_finish(vclip, video_style_preset)
-        vclip, transition_duration = apply_scene_transitions(
-            vclip,
-            scene_profile=scene["profile"],
-            video_style_preset=video_style_preset,
-        )
 
+        if idx < total_scenes:
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.16)
+            vclip = vclip.with_effects([vfx.FadeIn(transition_duration), vfx.FadeOut(transition_duration)])
+        else:
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.12)
+            vclip = vclip.with_effects([vfx.FadeIn(transition_duration)])
+
+        vclip = vclip.with_audio(audio_clip)
         video_clips.append(vclip)
+
         scene_duration_log.append({
-            "scene_id": scene["scene_id"],
-            "final_duration": round(float(duration), 2),
+            "scene_id": scene_id,
+            "final_duration": round(float(duration), 3),
             "scene_profile": scene["profile"],
             "voice_used": scene.get("voice", selected_voice),
             "transition_duration": round(float(transition_duration), 3),
@@ -2077,13 +2100,8 @@ def run_job(job_config, job_id):
             "scene_plan": scene.get("scene_plan", {}),
         })
 
-        eta_sec = estimate_eta(
-            time.time() - build_started_at,
-            idx,
-            total_scenes,
-            fallback_sec=max(10, total_scenes * 2),
-        )
-        progress_pct = int(80 + (idx / max(total_scenes, 1)) * 12)
+        eta_sec = estimate_eta(time.time() - build_started_at, idx, total_scenes, fallback_sec=max(10, total_scenes * 2))
+        progress_pct = int(72 + (idx / max(total_scenes, 1)) * 20)
 
         write_status(job_dir, job_id, "running", {
             "step": "build_video",
@@ -2096,9 +2114,6 @@ def run_job(job_config, job_id):
 
     write_json(os.path.join(META_DIR, "scene_duration_log.json"), scene_duration_log)
 
-    # =========================
-    # 5. CONCAT VIDEO + ATTACH ONE AUDIO
-    # =========================
     write_status(job_dir, job_id, "running", {
         "step": "build_video",
         "substep": "final_render",
@@ -2108,8 +2123,6 @@ def run_job(job_config, job_id):
     })
 
     final_video = concatenate_videoclips(video_clips, method="compose")
-    final_video = final_video.with_audio(narration_clip)
-
     final_path = os.path.join(OUT_DIR, "final_story_video_adaptive.mp4")
 
     final_video.write_videofile(
@@ -2121,14 +2134,15 @@ def run_job(job_config, job_id):
         preset="medium",
     )
 
-    try:
-        narration_clip.close()
-    except Exception:
-        pass
-
     for v in video_clips:
         try:
             v.close()
+        except Exception:
+            pass
+
+    for a in audio_clips:
+        try:
+            a.close()
         except Exception:
             pass
 
@@ -2159,9 +2173,10 @@ def run_job(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "used_ai_planner": adaptive_plan["used_ai_planner"],
+        "timeline_mode": "per_scene_audio",
+        "total_audio_duration": round(total_audio_duration, 3),
         "finished_at": now_str(),
     }
-
 
 
 
