@@ -1,4 +1,5 @@
 # pipeline_module.py — Production serverless version for RunPod
+# Balanced quality/speed version: SDXL Base default, per-scene audio, preview/download use the same final output.
 # Converted from the tested notebook.
 # Entry point used by handler.py: run_job_serverless(job_config, job_id, base_dir, progress_callback)
 
@@ -277,9 +278,11 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
-        # image generation
-        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 16, min_value=1, max_value=30),
-        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 0.0, min_value=0.0, max_value=10.0),
+        # image generation — balanced quality/speed default.
+        # SDXL Turbo is not the default because it can look like sketches.
+        # SDXL Base at ~16 steps keeps images much clearer while still faster than 28–30 steps.
+        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 16, min_value=8, max_value=24),
+        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 5.8, min_value=1.0, max_value=8.0),
         "seed": _safe_int(job_config.get("seed"), 42),
 
         # retry
@@ -304,7 +307,7 @@ import torch
 import threading
 from PIL import Image
 
-SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/sdxl-turbo").strip()
+SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
 _IMAGE_PIPE = None
 _IMAGE_PIPE_LOCK = threading.Lock()
 
@@ -450,7 +453,7 @@ def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
     s = max(1, int(steps))
     if _is_turbo_model():
         return min(max(s, 4), 16)
-    return min(max(s, 8), 30)
+    return min(max(s, 8), 24)
 
 
 def load_image_pipe(force_reload: bool = False):
@@ -1331,7 +1334,7 @@ Return JSON exactly with this schema:
 {{
   "video_style_preset": "{locked_style if style_locked else 'one of allowed style presets'}",
   "num_inference_steps": 16,
-  "guidance_scale": 0.0,
+  "guidance_scale": 5.8,
   "global_negative_prompt_addon": "",
   "director_notes": "short note",
   "scenes": [
@@ -1456,10 +1459,12 @@ def create_adaptive_video_plan(
     video_style_preset = normalize_style_preset(requested_style)
     video_style = dict(STYLE_PRESETS[video_style_preset])
 
-    # Fast production defaults. SDXL Turbo is the default model, so keep steps low.
+    # Balanced production defaults.
+    # Do NOT use SDXL Turbo by default: it is fast but often sketchy/low-detail.
+    # SDXL Base at 16 steps gives a better speed/quality trade-off.
     default_steps = 16
     default_guidance = 0.0 if _is_turbo_model() else (
-        5.5 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.0
+        5.8 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.5
     )
 
     num_inference_steps = int((ai_plan or {}).get("num_inference_steps", job_config.get("num_inference_steps", default_steps)))
@@ -1738,18 +1743,20 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
     base = _load_image_rgb(image_path, width, height)
     scene_profile = (scene_profile or "gentle").lower()
 
+    # Natural pacing: reduce excessive Ken Burns movement.
+    # Old values made the video feel slow/heavy and sometimes blurred.
     if scene_profile == "dramatic":
-        max_zoom = 1.12
-        drift = 0.07
+        max_zoom = 1.065
+        drift = 0.025
     elif scene_profile == "slow":
-        max_zoom = 1.05
-        drift = 0.03
+        max_zoom = 1.025
+        drift = 0.010
     elif scene_profile == "gentle":
-        max_zoom = 1.07
-        drift = 0.04
+        max_zoom = 1.035
+        drift = 0.014
     else:
-        max_zoom = 1.09
-        drift = 0.05
+        max_zoom = 1.045
+        drift = 0.018
 
     def make_frame(t):
         p = 0.0 if duration <= 0 else min(1.0, max(0.0, t / duration))
@@ -1766,7 +1773,8 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
             yy, xx = np.ogrid[:h, :w]
             cx, cy = w / 2.0, h / 2.0
             dist = ((xx - cx) ** 2 / (cx ** 2) + (yy - cy) ** 2 / (cy ** 2))
-            vignette = np.clip(1.0 - 0.03 * dist, 0.97, 1.0)
+            # Very light vignette only; avoid dark/blurred-looking back half.
+            vignette = np.clip(1.0 - 0.012 * dist, 0.988, 1.0)
             frame = np.clip(frame.astype(np.float32) * vignette[..., None], 0, 255).astype(np.uint8)
 
         return frame
@@ -1971,10 +1979,12 @@ def run_job(job_config, job_id):
     video_style = adaptive_plan["video_style"]
     num_inference_steps = int(adaptive_plan["num_inference_steps"])
     guidance_scale = float(adaptive_plan["guidance_scale"])
-    # Hard safety clamp for fast production mode.
-    num_inference_steps = min(max(num_inference_steps, 1), 16 if _is_turbo_model() else 30)
+    # Hard safety clamp for balanced production mode.
+    num_inference_steps = min(max(num_inference_steps, 4 if _is_turbo_model() else 8), 16 if _is_turbo_model() else 24)
     if _is_turbo_model():
         guidance_scale = max(0.0, min(guidance_scale, 1.0))
+    else:
+        guidance_scale = max(1.0, min(guidance_scale, 8.0))
     scene_objects = adaptive_plan["scene_objects"]
     selected_voice = adaptive_plan.get(
         "selected_voice",
@@ -2017,8 +2027,8 @@ def run_job(job_config, job_id):
     images_started_at = time.time()
     image_max_workers = _get_image_max_workers(job_config)
 
-    # SDXL Turbo is already much faster. Workers are configurable but capped
-    # to avoid CUDA OOM on 24GB GPUs.
+    # Workers are configurable but capped to avoid CUDA OOM on 24GB GPUs.
+    # For SDXL Base, IMAGE_MAX_WORKERS=1 is safest; try 2 only on larger GPUs.
     if image_max_workers <= 1:
         for idx, scene in enumerate(scene_objects):
             img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
