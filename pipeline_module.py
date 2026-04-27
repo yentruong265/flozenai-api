@@ -1,12 +1,13 @@
 # pipeline_module.py — Production serverless version for RunPod
-# Balanced quality/speed version: SDXL Base default, per-scene audio, preview/download use the same final output.
+# Lightning quality/speed version: SDXL Base + optional SDXL-Lightning LoRA, compact prompts,
+# per-scene audio, preview/download use the same final output.
 # Converted from the tested notebook.
 # Entry point used by handler.py: run_job_serverless(job_config, job_id, base_dir, progress_callback)
 
 import os
 import torch
 from pathlib import Path
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler, EulerDiscreteScheduler
 
 DRIVE_ROOT = os.getenv("JOB_ROOT", "/tmp/easyai_jobs")
 PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
@@ -278,11 +279,11 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
-        # image generation — balanced quality/speed default.
-        # SDXL Turbo is not the default because it can look like sketches.
-        # SDXL Base at ~16 steps keeps images much clearer while still faster than 28–30 steps.
-        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 16, min_value=8, max_value=24),
-        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 5.8, min_value=1.0, max_value=8.0),
+        # image generation — quality/speed default.
+        # Default uses SDXL Base + SDXL-Lightning LoRA when IMAGE_ACCELERATION=lightning.
+        # This is faster than SDXL Base 16–30 steps, but clearer than SDXL Turbo.
+        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), int(os.getenv("DEFAULT_IMAGE_STEPS", "4")), min_value=2, max_value=24),
+        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), float(os.getenv("DEFAULT_GUIDANCE_SCALE", "0.0")), min_value=0.0, max_value=8.0),
         "seed": _safe_int(job_config.get("seed"), 42),
 
         # retry
@@ -308,8 +309,13 @@ import threading
 from PIL import Image
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
+IMAGE_ACCELERATION = os.getenv("IMAGE_ACCELERATION", "lightning").strip().lower()
+SDXL_LIGHTNING_REPO = os.getenv("SDXL_LIGHTNING_REPO", "ByteDance/SDXL-Lightning").strip()
+SDXL_LIGHTNING_LORA = os.getenv("SDXL_LIGHTNING_LORA", "sdxl_lightning_4step_lora.safetensors").strip()
+SDXL_LIGHTNING_LORA_SCALE = float(os.getenv("SDXL_LIGHTNING_LORA_SCALE", "1.0"))
 _IMAGE_PIPE = None
 _IMAGE_PIPE_LOCK = threading.Lock()
+_IMAGE_ACCELERATION_APPLIED = None
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -379,7 +385,7 @@ def _is_vertical_frame(width: int, height: int) -> bool:
 
 
 def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> str:
-    prompt = shorten_prompt_for_sdxl(prompt, max_chars=380)
+    prompt = shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
 
     if _is_vertical_frame(width, height):
         prompt = ", ".join([
@@ -402,7 +408,7 @@ def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> st
             "balanced left-right spacing",
         ])
 
-    return shorten_prompt_for_sdxl(prompt, max_chars=380)
+    return shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
 
 
 def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, height: int) -> str:
@@ -424,11 +430,19 @@ def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, 
             "subject filling entire frame",
         ])
 
-    return shorten_prompt_for_sdxl(negative_prompt, max_chars=360)
+    return shorten_prompt_for_sdxl(negative_prompt, max_chars=260, max_words=55)
 
 
 def _is_turbo_model() -> bool:
     return "turbo" in (SDXL_MODEL_ID or "").lower()
+
+
+def _use_lightning_lora() -> bool:
+    return (IMAGE_ACCELERATION in {"lightning", "sdxl_lightning", "lightning_lora"}) and (not _is_turbo_model())
+
+
+def _is_lightning_active() -> bool:
+    return _IMAGE_ACCELERATION_APPLIED == "lightning"
 
 
 def _get_guidance_scale(width: int, height: int, guidance_scale: float) -> float:
@@ -457,67 +471,92 @@ def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
 
 
 def load_image_pipe(force_reload: bool = False):
-    global _IMAGE_PIPE
+    global _IMAGE_PIPE, _IMAGE_ACCELERATION_APPLIED
 
     if _IMAGE_PIPE is not None and not force_reload:
         return _IMAGE_PIPE
 
-    if force_reload:
-        _cleanup_existing_pipe()
-    else:
-        free_memory()
+    with _IMAGE_PIPE_LOCK:
+        if _IMAGE_PIPE is not None and not force_reload:
+            return _IMAGE_PIPE
 
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if force_reload:
+            _cleanup_existing_pipe()
+        else:
+            free_memory()
 
-    print("🔄 Loading SDXL:", SDXL_MODEL_ID)
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        print("🔄 Loading SDXL:", SDXL_MODEL_ID)
 
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        SDXL_MODEL_ID,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        variant="fp16" if torch.cuda.is_available() else None,
-    )
-
-    try:
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            pipe.scheduler.config,
-            use_karras_sigmas=True
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            SDXL_MODEL_ID,
+            torch_dtype=dtype,
+            use_safetensors=True,
+            variant="fp16" if torch.cuda.is_available() else None,
         )
-    except Exception:
+
+        _IMAGE_ACCELERATION_APPLIED = "none"
+        if _use_lightning_lora():
+            try:
+                print(f"⚡ Loading SDXL-Lightning LoRA: {SDXL_LIGHTNING_REPO} / {SDXL_LIGHTNING_LORA}")
+                pipe.load_lora_weights(SDXL_LIGHTNING_REPO, weight_name=SDXL_LIGHTNING_LORA)
+                try:
+                    pipe.fuse_lora(lora_scale=SDXL_LIGHTNING_LORA_SCALE)
+                except TypeError:
+                    pipe.fuse_lora()
+                try:
+                    pipe.scheduler = EulerDiscreteScheduler.from_config(
+                        pipe.scheduler.config,
+                        timestep_spacing="trailing",
+                    )
+                except Exception:
+                    pass
+                _IMAGE_ACCELERATION_APPLIED = "lightning"
+                print("✅ SDXL-Lightning LoRA applied")
+            except Exception as e:
+                print("WARN: could not load Lightning LoRA; fallback to normal SDXL:", repr(e))
+                _IMAGE_ACCELERATION_APPLIED = "none"
+
+        if _IMAGE_ACCELERATION_APPLIED != "lightning":
+            try:
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                    pipe.scheduler.config,
+                    use_karras_sigmas=True,
+                )
+            except Exception:
+                try:
+                    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+                except Exception:
+                    pass
+
         try:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+            pipe.set_progress_bar_config(disable=True)
         except Exception:
             pass
 
-    try:
-        pipe.set_progress_bar_config(disable=True)
-    except Exception:
-        pass
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
 
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
+        try:
+            pipe.enable_vae_slicing()
+        except Exception:
+            pass
 
-    try:
-        pipe.enable_vae_slicing()
-    except Exception:
-        pass
+        try:
+            pipe.enable_vae_tiling()
+        except Exception:
+            pass
 
-    try:
-        pipe.enable_vae_tiling()
-    except Exception:
-        pass
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
+        else:
+            pipe = pipe.to("cpu")
 
-    if torch.cuda.is_available():
-        pipe = pipe.to("cuda")
-    else:
-        pipe = pipe.to("cpu")
-
-    _IMAGE_PIPE = pipe
-    print("✅ SDXL ready")
-    return _IMAGE_PIPE
-
+        _IMAGE_PIPE = pipe
+        print(f"✅ SDXL ready | acceleration={_IMAGE_ACCELERATION_APPLIED}")
+        return _IMAGE_PIPE
 
 def save_image_safely(image: Image.Image, out_path: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -574,11 +613,11 @@ def generate_image(
             if is_vertical and attempt >= 2:
                 run_prompt = shorten_prompt_for_sdxl(
                     run_prompt + ", camera pulled back more, full body clearly visible, extra space above and below subject",
-                    max_chars=380
+                    max_chars=240
                 )
                 run_negative_prompt = shorten_prompt_for_sdxl(
                     run_negative_prompt + ", face too close, torso cropped, feet cropped, oversized subject",
-                    max_chars=360
+                    max_chars=260
                 )
                 run_guidance_scale = min(run_guidance_scale + 0.3, 12.0)
                 run_steps = min(run_steps + 2, 80)
@@ -699,8 +738,8 @@ STYLE_PRESETS = {
     "dramatic_cinematic": {
         "name": "dramatic_cinematic",
         "prompt_style": (
-            "cinematic live action frame, dramatic lighting, photorealistic, film still, "
-            "realistic proportions, high detail, strong atmosphere, expressive camera language, 35mm cinema"
+            "photorealistic cinematic frame, dramatic light, realistic proportions, "
+            "strong atmosphere, 35mm cinema"
         ),
         "negative_style": (
             "cartoon, anime, drawing, painting, 2d, cel shading, low realism, flat image, childish illustration"
@@ -723,10 +762,8 @@ STYLE_PRESETS = {
     "cinematic_realistic": {
         "name": "cinematic_realistic",
         "prompt_style": (
-            "ultra realistic cinematic photography, documentary realism, real life everyday scene, "
-            "candid moment, modern real environment, realistic face, natural skin texture, "
-            "35mm film look, shallow depth of field, natural lighting, detailed composition, "
-            "high dynamic range, professional color grading"
+            "cinematic realistic photo, realistic daily scene, natural people, "
+            "35mm photo, natural light, clear subject, professional color"
         ),
         "negative_style": (
             "cartoon, anime, illustration, drawing, painting, storybook, 2d, stylized face, "
@@ -1161,18 +1198,12 @@ def build_visual_prompt(
 
     if style_name == "cinematic_realistic":
         parts = [
-            "ultra realistic cinematic photography",
-            "documentary realism",
-            "real life everyday scene",
-            "candid moment",
-            "natural human behavior",
-            "modern real environment",
-            "35mm film look",
-            "shallow depth of field",
-            "high dynamic range",
-            "realistic face",
-            "natural skin texture",
-            "non-illustration",
+            "cinematic realistic photo",
+            "realistic daily scene",
+            "natural people",
+            "35mm photo",
+            "natural light",
+            "clear subject",
             subject or "ordinary people",
             action or "natural everyday activity",
             expression or "authentic facial expression",
@@ -1222,7 +1253,7 @@ def build_visual_prompt(
         ]
 
     prompt = ", ".join([p for p in parts if p])
-    return shorten_prompt_for_sdxl(prompt, max_chars=380)
+    return shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
 
 
 def build_scene_profile_from_plan(scene_plan: Dict[str, Any], idx: int, video_style: Dict[str, Any]) -> str:
@@ -1267,8 +1298,8 @@ def plan_video_with_ai(
     user_style_text = locked_style or "auto"
     aspect_text = "9:16 vertical TikTok/Reels/Shorts" if is_vertical else "16:9 landscape YouTube/web"
 
-    min_scenes = int(job_config.get("min_scenes", 4) or 4)
-    max_scenes = int(job_config.get("max_scenes", 8) or 8)
+    min_scenes = int(job_config.get("min_scenes", 3) or 3)
+    max_scenes = int(job_config.get("max_scenes", 10) or 10)
     min_scenes = max(2, min(min_scenes, 10))
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
@@ -1303,17 +1334,21 @@ IMPORTANT STYLE RULES:
 
 IMPORTANT PLANNING RULES:
 5. Understand the user request and turn it into a coherent short video.
-6. Split the content into {min_scenes} to {max_scenes} visually different scenes.
-7. Even if the input is one paragraph, you MUST still create multiple scenes.
-8. Each scene must represent a different moment, action, camera framing, or visual idea.
-9. Each scene must include narration_text. This is the spoken narration for that scene.
-10. narration_text must follow the user's requested content; do not invent unrelated facts.
+6. Choose the scene count naturally based on the content and target length, within {min_scenes} to {max_scenes} scenes.
+7. For short videos under 45 seconds, usually create 4-7 scenes, but use your judgment.
+8. Even if the input is one paragraph, you MUST still create multiple coherent scenes.
+9. Each scene must represent a different moment, action, camera framing, or visual idea.
+10. Each scene must include narration_text. This is the spoken narration for that scene.
+11. narration_text must follow the user's requested content; do not invent unrelated facts.
+12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
+13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
 11. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
 12. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
 13. If narration_text mentions a person, the visual_prompt must show that person.
 14. If narration_text mentions an action, the visual_prompt must show that visible action.
 15. If narration_text mentions a place, product, object, or situation, the visual_prompt must include it clearly.
 16. Each visual_prompt must be concrete enough for image generation: subject + action + location + camera framing + mood + lighting.
+17. Keep visual_prompt compact: maximum 45-55 English words. Avoid long repeated style phrases.
 17. Avoid repeating the same visual_prompt across scenes.
 18. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
 19. Keep visual prompts practical and literal, not abstract.
@@ -1333,8 +1368,8 @@ STYLE-SPECIFIC RULES:
 Return JSON exactly with this schema:
 {{
   "video_style_preset": "{locked_style if style_locked else 'one of allowed style presets'}",
-  "num_inference_steps": 16,
-  "guidance_scale": 5.8,
+  "num_inference_steps": 4,
+  "guidance_scale": 0.0,
   "global_negative_prompt_addon": "",
   "director_notes": "short note",
   "scenes": [
@@ -1424,8 +1459,8 @@ def create_adaptive_video_plan(
     style_locked = is_style_locked(job_config)
     is_vertical = is_vertical_aspect(job_config)
 
-    min_scenes = int(job_config.get("min_scenes", 4) or 4)
-    max_scenes = int(job_config.get("max_scenes", 8) or 8)
+    min_scenes = int(job_config.get("min_scenes", 3) or 3)
+    max_scenes = int(job_config.get("max_scenes", 10) or 10)
     min_scenes = max(2, min(min_scenes, 10))
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
@@ -1459,12 +1494,12 @@ def create_adaptive_video_plan(
     video_style_preset = normalize_style_preset(requested_style)
     video_style = dict(STYLE_PRESETS[video_style_preset])
 
-    # Balanced production defaults.
-    # Do NOT use SDXL Turbo by default: it is fast but often sketchy/low-detail.
-    # SDXL Base at 16 steps gives a better speed/quality trade-off.
-    default_steps = 16
-    default_guidance = 0.0 if _is_turbo_model() else (
-        5.8 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.5
+    # Fast high-quality production defaults.
+    # Default uses SDXL Base + SDXL-Lightning LoRA: faster than normal SDXL,
+    # but clearer than SDXL Turbo. If Lightning cannot load, fallback uses normal SDXL.
+    default_steps = int(os.getenv("DEFAULT_IMAGE_STEPS", "4")) if _use_lightning_lora() else 16
+    default_guidance = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "0.0")) if _use_lightning_lora() else (
+        5.6 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.2
     )
 
     num_inference_steps = int((ai_plan or {}).get("num_inference_steps", job_config.get("num_inference_steps", default_steps)))
@@ -1535,12 +1570,13 @@ def create_adaptive_video_plan(
         # Prefer AI's explicit visual_prompt; fallback to deterministic builder.
         ai_visual_prompt = str(raw_scene_plan.get("visual_prompt", "") or "").strip()
         if ai_visual_prompt:
-            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=320)
+            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=220, max_words=45)
             style_prompt = video_style.get("prompt_style", "")
             literal_match = f"literal scene matching narration: {chunk[:140]}"
             visual_prompt = shorten_prompt_for_sdxl(
                 ", ".join([base_prompt, literal_match, style_prompt, "style preset: " + video_style_preset]),
-                max_chars=380
+                max_chars=240,
+                max_words=55
             )
         else:
             visual_prompt = build_visual_prompt(
@@ -1746,17 +1782,17 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
     # Natural pacing: reduce excessive Ken Burns movement.
     # Old values made the video feel slow/heavy and sometimes blurred.
     if scene_profile == "dramatic":
-        max_zoom = 1.065
-        drift = 0.025
-    elif scene_profile == "slow":
-        max_zoom = 1.025
-        drift = 0.010
-    elif scene_profile == "gentle":
-        max_zoom = 1.035
-        drift = 0.014
-    else:
         max_zoom = 1.045
         drift = 0.018
+    elif scene_profile == "slow":
+        max_zoom = 1.018
+        drift = 0.006
+    elif scene_profile == "gentle":
+        max_zoom = 1.026
+        drift = 0.008
+    else:
+        max_zoom = 1.032
+        drift = 0.010
 
     def make_frame(t):
         p = 0.0 if duration <= 0 else min(1.0, max(0.0, t / duration))
@@ -1774,7 +1810,7 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
             cx, cy = w / 2.0, h / 2.0
             dist = ((xx - cx) ** 2 / (cx ** 2) + (yy - cy) ** 2 / (cy ** 2))
             # Very light vignette only; avoid dark/blurred-looking back half.
-            vignette = np.clip(1.0 - 0.012 * dist, 0.988, 1.0)
+            vignette = np.clip(1.0 - 0.006 * dist, 0.994, 1.0)
             frame = np.clip(frame.astype(np.float32) * vignette[..., None], 0, 255).astype(np.uint8)
 
         return frame
@@ -1887,7 +1923,7 @@ def _get_image_max_workers(job_config=None) -> int:
     Practical note:
     - On one small GPU, too many workers can cause CUDA OOM.
     - Default is 1 for safety.
-    - Set IMAGE_MAX_WORKERS=2 only after the container is stable with SDXL Turbo.
+    - Set IMAGE_MAX_WORKERS=2 only after the container is stable with your selected image model.
     """
     raw = None
     if isinstance(job_config, dict):
@@ -1911,7 +1947,7 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         seed=seed + int(scene["scene_id"]),
-        retries=1 if _is_turbo_model() else 2,
+        retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
         scene_id=scene["scene_id"],
     )
     return img_path
@@ -1979,11 +2015,13 @@ def run_job(job_config, job_id):
     video_style = adaptive_plan["video_style"]
     num_inference_steps = int(adaptive_plan["num_inference_steps"])
     guidance_scale = float(adaptive_plan["guidance_scale"])
-    # Hard safety clamp for balanced production mode.
-    num_inference_steps = min(max(num_inference_steps, 4 if _is_turbo_model() else 8), 16 if _is_turbo_model() else 24)
-    if _is_turbo_model():
+    # Hard safety clamp for production mode.
+    # Lightning uses very few steps and guidance 0. Normal SDXL keeps moderate guidance.
+    if _is_turbo_model() or _use_lightning_lora():
+        num_inference_steps = min(max(num_inference_steps, 4), 8)
         guidance_scale = max(0.0, min(guidance_scale, 1.0))
     else:
+        num_inference_steps = min(max(num_inference_steps, 8), 24)
         guidance_scale = max(1.0, min(guidance_scale, 8.0))
     scene_objects = adaptive_plan["scene_objects"]
     selected_voice = adaptive_plan.get(
@@ -2009,6 +2047,8 @@ def run_job(job_config, job_id):
         "timeline_mode": "per_scene_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
+        "image_acceleration": IMAGE_ACCELERATION,
+        "lightning_lora": SDXL_LIGHTNING_LORA if _use_lightning_lora() else "",
     })
 
     write_json(os.path.join(META_DIR, "scene_profiles.json"), scene_objects)
@@ -2296,6 +2336,8 @@ def run_job(job_config, job_id):
         "timeline_mode": "per_scene_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
+        "image_acceleration": IMAGE_ACCELERATION,
+        "lightning_lora": SDXL_LIGHTNING_LORA if _use_lightning_lora() else "",
         "total_audio_duration": round(total_audio_duration, 3),
         "finished_at": now_str(),
     }
