@@ -335,7 +335,8 @@ def free_memory():
             pass
 
 
-def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380) -> str:
+def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380, max_words: int = None) -> str:
+    """Compact SDXL prompt by both characters and words to avoid CLIP truncation."""
     prompt = " ".join((prompt or "").strip().split())
     if not prompt:
         return "clear coherent scene"
@@ -345,8 +346,32 @@ def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380) -> str:
     prompt = re.sub(r"\s+,", ",", prompt)
     prompt = re.sub(r",\s*,+", ", ", prompt).strip(" ,")
 
-    if len(prompt) > max_chars:
-        prompt = prompt[:max_chars]
+    replacements = {
+        "ultra realistic cinematic photography": "cinematic realistic photo",
+        "documentary realism": "realistic documentary",
+        "real life everyday scene": "realistic daily scene",
+        "candid moment": "natural moment",
+        "modern real environment": "real environment",
+        "natural human behavior": "natural people",
+        "high dynamic range": "HDR",
+        "professional color grading": "professional color",
+        "shallow depth of field": "soft depth of field",
+    }
+    for k, v in replacements.items():
+        prompt = re.sub(re.escape(k), v, prompt, flags=re.IGNORECASE)
+
+    if max_words is not None:
+        try:
+            mw = int(max_words)
+            if mw > 0:
+                words = prompt.split()
+                if len(words) > mw:
+                    prompt = " ".join(words[:mw]).strip(" ,")
+        except Exception:
+            pass
+
+    if max_chars is not None and len(prompt) > int(max_chars):
+        prompt = prompt[:int(max_chars)]
         if "," in prompt:
             prompt = prompt.rsplit(",", 1)[0]
         prompt = prompt.strip(" ,")
@@ -874,7 +899,8 @@ def normalize_style_preset(style_value: str) -> str:
 
 
 
-def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380) -> str:
+def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380, max_words: int = None) -> str:
+    """Compact SDXL prompt by both characters and words to avoid CLIP truncation."""
     prompt = " ".join((prompt or "").strip().split())
     if not prompt:
         return "clear coherent scene"
@@ -884,8 +910,32 @@ def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380) -> str:
     prompt = re.sub(r"\s+,", ",", prompt)
     prompt = re.sub(r",\s*,+", ", ", prompt).strip(" ,")
 
-    if len(prompt) > max_chars:
-        prompt = prompt[:max_chars]
+    replacements = {
+        "ultra realistic cinematic photography": "cinematic realistic photo",
+        "documentary realism": "realistic documentary",
+        "real life everyday scene": "realistic daily scene",
+        "candid moment": "natural moment",
+        "modern real environment": "real environment",
+        "natural human behavior": "natural people",
+        "high dynamic range": "HDR",
+        "professional color grading": "professional color",
+        "shallow depth of field": "soft depth of field",
+    }
+    for k, v in replacements.items():
+        prompt = re.sub(re.escape(k), v, prompt, flags=re.IGNORECASE)
+
+    if max_words is not None:
+        try:
+            mw = int(max_words)
+            if mw > 0:
+                words = prompt.split()
+                if len(words) > mw:
+                    prompt = " ".join(words[:mw]).strip(" ,")
+        except Exception:
+            pass
+
+    if max_chars is not None and len(prompt) > int(max_chars):
+        prompt = prompt[:int(max_chars)]
         if "," in prompt:
             prompt = prompt.rsplit(",", 1)[0]
         prompt = prompt.strip(" ,")
