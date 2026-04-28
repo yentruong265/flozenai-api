@@ -275,7 +275,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # tts controls
         "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
         "tts_pitch": _safe_str(job_config.get("tts_pitch"), "+0Hz"),
-        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.20, min_value=0.7, max_value=1.5),
+        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.28, min_value=0.7, max_value=1.45),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
@@ -2214,6 +2214,7 @@ def create_adaptive_video_plan(
             "source_chunk": chunk,
             "scene_plan": scene_plan,
             "aspect_ratio": "9:16" if is_vertical else "16:9",
+            "video_style_preset": video_style_preset,
         })
 
     return {
@@ -2317,6 +2318,51 @@ async def save_tts(
     meta["segment_plan"] = [{"voice": EDGE_TTS_DEFAULT_VOICE, "text": text}]
     return meta
 
+
+
+def speed_up_audio_ffmpeg(audio_path: str, speed: float = 1.0) -> str:
+    """Speed up TTS audio using ffmpeg atempo without changing the code path for TTS.
+
+    Returns the original path if speed is near 1.0 or ffmpeg fails.
+    """
+    try:
+        speed = float(speed or 1.0)
+    except Exception:
+        speed = 1.0
+
+    if abs(speed - 1.0) < 0.03:
+        return audio_path
+
+    # ffmpeg atempo supports 0.5-2.0 per filter. We clamp here for safety.
+    speed = max(0.7, min(speed, 1.45))
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        print("WARN: ffmpeg not found; cannot apply speech_speed")
+        return audio_path
+
+    base, ext = os.path.splitext(audio_path)
+    out_path = f"{base}_speed{str(round(speed, 2)).replace('.', '_')}{ext or '.mp3'}"
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", audio_path,
+        "-filter:a", f"atempo={speed:.3f}",
+        "-vn",
+        out_path,
+    ]
+
+    try:
+        import subprocess
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+        print("WARN: ffmpeg speed-up failed:", result.stderr.decode("utf-8", errors="ignore")[-300:])
+    except Exception as e:
+        print("WARN: ffmpeg speed-up exception:", repr(e))
+
+    return audio_path
 
 
 def run_async_safely(coro):
@@ -2574,20 +2620,37 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
 
 
 def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
-    """Use local stock or Pexels when available; otherwise fall back to SDXL."""
+    """Use stock/Pexels for realistic or artifact-risk scenes; otherwise fall back to SDXL.
+
+    Important fix:
+    - Even if the AI planner marks a risky human/body/object scene as "ai",
+      we still try stock first. This prevents ugly SDXL artifacts such as
+      broken limbs, extra fingers, distorted faces, or impossible poses.
+    """
     visual_source = str(scene.get("visual_source", "ai") or "ai").lower()
     is_vertical = _is_vertical_frame(width, height)
 
-    if visual_source == "stock":
-        stock_query = scene.get("stock_query") or scene.get("visual_prompt") or scene.get("voice_text") or ""
+    narration = scene.get("voice_text") or scene.get("source_chunk") or ""
+    scene_plan = scene.get("scene_plan", {}) or {}
+    video_style_preset = scene.get("video_style_preset", "") or ""
+
+    force_stock_first = False
+    try:
+        force_stock_first = scene_stock_friendly(narration, scene_plan, video_style_preset) or scene_has_complex_body_pose(narration, scene_plan)
+    except Exception:
+        force_stock_first = False
+
+    if visual_source == "stock" or force_stock_first:
+        stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
 
         # 1) Try local stock asset folder first, if present.
         if ENABLE_STOCK_ASSETS:
-            stock = find_stock_asset(stock_query, scene.get("scene_plan", {}) or {}, is_vertical=is_vertical)
+            stock = find_stock_asset(stock_query, scene_plan, is_vertical=is_vertical)
             if stock:
                 print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                 prepare_stock_image(stock["path"], img_path, width, height)
                 scene["visual_used"] = "stock_local"
+                scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
                 scene["stock_match_score"] = stock.get("match_score")
                 scene["visual_file"] = os.path.basename(img_path)
@@ -2600,6 +2663,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             ok = prepare_pexels_image(pexels["url"], img_path, width, height)
             if ok:
                 scene["visual_used"] = "stock_pexels"
+                scene["visual_source"] = "stock"
                 scene["stock_query_used"] = pexels.get("query", "")
                 scene["pexels_id"] = pexels.get("pexels_id", "")
                 scene["pexels_photographer"] = pexels.get("photographer", "")
@@ -2828,6 +2892,13 @@ def run_job(job_config, job_id):
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
             raise RuntimeError(f"Scene TTS output missing or empty: {audio_path}")
 
+        # Apply speech speed after TTS generation. OpenAI TTS does not use the
+        # speech_speed field directly, so this post-process is required.
+        speech_speed = _clamp_float(job_config.get("speech_speed"), 1.28, min_value=0.7, max_value=1.45)
+        final_audio_path = speed_up_audio_ffmpeg(audio_path, speech_speed)
+        if final_audio_path != audio_path:
+            audio_path = final_audio_path
+
         audio_clip = AudioFileClip(audio_path)
         duration = float(audio_clip.duration or 0)
         if duration <= 0:
@@ -2845,6 +2916,7 @@ def run_job(job_config, job_id):
             "scene_id": scene_id,
             "audio_file": os.path.basename(audio_path),
             "audio_duration": round(duration, 3),
+            "speech_speed": speech_speed,
             "voice_used": tts_meta.get("voice_used", selected_voice),
             "tts_engine": tts_meta.get("engine", "unknown"),
             "text_len": len(voice_text),
