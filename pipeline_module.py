@@ -275,7 +275,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # tts controls
         "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
         "tts_pitch": _safe_str(job_config.get("tts_pitch"), "+0Hz"),
-        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.05, min_value=0.7, max_value=1.5),
+        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.20, min_value=0.7, max_value=1.5),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
@@ -316,9 +316,11 @@ _IMAGE_ACCELERATION_APPLIED = "none"
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
-    "bad anatomy, deformed, distorted face, ugly eyes, bad hands, extra fingers, extra limbs, "
-    "duplicate subject, cropped, cut off, watermark, text, logo, oversaturated, flat lighting, "
-    "plastic skin, unrealistic skin, cartoon, anime, illustration, painting, storybook, 2d, vector art"
+    "bad anatomy, deformed, distorted face, asymmetrical face, ugly eyes, crossed eyes, "
+    "bad hands, fused fingers, extra fingers, missing fingers, extra limbs, missing limbs, "
+    "duplicate subject, cloned face, cropped, cut off, out of frame, watermark, text, logo, subtitles, "
+    "oversaturated, flat lighting, plastic skin, unrealistic skin, uncanny face, "
+    "cartoon, anime, illustration, painting, storybook, 2d, vector art"
 )
 
 
@@ -596,6 +598,13 @@ def generate_image(
 
     num_inference_steps = _get_num_inference_steps(width, height, num_inference_steps)
     guidance_scale = _get_guidance_scale(width, height, guidance_scale)
+
+    # Slightly improve quality for human/face scenes, where AI artifacts are most visible.
+    human_prompt = _has_any_term(prompt, _PERSON_WORDS) if "_PERSON_WORDS" in globals() else False
+    if human_prompt and not _is_turbo_model():
+        num_inference_steps = min(num_inference_steps + 2, 24)
+        guidance_scale = min(max(guidance_scale, 6.2), 7.2)
+
     retries = max(1, int(retries))
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -784,9 +793,10 @@ STYLE_PRESETS = {
 }
 
 BASE_NEGATIVE_PROMPT = (
-    "blurry, low quality, bad anatomy, extra fingers, extra limbs, duplicate subject, "
-    "deformed face, cropped, text, watermark, logo, oversaturated, messy composition, "
-    "bad hands, ugly eyes, distorted body, broken perspective"
+    "blurry, low quality, bad anatomy, deformed face, asymmetrical face, ugly eyes, "
+    "bad hands, fused fingers, extra fingers, missing fingers, extra limbs, missing limbs, "
+    "duplicate subject, cloned face, cropped, cut off, out of frame, text, watermark, logo, subtitles, "
+    "oversaturated, messy composition, distorted body, broken perspective, uncanny face, plastic skin"
 )
 
 OPENAI_TTS_VOICES = {
@@ -1169,6 +1179,189 @@ def get_composition_hints(is_vertical: bool, style_name: str, scene_plan: Dict[s
     ]
 
 
+
+
+# ===== Scene grounding + AI artifact reduction helpers =====
+
+_PERSON_WORDS = {
+    "person", "people", "man", "woman", "boy", "girl", "child", "children", "old man", "old woman",
+    "father", "mother", "son", "daughter", "monk", "teacher", "customer", "seller",
+    "người", "ông", "bà", "cô", "cậu", "bé", "trẻ", "con trai", "con gái", "cha", "mẹ",
+    "nhà sư", "thiền sư", "khách hàng", "người bán", "phụ nữ", "đàn ông", "thanh niên"
+}
+
+_ABSTRACT_WORDS = {
+    "số phận", "may mắn", "bài học", "ý nghĩa", "hạnh phúc", "khổ đau", "vô thường", "nhân quả",
+    "fate", "luck", "lesson", "meaning", "happiness", "suffering", "karma", "impermanence"
+}
+
+
+def _has_any_term(text: str, terms) -> bool:
+    t = (text or "").lower()
+    return any(term in t for term in terms)
+
+
+def scene_has_human(scene_plan: Dict[str, Any], narration: str = "") -> bool:
+    joined = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+    return _has_any_term(joined, _PERSON_WORDS)
+
+
+def scene_is_abstract(narration: str, scene_plan: Dict[str, Any]) -> bool:
+    joined = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+    ]).lower()
+    return _has_any_term(joined, _ABSTRACT_WORDS)
+
+
+def _clean_prompt_piece(value: str, max_words: int = 12) -> str:
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
+    if not value:
+        return ""
+    words = value.split()
+    if len(words) > max_words:
+        value = " ".join(words[:max_words]).strip(" ,.;:")
+    return value
+
+
+def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_vertical: bool) -> str:
+    """Build a short, concrete visual anchor from structured planner fields."""
+    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 10)
+    action = _clean_prompt_piece(scene_plan.get("action", ""), 12)
+    location = _clean_prompt_piece(scene_plan.get("location", ""), 10)
+    expression = _clean_prompt_piece(scene_plan.get("expression", ""), 8)
+    shot = _clean_prompt_piece(scene_plan.get("shot", ""), 8)
+    lighting = _clean_prompt_piece(scene_plan.get("lighting", ""), 8)
+    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 8)
+
+    if not subject:
+        subject = "main person" if scene_has_human(scene_plan, narration) else "main subject"
+    if not action:
+        action = "visible action matching narration"
+    if not location:
+        location = "realistic setting matching narration"
+
+    if is_vertical and not shot:
+        shot = "portrait medium shot"
+    elif not shot:
+        shot = "eye-level medium shot"
+
+    parts = [
+        subject,
+        action,
+        location,
+        expression,
+        shot,
+        lighting or "natural light",
+        mood,
+    ]
+    return ", ".join([p for p in parts if p])
+
+
+def build_grounded_visual_prompt(
+    base_prompt: str,
+    narration: str,
+    video_style: Dict[str, Any],
+    scene_plan: Dict[str, Any],
+    is_vertical: bool = False,
+) -> str:
+    """
+    Make image prompt more grounded:
+    - prioritize visible subject/action/location from the narration/scene plan
+    - avoid abstract/symbolic prompts
+    - add human anatomy safeguards only when people appear
+    - keep prompt short enough to reduce CLIP truncation
+    """
+    style_name = (video_style.get("name") or "").strip().lower()
+    anchor = _scene_anchor_from_plan(scene_plan, narration, is_vertical)
+
+    if style_name == "cinematic_realistic":
+        style_terms = "cinematic realistic photo, natural light, realistic faces, clear subject"
+    elif style_name == "dramatic_cinematic":
+        style_terms = "photorealistic cinematic frame, dramatic light, realistic proportions"
+    elif style_name == "zen_soft":
+        style_terms = "calm soft visual, peaceful composition, gentle light"
+    elif style_name == "warm_storybook":
+        style_terms = "warm storybook illustration, clean composition, expressive subject"
+    elif style_name == "watercolor_poetic":
+        style_terms = "poetic watercolor, soft brush texture, clear subject"
+    else:
+        style_terms = str(video_style.get("prompt_style", "") or "")
+
+    human_terms = ""
+    if scene_has_human(scene_plan, narration):
+        human_terms = (
+            "one clear human subject, natural face, correct anatomy, realistic hands, "
+            "normal fingers, detailed eyes"
+        )
+
+    abstract_guard = ""
+    if scene_is_abstract(narration, scene_plan):
+        abstract_guard = "show a concrete real moment, not abstract symbolism"
+
+    if is_vertical:
+        composition = "portrait framing, subject centered, safe margins, no cropped head or feet"
+    else:
+        composition = "landscape framing, balanced composition, eye-level camera"
+
+    # Keep AI prompt, but only as support after the structured anchor.
+    base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=160, max_words=32)
+    narration_hint = shorten_prompt_for_sdxl(f"matches narration: {narration}", max_chars=100, max_words=18)
+
+    prompt = ", ".join([
+        anchor,
+        style_terms,
+        human_terms,
+        abstract_guard,
+        composition,
+        base_prompt,
+        narration_hint,
+    ])
+    return shorten_prompt_for_sdxl(prompt, max_chars=260, max_words=58)
+
+
+def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
+    """Add scene-specific negatives without making the negative prompt too long."""
+    extras = []
+    if scene_has_human(scene_plan, narration):
+        extras.extend([
+            "bad face", "uncanny face", "asymmetrical eyes", "bad hands",
+            "fused fingers", "extra fingers", "missing fingers", "extra arms", "extra legs"
+        ])
+    if is_vertical:
+        extras.extend([
+            "cropped head", "cut off feet", "subject too close", "extreme close-up", "off-center subject"
+        ])
+    if scene_is_abstract(narration, scene_plan):
+        extras.extend(["abstract symbols", "floating objects", "surreal unrelated scene"])
+
+    neg = ", ".join([global_negative_prompt or "", ", ".join(extras)])
+    return shorten_prompt_for_sdxl(neg, max_chars=300, max_words=65)
+
+
+def validate_and_repair_scene_plan(scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> Dict[str, Any]:
+    """Defensive repair for incomplete AI planner output."""
+    sp = dict(scene_plan or {})
+    if not str(sp.get("main_subject", "") or "").strip():
+        sp["main_subject"] = "main person" if scene_has_human(sp, narration) else "main subject"
+    if not str(sp.get("action", "") or "").strip():
+        sp["action"] = "visible action matching the narration"
+    if not str(sp.get("location", "") or "").strip():
+        sp["location"] = "realistic setting matching the narration"
+    if not str(sp.get("shot", "") or "").strip():
+        sp["shot"] = "portrait medium shot" if is_vertical else "eye-level medium shot"
+    if not str(sp.get("lighting", "") or "").strip():
+        sp["lighting"] = "natural soft light"
+    return sp
+
+
 def sanitize_scene_plan(scene_plan: Dict[str, Any], style_name: str, chunk: str, is_vertical: bool = False) -> Dict[str, Any]:
     scene_plan = dict(scene_plan or {})
 
@@ -1287,7 +1480,13 @@ def build_visual_prompt(
         ]
 
     prompt = ", ".join([p for p in parts if p])
-    return shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
+    return build_grounded_visual_prompt(
+        base_prompt=prompt,
+        narration=chunk,
+        video_style=video_style,
+        scene_plan=scene_plan,
+        is_vertical=is_vertical,
+    )
 
 
 def build_scene_profile_from_plan(scene_plan: Dict[str, Any], idx: int, video_style: Dict[str, Any]) -> str:
@@ -1376,21 +1575,26 @@ IMPORTANT PLANNING RULES:
 11. narration_text must follow the user's requested content; do not invent unrelated facts.
 12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
 13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
-11. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
-12. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
-13. If narration_text mentions a person, the visual_prompt must show that person.
-14. If narration_text mentions an action, the visual_prompt must show that visible action.
-15. If narration_text mentions a place, product, object, or situation, the visual_prompt must include it clearly.
-16. Each visual_prompt must be concrete enough for image generation: subject + action + location + camera framing + mood + lighting.
-17. Keep visual_prompt compact: maximum 45-55 English words. Avoid long repeated style phrases.
-17. Avoid repeating the same visual_prompt across scenes.
-18. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
-19. Keep visual prompts practical and literal, not abstract.
+14. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
+15. visual_prompt must be written in concise English for SDXL.
+16. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
+17. If narration_text mentions a person, visual_prompt must show that same person type, visible emotion, and visible action.
+18. If narration_text mentions an action, visual_prompt must show that visible action, not only a portrait.
+19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
+20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
+21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
+22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
+23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
+24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
+25. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
+26. Keep visual prompts practical and literal, not abstract.
 20. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
 21. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
 22. If aspect ratio is 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
-23. Do not add text, subtitles, watermark, logo, or words inside generated images.
-24. For every scene, narration_text and visual_prompt must describe the SAME moment.
+27. Do not add text, subtitles, watermark, logo, or words inside generated images.
+28. For every scene, narration_text and visual_prompt must describe the SAME moment.
+29. For scenes with humans, prefer one clear subject or a small natural group; avoid crowds unless necessary.
+30. For humans, include natural face, correct anatomy, realistic hands, normal fingers, and clear eyes in visual_prompt when relevant.
 
 STYLE-SPECIFIC RULES:
 19. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
@@ -1429,7 +1633,7 @@ Return JSON exactly with this schema:
     resp = client.responses.create(
         model=OPENAI_MODEL,
         input=prompt,
-        temperature=0.45,
+        temperature=0.30,
     )
 
     text = _extract_text_from_responses_api(resp)
@@ -1599,18 +1803,19 @@ def create_adaptive_video_plan(
         raw_scene_plan = item.get("scene_plan", {}) or {}
 
         scene_plan = sanitize_scene_plan(raw_scene_plan, video_style_preset, chunk, is_vertical=is_vertical)
+        scene_plan = validate_and_repair_scene_plan(scene_plan, chunk, is_vertical=is_vertical)
         profile = build_scene_profile_from_plan(scene_plan, i, video_style)
 
-        # Prefer AI's explicit visual_prompt; fallback to deterministic builder.
+        # Prefer AI's explicit visual_prompt, but ground it again with structured fields.
+        # This reduces generic/unrelated scenes and common AI artifacts.
         ai_visual_prompt = str(raw_scene_plan.get("visual_prompt", "") or "").strip()
         if ai_visual_prompt:
-            base_prompt = shorten_prompt_for_sdxl(ai_visual_prompt, max_chars=220, max_words=45)
-            style_prompt = video_style.get("prompt_style", "")
-            literal_match = f"literal scene matching narration: {chunk[:140]}"
-            visual_prompt = shorten_prompt_for_sdxl(
-                ", ".join([base_prompt, literal_match, style_prompt, "style preset: " + video_style_preset]),
-                max_chars=240,
-                max_words=55
+            visual_prompt = build_grounded_visual_prompt(
+                base_prompt=ai_visual_prompt,
+                narration=chunk,
+                video_style=video_style,
+                scene_plan=scene_plan,
+                is_vertical=is_vertical,
             )
         else:
             visual_prompt = build_visual_prompt(
@@ -1621,13 +1826,20 @@ def create_adaptive_video_plan(
                 is_vertical=is_vertical
             )
 
+        scene_negative_prompt = build_scene_negative_prompt(
+            global_negative_prompt=global_negative_prompt,
+            scene_plan=scene_plan,
+            narration=chunk,
+            is_vertical=is_vertical,
+        )
+
         scene_objects.append({
             "scene_id": i,
             "profile": profile,
             "voice": selected_voice,
             "voice_text": chunk,
             "visual_prompt": visual_prompt,
-            "negative_prompt": global_negative_prompt,
+            "negative_prompt": scene_negative_prompt,
             "source_chunk": chunk,
             "scene_plan": scene_plan,
             "aspect_ratio": "9:16" if is_vertical else "16:9",
