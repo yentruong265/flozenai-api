@@ -306,6 +306,7 @@ import gc
 import time
 import torch
 import threading
+import requests
 from PIL import Image
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
@@ -313,6 +314,19 @@ IMAGE_ACCELERATION = "none"  # SDXL Base only. Ignore Lightning env for stabilit
 _IMAGE_PIPE = None
 _IMAGE_PIPE_LOCK = threading.Lock()
 _IMAGE_ACCELERATION_APPLIED = "none"
+
+# Optional stock image mode.
+# Priority order for each scene:
+#   1) local stock assets, if you have STOCK_ASSET_DIR
+#   2) Pexels API, if PEXELS_API_KEY is set
+#   3) SDXL AI fallback
+STOCK_ASSET_DIR = os.getenv("STOCK_ASSET_DIR", os.path.join(os.getenv("JOB_ROOT", "/tmp/easyai_jobs"), "stock_assets")).strip()
+STOCK_METADATA_FILE = os.getenv("STOCK_METADATA_FILE", os.path.join(STOCK_ASSET_DIR, "stock_metadata.json")).strip()
+ENABLE_STOCK_ASSETS = os.getenv("ENABLE_STOCK_ASSETS", "1").strip().lower() in {"1", "true", "yes", "y"}
+ENABLE_STOCK_FETCH = os.getenv("ENABLE_STOCK_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "10"))
+STOCK_MIN_MATCH_SCORE = float(os.getenv("STOCK_MIN_MATCH_SCORE", "0.18"))
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -1195,6 +1209,62 @@ _ABSTRACT_WORDS = {
     "fate", "luck", "lesson", "meaning", "happiness", "suffering", "karma", "impermanence"
 }
 
+_VIETNAMESE_HINT_WORDS = {
+    "và", "là", "của", "một", "những", "người", "không", "trong", "cho", "với",
+    "tôi", "bạn", "câu", "chuyện", "video", "đời", "sống", "thiền", "phật", "tâm"
+}
+
+_STOCK_FRIENDLY_WORDS = {
+    "daily life", "realistic daily scene", "office", "business", "family", "nature", "city", "street",
+    "food", "travel", "shopping", "school", "student", "teacher", "home", "work", "coffee",
+    "đời sống", "văn phòng", "gia đình", "thiên nhiên", "đường phố", "thành phố", "học tập",
+    "làm việc", "mua sắm", "du lịch", "quán cà phê", "nhà", "trường học", "kinh doanh"
+}
+
+_AI_REQUIRED_WORDS = {
+    "ancient", "myth", "fantasy", "magic", "dragon", "heaven", "hell", "deity", "buddha",
+    "ma quỷ", "quỷ", "thần", "phật", "cổ trang", "truyền thuyết", "huyền bí", "tâm linh",
+    "future", "sci-fi", "spaceship", "robot", "cyberpunk", "surreal"
+}
+
+
+def detect_language(text: str) -> str:
+    """Very small language detector for routing narration. Keeps Vietnamese narration in Vietnamese."""
+    t = (text or "").strip().lower()
+    if not t:
+        return "unknown"
+    if re.search(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]", t):
+        return "vi"
+    words = set(re.findall(r"\b\w+\b", t))
+    if len(words & _VIETNAMESE_HINT_WORDS) >= 2:
+        return "vi"
+    return "en"
+
+
+def looks_english_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if detect_language(t) == "vi":
+        return False
+    common_en = {"the", "a", "an", "and", "is", "are", "with", "in", "on", "to", "of", "for", "from"}
+    words = set(re.findall(r"\b[a-z]+\b", t))
+    return len(words & common_en) >= 2
+
+
+def repair_narration_language(narration: str, fallback_text: str, source_language: str) -> str:
+    narration = sanitize_tts_text(narration, max_chars=700)
+    fallback_text = sanitize_tts_text(fallback_text, max_chars=700)
+    if source_language == "vi" and looks_english_text(narration) and fallback_text:
+        return fallback_text
+    return narration or fallback_text
+
+
+def tokenize_for_match(text: str):
+    t = (text or "").lower()
+    t = re.sub(r"[^0-9a-zA-Zăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ\s_-]", " ", t)
+    return {w for w in re.split(r"[\s_-]+", t) if len(w) >= 3}
+
 
 def _has_any_term(text: str, terms) -> bool:
     t = (text or "").lower()
@@ -1219,6 +1289,201 @@ def scene_is_abstract(narration: str, scene_plan: Dict[str, Any]) -> bool:
         str(scene_plan.get("action", "") or ""),
     ]).lower()
     return _has_any_term(joined, _ABSTRACT_WORDS)
+
+
+def scene_requires_ai(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
+    joined = " ".join([
+        str(narration or ""),
+        str(video_style_preset or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+    if video_style_preset in {"warm_storybook", "watercolor_poetic", "zen_soft"}:
+        return True
+    return _has_any_term(joined, _AI_REQUIRED_WORDS)
+
+
+def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
+    if scene_requires_ai(narration, scene_plan, video_style_preset):
+        return False
+    if video_style_preset not in {"cinematic_realistic", "dramatic_cinematic", ""}:
+        return False
+    joined = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+    return _has_any_term(joined, _STOCK_FRIENDLY_WORDS) or not scene_is_abstract(narration, scene_plan)
+
+
+def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
+    parts = [
+        scene_plan.get("main_subject", ""),
+        scene_plan.get("action", ""),
+        scene_plan.get("location", ""),
+        scene_plan.get("mood", ""),
+        narration,
+        "vertical" if is_vertical else "landscape",
+    ]
+    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
+
+
+def _load_stock_metadata():
+    items = []
+    if not ENABLE_STOCK_ASSETS or not STOCK_ASSET_DIR or not os.path.isdir(STOCK_ASSET_DIR):
+        return []
+
+    if STOCK_METADATA_FILE and os.path.exists(STOCK_METADATA_FILE):
+        try:
+            data = read_json(STOCK_METADATA_FILE)
+            if isinstance(data, dict):
+                data = data.get("items", []) or data.get("assets", []) or []
+            if isinstance(data, list):
+                for row in data:
+                    if not isinstance(row, dict):
+                        continue
+                    rel = str(row.get("file") or row.get("path") or "").strip()
+                    if not rel:
+                        continue
+                    path = rel if os.path.isabs(rel) else os.path.join(STOCK_ASSET_DIR, rel)
+                    if os.path.exists(path):
+                        tags = row.get("tags", [])
+                        if isinstance(tags, str):
+                            tags = [tags]
+                        items.append({
+                            "path": path,
+                            "tags": [str(x).lower() for x in tags],
+                            "title": str(row.get("title", "") or ""),
+                            "category": str(row.get("category", "") or ""),
+                        })
+        except Exception as e:
+            print("WARN: could not read stock metadata:", repr(e))
+
+    if not items:
+        exts = {".jpg", ".jpeg", ".png", ".webp"}
+        for root, _, files in os.walk(STOCK_ASSET_DIR):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in exts:
+                    path = os.path.join(root, fn)
+                    rel = os.path.relpath(path, STOCK_ASSET_DIR)
+                    tags = re.split(r"[\s_\-/.]+", os.path.splitext(rel)[0].lower())
+                    items.append({"path": path, "tags": tags, "title": rel, "category": os.path.basename(root)})
+    return items
+
+
+def find_stock_asset(stock_query: str, scene_plan: Dict[str, Any], is_vertical: bool = False):
+    items = _load_stock_metadata()
+    if not items:
+        return None
+    q_tokens = tokenize_for_match(stock_query)
+    best = None
+    best_score = 0.0
+    for item in items:
+        tag_text = " ".join(item.get("tags", []) + [item.get("title", ""), item.get("category", "")])
+        t_tokens = tokenize_for_match(tag_text)
+        if not t_tokens:
+            continue
+        overlap = len(q_tokens & t_tokens)
+        score = overlap / max(6, len(q_tokens))
+        if is_vertical and ({"vertical", "portrait", "reels", "shorts"} & t_tokens):
+            score += 0.08
+        if (not is_vertical) and ({"landscape", "wide", "horizontal"} & t_tokens):
+            score += 0.08
+        if score > best_score:
+            best_score = score
+            best = item
+    if best and best_score >= STOCK_MIN_MATCH_SCORE:
+        return {**best, "match_score": round(best_score, 3), "query": stock_query}
+    return None
+
+
+def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img = Image.open(src_path).convert("RGB")
+    src_w, src_h = img.size
+    target_ratio = width / max(height, 1)
+    src_ratio = src_w / max(src_h, 1)
+    if src_ratio > target_ratio:
+        new_w = int(src_h * target_ratio)
+        x1 = max(0, (src_w - new_w) // 2)
+        img = img.crop((x1, 0, x1 + new_w, src_h))
+    else:
+        new_h = int(src_w / max(target_ratio, 1e-6))
+        y1 = max(0, (src_h - new_h) // 2)
+        img = img.crop((0, y1, src_w, y1 + new_h))
+    img = img.resize((width, height), Image.LANCZOS)
+    save_image_safely(img, out_path)
+    return out_path
+
+
+def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
+    """Fetch one suitable Pexels photo URL for stock-friendly scenes.
+    Returns metadata dict or None. Does not raise.
+    """
+    if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
+        return None
+
+    query = shorten_prompt_for_sdxl(stock_query or "daily life", max_chars=120, max_words=18)
+    if not query:
+        query = "daily life"
+
+    orientation = "portrait" if is_vertical else "landscape"
+    url = "https://api.pexels.com/v1/search"
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {
+        "query": query,
+        "orientation": orientation,
+        "per_page": max(1, min(int(PEXELS_PER_PAGE), 20)),
+    }
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        if resp.status_code != 200:
+            print(f"WARN: Pexels API status={resp.status_code} query={query!r}")
+            return None
+        data = resp.json()
+        photos = data.get("photos", []) or []
+        if not photos:
+            return None
+
+        # Prefer larger, non-empty images. Use deterministic first result to reduce randomness.
+        photo = photos[0]
+        src = photo.get("src", {}) or {}
+        image_url = src.get("large2x") or src.get("large") or src.get("original")
+        if not image_url:
+            return None
+        return {
+            "url": image_url,
+            "query": query,
+            "photographer": photo.get("photographer", ""),
+            "pexels_id": photo.get("id", ""),
+        }
+    except Exception as e:
+        print("WARN: Pexels fetch failed:", repr(e))
+        return None
+
+
+def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int):
+    """Download and crop a Pexels image to target frame."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        r = requests.get(image_url, timeout=15)
+        r.raise_for_status()
+        tmp_path = out_path + ".download"
+        with open(tmp_path, "wb") as f:
+            f.write(r.content)
+        prepare_stock_image(tmp_path, out_path, width, height)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return out_path
+    except Exception as e:
+        print("WARN: Pexels image download failed:", repr(e))
+        return None
 
 
 def _clean_prompt_piece(value: str, max_words: int = 12) -> str:
@@ -1559,6 +1824,12 @@ ASPECT RATIO:
 CURRENT ROUGH TEXT CHUNKS:
 {json.dumps(scene_chunks, ensure_ascii=False)}
 
+LANGUAGE RULES:
+A. Detect the language of USER REQUEST.
+B. narration_text MUST be in the SAME language as USER REQUEST.
+C. If USER REQUEST is Vietnamese, every narration_text MUST be Vietnamese. Do not translate narration_text into English.
+D. visual_prompt and stock_query MUST be concise English for image search/generation.
+
 IMPORTANT STYLE RULES:
 1. If STYLE LOCKED is true, video_style_preset MUST be exactly "{locked_style}".
 2. Do not override the user's selected frontend style.
@@ -1583,6 +1854,9 @@ IMPORTANT PLANNING RULES:
 19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
 20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
 21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
+21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel scenes that can use existing photos.
+21c. Choose visual_source as "ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
+21d. Provide stock_query in English whenever visual_source is "stock".
 22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
@@ -1613,8 +1887,10 @@ Return JSON exactly with this schema:
   "scenes": [
     {{
       "scene_id": 1,
-      "narration_text": "spoken narration for this scene, matching the user request",
-      "visual_prompt": "full image prompt for SDXL, concrete and style-consistent",
+      "narration_text": "spoken narration in the same language as USER REQUEST",
+      "visual_source": "stock or ai",
+      "stock_query": "English search query for stock/local asset, or empty string",
+      "visual_prompt": "English SDXL prompt, concrete and style-consistent",
       "main_subject": "short specific visual subject",
       "action": "short visible action",
       "expression": "visible emotion if relevant",
@@ -1684,6 +1960,7 @@ def create_adaptive_video_plan(
     if not initial_chunks:
         raise ValueError("No scene chunks generated")
 
+    source_language = detect_language(story_text)
     used_ai = False
     ai_plan = None
     director_notes = ""
@@ -1772,6 +2049,7 @@ def create_adaptive_video_plan(
         for idx, scene in enumerate(plan_scenes, 1):
             fallback = initial_chunks[min(idx - 1, len(initial_chunks) - 1)] if initial_chunks else story_text
             narration = get_ai_scene_narration(scene, fallback_text=fallback)
+            narration = repair_narration_language(narration, fallback, source_language)
             if not narration:
                 narration = fallback
             scene_source.append({
@@ -1833,11 +2111,22 @@ def create_adaptive_video_plan(
             is_vertical=is_vertical,
         )
 
+        raw_visual_source = str(raw_scene_plan.get("visual_source", "") or "").strip().lower()
+        if raw_visual_source not in {"stock", "ai"}:
+            raw_visual_source = "stock" if scene_stock_friendly(chunk, scene_plan, video_style_preset) else "ai"
+        if scene_requires_ai(chunk, scene_plan, video_style_preset):
+            raw_visual_source = "ai"
+        stock_query = str(raw_scene_plan.get("stock_query", "") or "").strip()
+        if not stock_query:
+            stock_query = build_stock_query(chunk, scene_plan, is_vertical=is_vertical)
+
         scene_objects.append({
             "scene_id": i,
             "profile": profile,
             "voice": selected_voice,
             "voice_text": chunk,
+            "visual_source": raw_visual_source,
+            "stock_query": stock_query,
             "visual_prompt": visual_prompt,
             "negative_prompt": scene_negative_prompt,
             "source_chunk": chunk,
@@ -1847,6 +2136,7 @@ def create_adaptive_video_plan(
 
     return {
         "used_ai_planner": used_ai,
+        "source_language": source_language,
         "video_style_preset": video_style_preset,
         "video_style": video_style,
         "num_inference_steps": num_inference_steps,
@@ -2196,7 +2486,47 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
         scene_id=scene["scene_id"],
     )
+    scene["visual_used"] = "ai"
+    scene["visual_file"] = os.path.basename(img_path)
     return img_path
+
+
+def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
+    """Use local stock or Pexels when available; otherwise fall back to SDXL."""
+    visual_source = str(scene.get("visual_source", "ai") or "ai").lower()
+    is_vertical = _is_vertical_frame(width, height)
+
+    if visual_source == "stock":
+        stock_query = scene.get("stock_query") or scene.get("visual_prompt") or scene.get("voice_text") or ""
+
+        # 1) Try local stock asset folder first, if present.
+        if ENABLE_STOCK_ASSETS:
+            stock = find_stock_asset(stock_query, scene.get("scene_plan", {}) or {}, is_vertical=is_vertical)
+            if stock:
+                print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
+                prepare_stock_image(stock["path"], img_path, width, height)
+                scene["visual_used"] = "stock_local"
+                scene["stock_asset_path"] = stock.get("path")
+                scene["stock_match_score"] = stock.get("match_score")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 2) Try Pexels API if user has no local asset folder.
+        pexels = fetch_pexels_photo(stock_query, is_vertical=is_vertical)
+        if pexels:
+            print(f"📸 Using Pexels stock for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
+            ok = prepare_pexels_image(pexels["url"], img_path, width, height)
+            if ok:
+                scene["visual_used"] = "stock_pexels"
+                scene["stock_query_used"] = pexels.get("query", "")
+                scene["pexels_id"] = pexels.get("pexels_id", "")
+                scene["pexels_photographer"] = pexels.get("photographer", "")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
+
+    return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
 def run_job(job_config, job_id):
     """
@@ -2282,6 +2612,7 @@ def run_job(job_config, job_id):
 
     write_json(os.path.join(META_DIR, "adaptive_plan.json"), {
         "used_ai_planner": adaptive_plan["used_ai_planner"],
+        "source_language": adaptive_plan.get("source_language", "unknown"),
         "video_style_preset": video_style_preset,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": guidance_scale,
@@ -2294,6 +2625,8 @@ def run_job(job_config, job_id):
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
+        "stock_assets_enabled": ENABLE_STOCK_ASSETS,
+        "stock_asset_dir": STOCK_ASSET_DIR,
         "lightning_lora": "",
     })
 
@@ -2318,7 +2651,7 @@ def run_job(job_config, job_id):
     if image_max_workers <= 1:
         for idx, scene in enumerate(scene_objects):
             img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
-            image_paths[idx] = _generate_one_scene_image(
+            image_paths[idx] = _prepare_one_scene_visual(
                 scene=scene,
                 img_path=img_path,
                 width=width,
@@ -2350,7 +2683,7 @@ def run_job(job_config, job_id):
             for idx, scene in enumerate(scene_objects):
                 img_path = os.path.join(IMG_DIR, f"scene_{scene['scene_id']:02d}.png")
                 fut = executor.submit(
-                    _generate_one_scene_image,
+                    _prepare_one_scene_visual,
                     scene,
                     img_path,
                     width,
@@ -2501,6 +2834,10 @@ def run_job(job_config, job_id):
             "scene_profile": scene["profile"],
             "voice_used": scene.get("voice", selected_voice),
             "transition_duration": round(float(transition_duration), 3),
+            "visual_source": scene.get("visual_source", "ai"),
+            "visual_used": scene.get("visual_used", "ai"),
+            "stock_query": scene.get("stock_query", ""),
+            "stock_asset_path": scene.get("stock_asset_path", ""),
             "visual_prompt": scene["visual_prompt"],
             "negative_prompt": scene["negative_prompt"],
             "scene_plan": scene.get("scene_plan", {}),
