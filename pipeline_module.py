@@ -619,8 +619,8 @@ def generate_image(
         num_inference_steps = min(num_inference_steps + 2, 24)
         guidance_scale = min(max(guidance_scale, 6.2), 7.2)
 
-    # Extra safety if AI still has to render a complex fitness/body pose.
-    # This does not guarantee perfect anatomy, but reduces the worst limb artifacts.
+    # Extra safety if AI still has to render a risky human/object scene.
+    # This does not guarantee perfect output, but reduces the worst AI artifacts.
     complex_pose_prompt = _has_any_term(prompt, _COMPLEX_BODY_POSE_WORDS) if "_COMPLEX_BODY_POSE_WORDS" in globals() else False
     if complex_pose_prompt and not _is_turbo_model():
         prompt = shorten_prompt_for_sdxl(
@@ -1242,6 +1242,20 @@ _STOCK_FRIENDLY_WORDS = {
 }
 
 _COMPLEX_BODY_POSE_WORDS = {
+    # General AI artifact risk terms, not only yoga/fitness.
+    # These scenes often create bad hands, broken limbs, distorted faces, weird objects, or unreadable details.
+    "hands", "hand", "fingers", "finger", "feet", "foot", "toes", "toe",
+    "face", "eyes", "teeth", "smile", "close-up face", "portrait",
+    "full body", "full-body", "walking", "running", "jumping", "dancing", "sitting", "standing",
+    "holding", "grabbing", "touching", "using phone", "typing", "eating", "drinking",
+    "group of people", "crowd", "children", "baby", "elderly",
+    "animal", "dog", "cat", "horse", "bird",
+    "product", "bottle", "watch", "phone", "laptop", "car", "bicycle", "motorbike",
+    "building", "architecture", "street", "kitchen", "restaurant",
+    "tay", "ngón tay", "bàn tay", "chân", "bàn chân", "mặt", "khuôn mặt", "mắt", "răng",
+    "toàn thân", "đi bộ", "chạy", "nhảy", "ngồi", "đứng", "cầm", "nắm", "ăn", "uống",
+    "đám đông", "trẻ em", "em bé", "người già", "động vật", "chó", "mèo",
+    "sản phẩm", "chai", "điện thoại", "laptop", "xe hơi", "xe đạp", "xe máy",
     "yoga", "pilates", "gym", "fitness", "workout", "exercise", "stretching", "running",
     "dance", "dancing", "acrobat", "gymnastics", "martial arts", "sports", "athlete",
     "leg raised", "raised leg", "bent leg", "twist", "twisted", "full body pose",
@@ -1311,8 +1325,7 @@ def scene_has_human(scene_plan: Dict[str, Any], narration: str = "") -> bool:
 
 
 def scene_has_complex_body_pose(narration: str, scene_plan: Dict[str, Any]) -> bool:
-    """Detect poses where SDXL often creates body/limb artifacts.
-    For these scenes, stock footage/photos are preferred when available.
+    """Detect scenes where SDXL often creates visible artifacts: hands, faces, limbs, objects, animals, products, or complex body/action scenes. Stock photos are preferred when available; otherwise the AI prompt is simplified and guarded.
     """
     joined = " ".join([
         str(narration or ""),
@@ -1344,7 +1357,7 @@ def scene_requires_ai(narration: str, scene_plan: Dict[str, Any], video_style_pr
     ]).lower()
     if video_style_preset in {"warm_storybook", "watercolor_poetic", "zen_soft"}:
         return True
-    # Complex body/fitness/action poses are usually better as stock photos;
+    # Risky realistic scenes with humans/objects/animals are usually better as stock photos;
     # do not force AI unless the scene is spiritual/fantasy/ancient/etc.
     if scene_has_complex_body_pose(narration, scene_plan) and not _has_any_term(joined, _AI_REQUIRED_WORDS):
         return False
@@ -1377,7 +1390,7 @@ def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: b
         narration,
     ]
     if scene_has_complex_body_pose(narration, scene_plan):
-        parts.extend(["realistic fitness workout photo", "healthy lifestyle", "natural body pose"])
+        parts.extend(["realistic stock photo", "natural composition", "clean details"])
     parts.append("portrait photo" if is_vertical else "landscape photo")
     return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
 
@@ -1922,10 +1935,10 @@ IMPORTANT PLANNING RULES:
 20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
 21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
 21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
-21c. Strong preference: choose visual_source="stock" for fitness, yoga, exercise, stretching, sports, dance, or any scene with complex full-body poses, because AI often creates distorted limbs.
+21c. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
 21d. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
 21e. Provide stock_query in English whenever visual_source is "stock". For fitness/yoga/exercise, use simple stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
-21f. If visual_source="ai" and the scene has a human body, avoid extreme poses. Use simple standing/sitting/walking/holding-object poses. Do not ask for twisted limbs, raised legs, acrobatics, or complex yoga poses unless absolutely necessary.
+21f. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
 22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
