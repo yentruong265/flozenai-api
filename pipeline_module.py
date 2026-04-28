@@ -1,13 +1,13 @@
 # pipeline_module.py — Production serverless version for RunPod
-# Lightning quality/speed version: SDXL Base + optional SDXL-Lightning LoRA, compact prompts,
-# per-scene audio, preview/download use the same final output.
+# Stable high-quality version: SDXL Base only, dynamic image settings, compact prompts,
+# per-scene audio, preview/download use the same final output. No Lightning env required.
 # Converted from the tested notebook.
 # Entry point used by handler.py: run_job_serverless(job_config, job_id, base_dir, progress_callback)
 
 import os
 import torch
 from pathlib import Path
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler, EulerDiscreteScheduler
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
 DRIVE_ROOT = os.getenv("JOB_ROOT", "/tmp/easyai_jobs")
 PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
@@ -279,11 +279,11 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
-        # image generation — quality/speed default.
-        # Default uses SDXL Base + SDXL-Lightning LoRA when IMAGE_ACCELERATION=lightning.
-        # This is faster than SDXL Base 16–30 steps, but clearer than SDXL Turbo.
-        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), int(os.getenv("DEFAULT_IMAGE_STEPS", "4")), min_value=2, max_value=24),
-        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), float(os.getenv("DEFAULT_GUIDANCE_SCALE", "0.0")), min_value=0.0, max_value=8.0),
+        # image generation — stable quality/speed default.
+        # No Lightning env required. SDXL Base is slower than Lightning but much more stable.
+        # These are only initial defaults; generate_image() still applies aspect-aware safeguards.
+        "num_inference_steps": _clamp_int(job_config.get("num_inference_steps"), 16, min_value=8, max_value=28),
+        "guidance_scale": _clamp_float(job_config.get("guidance_scale"), 6.0, min_value=4.0, max_value=8.0),
         "seed": _safe_int(job_config.get("seed"), 42),
 
         # retry
@@ -309,13 +309,10 @@ import threading
 from PIL import Image
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
-IMAGE_ACCELERATION = os.getenv("IMAGE_ACCELERATION", "lightning").strip().lower()
-SDXL_LIGHTNING_REPO = os.getenv("SDXL_LIGHTNING_REPO", "ByteDance/SDXL-Lightning").strip()
-SDXL_LIGHTNING_LORA = os.getenv("SDXL_LIGHTNING_LORA", "sdxl_lightning_4step_lora.safetensors").strip()
-SDXL_LIGHTNING_LORA_SCALE = float(os.getenv("SDXL_LIGHTNING_LORA_SCALE", "1.0"))
+IMAGE_ACCELERATION = "none"  # SDXL Base only. Ignore Lightning env for stability.
 _IMAGE_PIPE = None
 _IMAGE_PIPE_LOCK = threading.Lock()
-_IMAGE_ACCELERATION_APPLIED = None
+_IMAGE_ACCELERATION_APPLIED = "none"
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -463,36 +460,44 @@ def _is_turbo_model() -> bool:
 
 
 def _use_lightning_lora() -> bool:
-    return (IMAGE_ACCELERATION in {"lightning", "sdxl_lightning", "lightning_lora"}) and (not _is_turbo_model())
+    return False
 
 
 def _is_lightning_active() -> bool:
-    return _IMAGE_ACCELERATION_APPLIED == "lightning"
+    return False
 
 
 def _get_guidance_scale(width: int, height: int, guidance_scale: float) -> float:
     """
-    SDXL Turbo is fastest and works best with low/no classifier-free guidance.
-    For non-turbo SDXL, keep moderate guidance.
+    Stable SDXL Base guidance.
+    Lower than the old 7.2+ setting for speed/control balance,
+    but high enough to avoid the loose/glitchy look from Lightning/Turbo.
     """
     g = float(guidance_scale)
     if _is_turbo_model():
         return max(0.0, min(g, 1.0))
 
     if _is_vertical_frame(width, height):
-        g = max(g, 5.5)
-    return min(g, 10.0)
+        g = max(g, 6.2)
+    else:
+        g = max(g, 5.8)
+    return min(g, 7.2)
 
 
 def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
     """
-    Keep inference fast. The old version forced vertical videos to 30 steps,
-    which made 9:16 videos much slower.
+    Stable dynamic steps.
+    - Landscape: 16-18 is the speed/quality sweet spot on RTX 4090.
+    - Vertical: add a little quality to reduce crop/anatomy issues, but do not force 30.
     """
-    s = max(1, int(steps))
+    s = int(steps)
     if _is_turbo_model():
         return min(max(s, 4), 16)
-    return min(max(s, 8), 24)
+    if _is_vertical_frame(width, height):
+        s = max(s, 18)
+    else:
+        s = max(s, 16)
+    return min(s, 24)
 
 
 def load_image_pipe(force_reload: bool = False):
@@ -521,38 +526,17 @@ def load_image_pipe(force_reload: bool = False):
         )
 
         _IMAGE_ACCELERATION_APPLIED = "none"
-        if _use_lightning_lora():
-            try:
-                print(f"⚡ Loading SDXL-Lightning LoRA: {SDXL_LIGHTNING_REPO} / {SDXL_LIGHTNING_LORA}")
-                pipe.load_lora_weights(SDXL_LIGHTNING_REPO, weight_name=SDXL_LIGHTNING_LORA)
-                try:
-                    pipe.fuse_lora(lora_scale=SDXL_LIGHTNING_LORA_SCALE)
-                except TypeError:
-                    pipe.fuse_lora()
-                try:
-                    pipe.scheduler = EulerDiscreteScheduler.from_config(
-                        pipe.scheduler.config,
-                        timestep_spacing="trailing",
-                    )
-                except Exception:
-                    pass
-                _IMAGE_ACCELERATION_APPLIED = "lightning"
-                print("✅ SDXL-Lightning LoRA applied")
-            except Exception as e:
-                print("WARN: could not load Lightning LoRA; fallback to normal SDXL:", repr(e))
-                _IMAGE_ACCELERATION_APPLIED = "none"
 
-        if _IMAGE_ACCELERATION_APPLIED != "lightning":
+        try:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                use_karras_sigmas=True,
+            )
+        except Exception:
             try:
-                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                    pipe.scheduler.config,
-                    use_karras_sigmas=True,
-                )
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
             except Exception:
-                try:
-                    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-                except Exception:
-                    pass
+                pass
 
         try:
             pipe.set_progress_bar_config(disable=True)
@@ -1418,8 +1402,8 @@ STYLE-SPECIFIC RULES:
 Return JSON exactly with this schema:
 {{
   "video_style_preset": "{locked_style if style_locked else 'one of allowed style presets'}",
-  "num_inference_steps": 4,
-  "guidance_scale": 0.0,
+  "num_inference_steps": 16,
+  "guidance_scale": 6.0,
   "global_negative_prompt_addon": "",
   "director_notes": "short note",
   "scenes": [
@@ -1544,13 +1528,13 @@ def create_adaptive_video_plan(
     video_style_preset = normalize_style_preset(requested_style)
     video_style = dict(STYLE_PRESETS[video_style_preset])
 
-    # Fast high-quality production defaults.
-    # Default uses SDXL Base + SDXL-Lightning LoRA: faster than normal SDXL,
-    # but clearer than SDXL Turbo. If Lightning cannot load, fallback uses normal SDXL.
-    default_steps = int(os.getenv("DEFAULT_IMAGE_STEPS", "4")) if _use_lightning_lora() else 16
-    default_guidance = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "0.0")) if _use_lightning_lora() else (
-        5.6 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.2
-    )
+    # Stable high-quality production defaults.
+    # SDXL Base only: no Lightning env required, no LoRA startup risk.
+    # Keep scene count from OpenAI, but use safe image settings.
+    default_steps = 18 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 16
+    if is_vertical:
+        default_steps = max(default_steps, 18)
+    default_guidance = 6.2 if video_style_preset in {"cinematic_realistic", "dramatic_cinematic"} else 5.8
 
     num_inference_steps = int((ai_plan or {}).get("num_inference_steps", job_config.get("num_inference_steps", default_steps)))
     guidance_scale = float((ai_plan or {}).get("guidance_scale", job_config.get("guidance_scale", default_guidance)))
@@ -2098,7 +2082,7 @@ def run_job(job_config, job_id):
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
-        "lightning_lora": SDXL_LIGHTNING_LORA if _use_lightning_lora() else "",
+        "lightning_lora": "",
     })
 
     write_json(os.path.join(META_DIR, "scene_profiles.json"), scene_objects)
@@ -2387,7 +2371,7 @@ def run_job(job_config, job_id):
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
-        "lightning_lora": SDXL_LIGHTNING_LORA if _use_lightning_lora() else "",
+        "lightning_lora": "",
         "total_audio_duration": round(total_audio_duration, 3),
         "finished_at": now_str(),
     }
