@@ -2767,7 +2767,7 @@ def run_job(job_config, job_id):
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
         "full_narration_text": adaptive_plan.get("full_narration_text", ""),
-        "timeline_mode": "per_scene_audio",
+        "timeline_mode": "single_full_narration_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
@@ -2863,86 +2863,123 @@ def run_job(job_config, job_id):
         raise RuntimeError("Some scene images were not generated")
 
     write_status(job_dir, job_id, "running", {
-        "step": "generate_tts_per_scene",
+        "step": "generate_full_narration_audio",
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
         "progress_pct": 50,
-        "eta_sec": max(20, total_scenes * 4),
+        "eta_sec": 20,
     })
 
-    audio_clips = []
-    tts_scene_log = []
-    tts_started_at = time.time()
+    # ------------------------------------------------------------------
+    # SINGLE FULL NARRATION AUDIO MODE
+    # ------------------------------------------------------------------
+    # Old behavior generated one TTS file per scene. That made narration
+    # speed inconsistent because OpenAI/Edge TTS may speak each segment with
+    # a different rhythm. New behavior generates one full narration track,
+    # then allocates scene durations from that single audio duration.
+    full_narration_text = sanitize_tts_text(adaptive_plan.get("full_narration_text", ""), max_chars=4000)
+    if not full_narration_text:
+        full_narration_text = sanitize_tts_text(
+            " ".join([
+                str(s.get("voice_text") or s.get("source_chunk") or "")
+                for s in scene_objects
+                if str(s.get("voice_text") or s.get("source_chunk") or "").strip()
+            ]),
+            max_chars=4000,
+        )
+    if not full_narration_text:
+        full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
+    full_audio_raw_path = os.path.join(AUDIO_DIR, "full_narration_raw.mp3")
+    tts_started_at = time.time()
+    tts_meta = run_async_safely(save_tts(
+        text=full_narration_text,
+        out_path=full_audio_raw_path,
+        voice=selected_voice,
+        rate=job_config.get("tts_rate", "+0%"),
+        pitch=job_config.get("tts_pitch", "+0Hz"),
+    ))
+
+    if not os.path.exists(full_audio_raw_path) or os.path.getsize(full_audio_raw_path) <= 0:
+        raise RuntimeError(f"Full narration TTS output missing or empty: {full_audio_raw_path}")
+
+    # Apply one consistent speed factor to the whole narration track.
+    # This keeps the entire voice rhythm uniform, unlike per-scene speed-up.
+    speech_speed = _clamp_float(job_config.get("speech_speed"), 1.18, min_value=0.85, max_value=1.35)
+    full_audio_path = speed_up_audio_ffmpeg(full_audio_raw_path, speech_speed)
+
+    full_audio_clip = AudioFileClip(full_audio_path)
+    total_audio_duration = float(full_audio_clip.duration or 0)
+    if total_audio_duration <= 0:
+        try:
+            full_audio_clip.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Full narration audio duration is zero: {full_audio_path}")
+
+    # Allocate scene durations according to the amount of narration text per scene.
+    # The sum is forced to match the full audio duration, so the final video stays synced.
+    scene_weights = []
+    scene_text_log = []
     for idx, scene in enumerate(scene_objects, start=1):
-        scene_id = int(scene.get("scene_id", idx))
         voice_text = sanitize_tts_text(scene.get("voice_text") or scene.get("source_chunk") or "", max_chars=900)
         if not voice_text:
             voice_text = sanitize_tts_text(story_text, max_chars=900)
-
-        audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id:02d}.mp3")
-        tts_meta = run_async_safely(save_tts(
-            text=voice_text,
-            out_path=audio_path,
-            voice=scene.get("voice") or selected_voice,
-            rate=job_config.get("tts_rate", "+0%"),
-            pitch=job_config.get("tts_pitch", "+0Hz"),
-        ))
-
-        if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
-            raise RuntimeError(f"Scene TTS output missing or empty: {audio_path}")
-
-        # Apply speech speed after TTS generation. OpenAI TTS does not use the
-        # speech_speed field directly, so this post-process is required.
-        speech_speed = _clamp_float(job_config.get("speech_speed"), 1.28, min_value=0.7, max_value=1.45)
-        final_audio_path = speed_up_audio_ffmpeg(audio_path, speech_speed)
-        if final_audio_path != audio_path:
-            audio_path = final_audio_path
-
-        audio_clip = AudioFileClip(audio_path)
-        duration = float(audio_clip.duration or 0)
-        if duration <= 0:
-            try:
-                audio_clip.close()
-            except Exception:
-                pass
-            raise RuntimeError(f"Scene audio duration is zero: {audio_path}")
-
-        if max_scene_duration and duration > max_scene_duration + 3.0:
-            print(f"WARN: scene {scene_id} audio duration {duration:.2f}s is longer than max_scene_duration {max_scene_duration:.2f}s. Keeping real audio duration to avoid sync drift.")
-
-        audio_clips.append(audio_clip)
-        tts_scene_log.append({
-            "scene_id": scene_id,
-            "audio_file": os.path.basename(audio_path),
-            "audio_duration": round(duration, 3),
-            "speech_speed": speech_speed,
-            "voice_used": tts_meta.get("voice_used", selected_voice),
-            "tts_engine": tts_meta.get("engine", "unknown"),
+        word_count = max(1, len(voice_text.split()))
+        char_count = max(1, len(voice_text))
+        # Blend word and character counts so Vietnamese/English allocation is more stable.
+        weight = max(1.0, (word_count * 1.0) + (char_count / 28.0))
+        scene_weights.append(weight)
+        scene_text_log.append({
+            "scene_id": int(scene.get("scene_id", idx)),
+            "word_count": word_count,
             "text_len": len(voice_text),
-            "word_count": len(voice_text.split()),
             "voice_text": voice_text,
         })
 
-        eta_sec = estimate_eta(time.time() - tts_started_at, idx, total_scenes, fallback_sec=max(10, total_scenes * 3))
-        progress_pct = int(50 + (idx / max(total_scenes, 1)) * 20)
+    total_weight = sum(scene_weights) or float(total_scenes)
+    raw_durations = [total_audio_duration * (w / total_weight) for w in scene_weights]
 
-        write_status(job_dir, job_id, "running", {
-            "step": "generate_tts_per_scene",
-            "generated_audio": idx,
-            "scene_count": total_scenes,
-            "selected_voice": selected_voice,
-            "progress_pct": progress_pct,
-            "eta_sec": eta_sec,
-        })
+    # Avoid extremely tiny scenes when many chunks are produced. Then renormalize.
+    min_scene_sec = 1.05 if total_audio_duration >= total_scenes * 1.05 else max(0.45, total_audio_duration / max(total_scenes, 1) * 0.65)
+    adjusted_durations = [max(min_scene_sec, d) for d in raw_durations]
+    adjusted_sum = sum(adjusted_durations) or total_audio_duration
+    scene_durations = [max(0.35, d * total_audio_duration / adjusted_sum) for d in adjusted_durations]
 
-    total_audio_duration = sum(float(a.duration or 0) for a in audio_clips)
+    # Correct tiny floating drift on the last scene.
+    drift = total_audio_duration - sum(scene_durations)
+    if scene_durations:
+        scene_durations[-1] = max(0.35, scene_durations[-1] + drift)
+
+    audio_clips = [full_audio_clip]
     write_json(os.path.join(META_DIR, "tts_debug.json"), {
-        "tts_mode": "per_scene_audio",
+        "tts_mode": "single_full_narration_audio",
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
+        "audio_file": os.path.basename(full_audio_path),
+        "raw_audio_file": os.path.basename(full_audio_raw_path),
         "total_audio_duration": round(total_audio_duration, 3),
-        "scenes": tts_scene_log,
+        "speech_speed": speech_speed,
+        "voice_used": tts_meta.get("voice_used", selected_voice),
+        "tts_engine": tts_meta.get("engine", "unknown"),
+        "full_narration_text": full_narration_text,
+        "scenes": [
+            {
+                **scene_text_log[i],
+                "allocated_duration": round(float(scene_durations[i]), 3),
+                "weight": round(float(scene_weights[i]), 3),
+            }
+            for i in range(total_scenes)
+        ],
+    })
+
+    write_status(job_dir, job_id, "running", {
+        "step": "generate_full_narration_audio",
+        "generated_audio": 1,
+        "scene_count": total_scenes,
+        "selected_voice": selected_voice,
+        "progress_pct": 70,
+        "eta_sec": estimate_eta(time.time() - tts_started_at, 1, 1, fallback_sec=5),
     })
 
     write_status(job_dir, job_id, "running", {
@@ -2956,9 +2993,9 @@ def run_job(job_config, job_id):
     scene_duration_log = []
     build_started_at = time.time()
 
-    for idx, (scene, img_path, audio_clip) in enumerate(zip(scene_objects, image_paths, audio_clips), start=1):
+    for idx, (scene, img_path, duration) in enumerate(zip(scene_objects, image_paths, scene_durations), start=1):
         scene_id = int(scene.get("scene_id", idx))
-        duration = max(float(audio_clip.duration or 0), 1.0)
+        duration = max(float(duration or 0), 0.35)
 
         vclip = make_motion_clip(
             image_path=img_path,
@@ -2973,20 +3010,21 @@ def run_job(job_config, job_id):
         vclip = apply_visual_finish(vclip, video_style_preset)
 
         if idx < total_scenes:
-            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.16)
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.12, duration / 4)
             vclip = vclip.with_effects([vfx.FadeIn(transition_duration), vfx.FadeOut(transition_duration)])
         else:
-            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.12)
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.08, duration / 4)
             vclip = vclip.with_effects([vfx.FadeIn(transition_duration)])
 
-        vclip = vclip.with_audio(audio_clip)
+        # Do not attach per-scene audio. The full narration track is attached
+        # once after all visual clips are concatenated.
         video_clips.append(vclip)
 
         scene_duration_log.append({
             "scene_id": scene_id,
             "final_duration": round(float(duration), 3),
             "scene_profile": scene["profile"],
-            "voice_used": scene.get("voice", selected_voice),
+            "voice_used": selected_voice,
             "transition_duration": round(float(transition_duration), 3),
             "visual_source": scene.get("visual_source", "ai"),
             "visual_used": scene.get("visual_used", "ai"),
@@ -3020,6 +3058,7 @@ def run_job(job_config, job_id):
     })
 
     final_video = concatenate_videoclips(video_clips, method="compose")
+    final_video = final_video.with_audio(full_audio_clip)
     final_path = os.path.join(OUT_DIR, "final_story_video_adaptive.mp4")
 
     final_video.write_videofile(
@@ -3070,7 +3109,7 @@ def run_job(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "used_ai_planner": adaptive_plan["used_ai_planner"],
-        "timeline_mode": "per_scene_audio",
+        "timeline_mode": "single_full_narration_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
