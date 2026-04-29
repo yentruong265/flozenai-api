@@ -1419,28 +1419,12 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     total = len(scene_objects)
 
     if is_story_mixed_style(style):
-        max_ai = int(job_config.get("story_ai_image_budget", 0) or 0)
-        if max_ai <= 0:
-            max_ai = max(1, int(math.ceil(total * 0.60)))
-        max_ai = max(1, min(max_ai, int(math.ceil(total * 0.60)), total))
-
-        ranked = sorted(
-            range(total),
-            key=lambda i: _scene_priority_for_ai(scene_objects[i], i, total),
-            reverse=True,
-        )
-        ai_indices = set(ranked[:max_ai])
-        for i, s in enumerate(scene_objects):
-            if i in ai_indices:
-                s["visual_source"] = "ai"
-                s["ai_fallback_allowed"] = True
-                s["routing_reason"] = f"story_mixed_ai_budget_{max_ai}_of_{total}"
-            else:
-                s["visual_source"] = "stock"
-                s["ai_fallback_allowed"] = False
-                s["routing_reason"] = f"story_mixed_stock_remaining_max_ai_60pct_{max_ai}_of_{total}"
-            if not s.get("stock_query"):
-                s["stock_query"] = build_stock_query(s.get("voice_text", ""), s.get("scene_plan", {}) or {}, is_vertical=(s.get("aspect_ratio") == "9:16"))
+        # Warm Story now uses 100% AI visuals for style consistency.
+        # Time/cost is controlled earlier by the AI planner through smarter, duration-aware scene count.
+        for s in scene_objects:
+            s["visual_source"] = "ai"
+            s["ai_fallback_allowed"] = True
+            s["routing_reason"] = "warm_storybook_full_ai_duration_aware_scene_plan"
         return scene_objects
 
     if is_stock_first_style(style):
@@ -1892,6 +1876,10 @@ def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_verti
     action = _clean_prompt_piece(scene_plan.get("action", ""), 12)
     location = _clean_prompt_piece(scene_plan.get("location", ""), 10)
     expression = _clean_prompt_piece(scene_plan.get("expression", ""), 8)
+    culture = _clean_prompt_piece(scene_plan.get("country_or_culture", ""), 10)
+    period = _clean_prompt_piece(scene_plan.get("historical_period", ""), 10)
+    clothing = _clean_prompt_piece(scene_plan.get("clothing_or_appearance", "") or scene_plan.get("appearance", ""), 14)
+    entity_type = _clean_prompt_piece(scene_plan.get("visual_entity_type", ""), 5)
     shot = _clean_prompt_piece(scene_plan.get("shot", ""), 8)
     lighting = _clean_prompt_piece(scene_plan.get("lighting", ""), 8)
     mood = _clean_prompt_piece(scene_plan.get("mood", ""), 8)
@@ -1914,11 +1902,21 @@ def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_verti
     else:
         details_text = _clean_prompt_piece(str(details), 18)
 
+    must_show = scene_plan.get("must_show", []) or []
+    must_show_text = ""
+    if isinstance(must_show, list) and must_show:
+        must_show_text = _clean_prompt_piece("must show: " + ", ".join([str(x) for x in must_show[:5]]), 24)
+
     parts = [
         subject,
+        entity_type,
         action,
         location,
+        culture,
+        period,
+        clothing,
         details_text,
+        must_show_text,
         expression,
         shot,
         lighting or "natural light",
@@ -2029,6 +2027,14 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
     if scene_is_abstract(narration, scene_plan):
         extras.extend(["abstract symbols", "floating objects", "surreal unrelated scene"])
 
+    must_not_show = scene_plan.get("must_not_show", []) or []
+    if isinstance(must_not_show, list):
+        extras.extend([str(x).strip() for x in must_not_show[:10] if str(x).strip()])
+
+    visual_entity_type = str(scene_plan.get("visual_entity_type", "") or "").strip().lower()
+    if visual_entity_type == "human":
+        extras.extend(["statue", "sculpture", "stone figure", "marble figure", "idol", "figurine", "painting of a person instead of a living person"])
+
     neg = ", ".join([global_negative_prompt or "", ", ".join(extras)])
     return shorten_prompt_for_sdxl(neg, max_chars=300, max_words=65)
 
@@ -2071,10 +2077,26 @@ def sanitize_scene_plan(scene_plan: Dict[str, Any], style_name: str, chunk: str,
 
     inferred = infer_camera_language(style_name, scene_plan, chunk, is_vertical=is_vertical)
 
+    def _list_field(name, limit=8):
+        value = scene_plan.get(name, []) or []
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()][:limit]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()][:limit]
+        return []
+
     return {
         "main_subject": subject,
+        "visual_entity_type": str(scene_plan.get("visual_entity_type", "") or "").strip().lower(),
+        "country_or_culture": str(scene_plan.get("country_or_culture", "") or "").strip(),
+        "historical_period": str(scene_plan.get("historical_period", "") or "").strip(),
+        "clothing_or_appearance": str(scene_plan.get("clothing_or_appearance", "") or scene_plan.get("appearance", "") or "").strip(),
+        "must_show": _list_field("must_show", 8),
+        "must_not_show": _list_field("must_not_show", 10),
         "location": location,
         "details": details,
+        "background": str(scene_plan.get("background", "") or "").strip(),
+        "appearance": str(scene_plan.get("appearance", "") or "").strip(),
         "shot": inferred["shot"],
         "lighting": inferred["lighting"],
         "mood": inferred["mood"],
@@ -2218,10 +2240,37 @@ def plan_video_with_ai(
     user_style_text = locked_style or "auto"
     aspect_text = "9:16 vertical TikTok/Reels/Shorts" if is_vertical else "16:9 landscape YouTube/web"
 
+    target_total_video_sec = _safe_int(job_config.get("target_total_video_sec") or job_config.get("target_total_sec"), 60)
+    word_count = len((story_text or "").split())
+    warm_story_ai_full_mode = (locked_style == "warm_storybook")
+
     min_scenes = int(job_config.get("min_scenes", 3) or 3)
     max_scenes = int(job_config.get("max_scenes", 10) or 10)
     min_scenes = max(2, min(min_scenes, 10))
     max_scenes = max(min_scenes, min(max_scenes, 12))
+
+    # Warm Story uses 100% AI visuals, so we reduce cost by asking the planner
+    # to make fewer, richer scenes based on duration/content instead of hard-capping a fixed number.
+    if warm_story_ai_full_mode:
+        duration_based = max(3, min(10, int(math.ceil(max(target_total_video_sec, 30) / 32.0))))
+        content_based = max(3, min(10, int(math.ceil(max(word_count, 40) / 55.0))))
+        smart_warm_max = max(duration_based, content_based)
+        smart_warm_min = max(2, min(4, smart_warm_max))
+        min_scenes = max(min_scenes, smart_warm_min)
+        max_scenes = min(max_scenes, smart_warm_max)
+        max_scenes = max(min_scenes, max_scenes)
+
+    warm_story_instruction = ""
+    if warm_story_ai_full_mode:
+        warm_story_instruction = f"""
+WARM STORYBOOK FULL-AI MODE:
+- The selected style is warm_storybook, so every scene should use visual_source="ai".
+- To control cost and render time, do NOT over-split the story.
+- Create fewer but richer scenes based on duration/content: target {min_scenes}-{max_scenes} scenes for about {target_total_video_sec} seconds and {word_count} words.
+- Each scene may cover a slightly longer narration segment if the visual moment is coherent.
+- Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
+- Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
+"""
 
     prompt = f"""
 You are FlozenAI's senior cinematic director, visual prompt engineer, and stock-image search planner.
@@ -2240,6 +2289,7 @@ FRONTEND SELECTED STYLE:
 STYLE LOCKED:
 {style_locked}
 
+{warm_story_instruction}
 ASPECT RATIO:
 {aspect_text}
 
@@ -2279,6 +2329,17 @@ SCENE PLANNING RULES:
 13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
 
 VISUAL GROUNDING RULES — VERY IMPORTANT:
+CULTURAL / HISTORICAL / ENTITY ACCURACY RULES — VERY IMPORTANT:
+- For every scene, infer the correct country_or_culture, historical_period, clothing_or_appearance, and environment from the script context.
+- Do NOT mix cultures incorrectly. If a scene is in ancient India, clothing, architecture, and props must match ancient India; do not use Chinese robes, Chinese temples, Japanese clothing, or modern fashion unless the script explicitly says so.
+- If the script mentions Buddha, monks, kings, villagers, warriors, temples, ancient settings, or spiritual teachers, infer the historically/culturally appropriate clothing and setting.
+- If the subject is a living person, set visual_entity_type="human" and show a living human, not a statue, sculpture, painting, icon, or idol.
+- If the subject is a statue/sculpture, set visual_entity_type="statue" and make that explicit.
+- Do not replace a living Buddha/teacher/person with a Buddha statue unless the narration explicitly says statue, sculpture, idol, image, altar statue, or carved figure.
+- image_prompt must include the planner-inferred culture, era, clothing, body/face expression, key props, and environment when relevant.
+- must_show must list the concrete things that must appear in the image.
+- must_not_show must list common wrong substitutions, wrong cultures, wrong entity types, modern clothing, text/logo/watermark, and other risks.
+
 14. visual_prompt MUST directly and literally represent narration_text.
 15. Do NOT create generic, decorative, symbolic-only, or unrelated visuals.
 16. For every scene, identify the visible moment first, then style.
@@ -2345,10 +2406,10 @@ STYLE-SPECIFIC RULES:
 64. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
 65. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
 66. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
-67. For warm_storybook: mixed visual mode. Do not mark every scene as AI. Use AI for key characters/turning points; use stock for generic village, nature, temple, road, hands, daily-life moments.
+67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats. If not active, mixed visual mode is acceptable.
 68. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
 69. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
-70. Hard rule: For zen_soft, warm_storybook, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". The rest should be visual_source="stock" with strong stock_query.
+70. Hard rule: For zen_soft, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". For warm_storybook, use 100% visual_source="ai" when WARM STORYBOOK FULL-AI MODE is active, but keep scene count efficient and duration-aware.
 
 SELF-CHECK BEFORE FINAL JSON:
 71. For each scene, verify: Does visual_prompt show the same moment as narration_text?
@@ -2372,6 +2433,12 @@ Return JSON exactly with this schema:
       "stock_query": "English search query for stock/local asset, or empty string",
       "visual_prompt": "English SDXL prompt, concrete and style-consistent",
       "main_subject": "short specific visual subject",
+      "visual_entity_type": "human / animal / object / statue / landscape / symbolic",
+      "country_or_culture": "planner-inferred country/culture if relevant",
+      "historical_period": "planner-inferred era/time period if relevant",
+      "clothing_or_appearance": "historically/culturally appropriate clothing and appearance if relevant",
+      "must_show": ["concrete required visual element 1", "concrete required visual element 2"],
+      "must_not_show": ["wrong visual substitution to avoid", "wrong culture/style/entity to avoid"],
       "action": "short visible physical action",
       "expression": "visible emotion if relevant",
       "location": "specific realistic/appropriate setting",
@@ -2454,6 +2521,15 @@ def create_adaptive_video_plan(
         or str(job_config.get("style", "") or "").strip()
     )
     portal_style = normalize_style_preset(portal_style_raw) if portal_style_raw else ""
+
+    # Warm Story is AI-image heavy; make fallback chunks more efficient without hard-capping scene count.
+    # The AI planner still decides the final scene count, but rough chunks become less fragmented.
+    if portal_style == "warm_storybook":
+        target_sec = _safe_int(job_config.get("target_total_video_sec") or job_config.get("target_total_sec"), 60)
+        adaptive_words = max(target_words_per_scene, min(85, max(48, int(max(target_sec, 30) / 2.2))))
+        initial_chunks = chunk_story(story_text, target_words=adaptive_words)
+        if not initial_chunks:
+            initial_chunks = force_scene_chunks_by_words(story_text, min_scenes=3, max_scenes=8)
 
     style_locked = is_style_locked(job_config)
     is_vertical = is_vertical_aspect(job_config)
