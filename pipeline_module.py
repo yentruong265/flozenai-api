@@ -290,6 +290,9 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "retry_count": _clamp_int(job_config.get("retry_count"), 0, min_value=0, max_value=20),
         "max_retry": _clamp_int(job_config.get("max_retry"), 2, min_value=0, max_value=20),
 
+        # Image source routing: smart | stock_first | ai_first
+        "image_source_mode": _safe_str(job_config.get("image_source_mode"), os.getenv("IMAGE_SOURCE_MODE", "smart")).lower(),
+
         "created_at": _safe_str(job_config.get("created_at"), now_str()),
         "meta": meta,
     }
@@ -327,6 +330,10 @@ ENABLE_STOCK_FETCH = os.getenv("ENABLE_STOCK_FETCH", "1").strip().lower() in {"1
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "10"))
 STOCK_MIN_MATCH_SCORE = float(os.getenv("STOCK_MIN_MATCH_SCORE", "0.18"))
+
+# Smart image routing mode:
+# smart = best default; stock_first = fastest; ai_first = best for storytelling
+IMAGE_SOURCE_MODE = os.getenv("IMAGE_SOURCE_MODE", "smart").strip().lower()
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -1269,6 +1276,71 @@ _AI_REQUIRED_WORDS = {
     "future", "sci-fi", "spaceship", "robot", "cyberpunk", "surreal"
 }
 
+# Storytelling/narrative scenes are often poorly matched by generic stock photos.
+_STORYTELLING_WORDS = {
+    "story", "storytelling", "tale", "fable", "parable", "legend", "myth", "folklore",
+    "once upon a time", "king", "queen", "prince", "princess", "monk", "temple",
+    "old man", "old woman", "village", "ancient", "ancient times", "lesson", "moral",
+    "karma", "buddhist", "buddha", "zen master",
+    "câu chuyện", "kể chuyện", "chuyện kể", "ngày xưa", "xưa kia", "thuở xưa",
+    "truyện", "truyện cổ", "ngụ ngôn", "giai thoại", "truyền thuyết", "cổ tích",
+    "vị vua", "hoàng tử", "công chúa", "ông lão", "bà lão", "người nghèo",
+    "nhà sư", "thiền sư", "ngôi chùa", "đức phật", "phật giáo", "nhân quả",
+    "bài học", "lòng tốt", "từ bi", "vô thường", "giác ngộ", "tâm linh", "huyền bí"
+}
+
+def _normalize_image_source_mode(mode: str = None) -> str:
+    mode = str(mode or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE) or "smart").strip().lower()
+    mode = mode.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "auto": "smart", "default": "smart", "smart_routing": "smart",
+        "pexels": "stock_first", "stock": "stock_first", "stock_only": "stock_first",
+        "pexels_first": "stock_first", "fast": "stock_first",
+        "ai": "ai_first", "sdxl": "ai_first", "story": "ai_first", "storytelling": "ai_first",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in {"smart", "stock_first", "ai_first"} else "smart"
+
+def get_image_source_mode(job_config=None) -> str:
+    if isinstance(job_config, dict):
+        raw = job_config.get("image_source_mode") or job_config.get("image_source") or job_config.get("visual_source_mode")
+        if raw not in (None, ""):
+            return _normalize_image_source_mode(raw)
+    return _normalize_image_source_mode()
+
+def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
+    joined = " ".join([
+        str(narration or ""), str(video_style_preset or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+    if video_style_preset in {"warm_storybook", "watercolor_poetic", "zen_soft"}:
+        return True
+    return _has_any_term(joined, _STORYTELLING_WORDS)
+
+def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
+    """Return 'stock' or 'ai' for one scene. Default smart mode balances speed and scene-match."""
+    mode = _normalize_image_source_mode(image_source_mode)
+    if mode == "ai_first":
+        return "ai"
+    if mode == "stock_first":
+        if scene_requires_ai(narration, scene_plan, video_style_preset):
+            return "ai"
+        return "stock"
+
+    # SMART MODE
+    if scene_is_storytelling(narration, scene_plan, video_style_preset):
+        return "ai"
+    if scene_requires_ai(narration, scene_plan, video_style_preset):
+        return "ai"
+    if scene_has_complex_body_pose(narration, scene_plan):
+        return "stock"
+    if scene_stock_friendly(narration, scene_plan, video_style_preset):
+        return "stock"
+    return "ai"
+
 
 def detect_language(text: str) -> str:
     """Very small language detector for routing narration. Keeps Vietnamese narration in Vietnamese."""
@@ -2193,11 +2265,21 @@ def create_adaptive_video_plan(
             is_vertical=is_vertical,
         )
 
+        # Smart image routing: scene-by-scene source decision.
+        image_source_mode = get_image_source_mode(job_config)
         raw_visual_source = str(raw_scene_plan.get("visual_source", "") or "").strip().lower()
-        if raw_visual_source not in {"stock", "ai"}:
-            raw_visual_source = "stock" if scene_stock_friendly(chunk, scene_plan, video_style_preset) else "ai"
-        if scene_requires_ai(chunk, scene_plan, video_style_preset):
-            raw_visual_source = "ai"
+        smart_visual_source = decide_image_source(
+            narration=chunk,
+            scene_plan=scene_plan,
+            video_style_preset=video_style_preset,
+            image_source_mode=image_source_mode,
+        )
+        if raw_visual_source in {"stock", "ai"}:
+            # Respect planner only when it does not conflict with narrative/fantasy requirements.
+            if scene_is_storytelling(chunk, scene_plan, video_style_preset) or scene_requires_ai(chunk, scene_plan, video_style_preset):
+                raw_visual_source = "ai"
+        else:
+            raw_visual_source = smart_visual_source
         stock_query = str(raw_scene_plan.get("stock_query", "") or "").strip()
         if not stock_query:
             stock_query = build_stock_query(chunk, scene_plan, is_vertical=is_vertical)
@@ -2215,6 +2297,7 @@ def create_adaptive_video_plan(
             "scene_plan": scene_plan,
             "aspect_ratio": "9:16" if is_vertical else "16:9",
             "video_style_preset": video_style_preset,
+            "image_source_mode": image_source_mode,
         })
 
     return {
@@ -2634,13 +2717,17 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     scene_plan = scene.get("scene_plan", {}) or {}
     video_style_preset = scene.get("video_style_preset", "") or ""
 
-    force_stock_first = False
+    image_source_mode = scene.get("image_source_mode") or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE)
     try:
-        force_stock_first = scene_stock_friendly(narration, scene_plan, video_style_preset) or scene_has_complex_body_pose(narration, scene_plan)
+        smart_source = decide_image_source(narration, scene_plan, video_style_preset, image_source_mode=image_source_mode)
     except Exception:
-        force_stock_first = False
+        smart_source = visual_source if visual_source in {"stock", "ai"} else "ai"
 
-    if visual_source == "stock" or force_stock_first:
+    # Protect storytelling scenes from generic Pexels mismatch.
+    if scene_is_storytelling(narration, scene_plan, video_style_preset) or scene_requires_ai(narration, scene_plan, video_style_preset):
+        smart_source = "ai"
+
+    if smart_source == "stock":
         stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
 
         # 1) Try local stock asset folder first, if present.
