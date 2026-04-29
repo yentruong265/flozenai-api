@@ -1372,8 +1372,8 @@ _STORYTELLING_WORDS = {
 
 
 # ===== Frontend style routing rules =====
-STORY_MIXED_STYLE_PRESETS = {"zen_soft", "warm_storybook", "mystic_light", "watercolor_poetic"}
-STOCK_FIRST_STYLE_PRESETS = {"lifestyle", "cinematic_glow", "bold_promo", "cinematic_realistic", "dramatic_cinematic"}
+STORY_MIXED_STYLE_PRESETS = {"warm_storybook"}
+STOCK_FIRST_STYLE_PRESETS = {"lifestyle", "cinematic_glow", "bold_promo", "cinematic_realistic", "dramatic_cinematic","zen_soft","mystic_light", "watercolor_poetic"}
 
 def is_story_mixed_style(video_style_preset: str) -> bool:
     return str(video_style_preset or "").strip().lower() in STORY_MIXED_STYLE_PRESETS
@@ -1811,6 +1811,71 @@ def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int)
         return None
 
 
+def is_warm_story_style(video_style_preset: str) -> bool:
+    """Return True for Warm Story / storybook styles from frontend."""
+    style = str(video_style_preset or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return style in {"warm_storybook", "warm_story", "storybook", "warm", "cau_chuyen", "câu_chuyện", "câu chuyện"}
+
+
+def apply_warm_story_image_grade(image_path: str, strength: float = 1.0) -> str:
+    """Unify AI + stock/Pexels images for Warm Story videos.
+
+    This is intentionally lightweight and CPU-only:
+    - adds a warm amber story tone
+    - slightly softens harsh stock contrast
+    - adds a tiny cinematic vignette
+    - preserves the original frame size
+
+    It helps AI and Pexels images feel like the same video world without changing
+    routing, planner, scene count, or GPU cost.
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter
+        img = Image.open(image_path).convert("RGB")
+        arr = np.asarray(img).astype(np.float32)
+
+        s = float(strength)
+        s = max(0.0, min(s, 1.5))
+
+        # Warm amber tone: lift red/green slightly, reduce harsh blue.
+        arr[..., 0] *= (1.035 + 0.025 * s)
+        arr[..., 1] *= (1.010 + 0.015 * s)
+        arr[..., 2] *= (0.955 - 0.015 * s)
+
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        img = Image.fromarray(arr, "RGB")
+
+        # Softer storybook-cinematic finish, not too strong.
+        img = ImageEnhance.Color(img).enhance(0.92)
+        img = ImageEnhance.Contrast(img).enhance(0.96)
+        img = ImageEnhance.Brightness(img).enhance(1.015)
+
+        # Very subtle soft layer to reduce mismatch between AI and photo stock.
+        soft = img.filter(ImageFilter.GaussianBlur(radius=0.35))
+        img = Image.blend(img, soft, 0.10)
+
+        # Light vignette to make mixed sources feel more cinematic.
+        w, h = img.size
+        yy, xx = np.mgrid[0:h, 0:w]
+        cx, cy = w / 2.0, h / 2.0
+        dist = np.sqrt(((xx - cx) / max(cx, 1)) ** 2 + ((yy - cy) / max(cy, 1)) ** 2)
+        vignette = 1.0 - np.clip((dist - 0.42) / 0.72, 0, 1) * (0.13 * s)
+        out_arr = np.asarray(img).astype(np.float32) * vignette[..., None]
+        out_arr = np.clip(out_arr, 0, 255).astype(np.uint8)
+
+        Image.fromarray(out_arr, "RGB").save(image_path, format="PNG")
+    except Exception as e:
+        print("WARN: warm story image grade failed:", repr(e))
+    return image_path
+
+
+def maybe_apply_style_image_grade(image_path: str, video_style_preset: str) -> str:
+    """Apply final image-level style unification only where needed."""
+    if is_warm_story_style(video_style_preset):
+        return apply_warm_story_image_grade(image_path, strength=1.0)
+    return image_path
+
+
 def _clean_prompt_piece(value: str, max_words: int = 12) -> str:
     value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
     if not value:
@@ -2159,7 +2224,7 @@ def plan_video_with_ai(
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
     prompt = f"""
-You are FlozenAI's production video director and prompt engineer.
+You are FlozenAI's senior cinematic director, visual prompt engineer, and stock-image search planner.
 
 Return ONLY valid JSON.
 No markdown.
@@ -2181,11 +2246,20 @@ ASPECT RATIO:
 CURRENT ROUGH TEXT CHUNKS:
 {json.dumps(scene_chunks, ensure_ascii=False)}
 
+CORE MISSION:
+You must convert the user's script into a practical, production-ready scene plan.
+Each scene must be visually concrete enough for BOTH:
+1. stock/Pexels search, and
+2. AI image generation.
+
 LANGUAGE RULES:
-A. Detect the language of USER REQUEST.
-B. narration_text MUST be in the SAME language as USER REQUEST.
-C. If USER REQUEST is Vietnamese, every narration_text MUST be Vietnamese. Do not translate narration_text into English.
-D. visual_prompt and stock_query MUST be concise English for image search/generation.
+A. The USER REQUEST can be any language or mixed languages.
+B. Detect the main language of USER REQUEST automatically.
+C. narration_text MUST keep the same language and tone as the USER REQUEST.
+D. Do NOT force Vietnamese or English narration.
+E. Do NOT translate narration_text unless the user explicitly asks for translation.
+F. visual_prompt MUST be in English because image models work better in English.
+G. stock_query MUST be in English because stock search works better in English.
 
 IMPORTANT STYLE RULES:
 1. If STYLE LOCKED is true, video_style_preset MUST be exactly "{locked_style}".
@@ -2193,57 +2267,95 @@ IMPORTANT STYLE RULES:
 3. Every scene must visually follow the selected style preset.
 4. Allowed style presets: {list(STYLE_PRESETS.keys())}.
 
-IMPORTANT PLANNING RULES:
+SCENE PLANNING RULES:
 5. Understand the user request and turn it into a coherent short video.
 6. Choose the scene count naturally based on the content and target length, within {min_scenes} to {max_scenes} scenes.
 7. For short videos under 45 seconds, usually create 4-7 scenes, but use your judgment.
-8. Even if the input is one paragraph, you MUST still create multiple coherent scenes.
+8. Even if the input is one paragraph, create multiple coherent scenes when the video needs visual progression.
 9. Each scene must represent a different moment, action, camera framing, or visual idea.
 10. Each scene must include narration_text. This is the spoken narration for that scene.
 11. narration_text must follow the user's requested content; do not invent unrelated facts.
 12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
 13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
-14. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
-15. visual_prompt must be written in concise English for SDXL.
-16. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
-17. If narration_text mentions a person, visual_prompt must show that same person type, visible emotion, and visible action.
-18. If narration_text mentions an action, visual_prompt must show that visible action, not only a portrait.
-19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
-20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
-20a. Scene planning must be detailed enough for image matching: include the exact background, props/objects, clothing or item cues, body posture, and what the subject is doing with the object.
-20b. details must contain 3-5 visible items only, for example: ["wooden desk", "morning window light", "notebook and pen", "cup of coffee"]. Do not put abstract ideas in details.
-20c. stock_query must include subject + action + setting + mood/style, not just one generic word. Example: "young woman planning day at desk morning light lifestyle photo".
-20d. visual_prompt must describe the same visible moment as narration_text, including the key object if the narration mentions one.
-21. Keep visual_prompt compact: maximum 45-65 English words. Avoid long repeated style phrases.
-21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
-21c. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
-21d. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
-21e. Provide stock_query in English whenever visual_source is "stock". For fitness/yoga/exercise, use simple stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
-21f. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
-22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
-23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
-24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
-25. Each scene must include a specific subject, visible action, location/background, shot, lighting, mood, and details.
-26. Keep visual prompts practical and literal, not abstract.
-20. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
-21. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
-22. If aspect ratio is 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
-27. Do not add text, subtitles, watermark, logo, or words inside generated images.
-28. For every scene, narration_text and visual_prompt must describe the SAME moment.
-29. For scenes with humans, prefer one clear subject or a small natural group; avoid crowds unless necessary.
-30. For humans, include natural face, correct anatomy, realistic hands, normal fingers, and clear eyes in visual_prompt when relevant.
+
+VISUAL GROUNDING RULES — VERY IMPORTANT:
+14. visual_prompt MUST directly and literally represent narration_text.
+15. Do NOT create generic, decorative, symbolic-only, or unrelated visuals.
+16. For every scene, identify the visible moment first, then style.
+17. Every visual_prompt must clearly include:
+    subject + visible action + key object/prop if any + location/background + camera shot + lighting + mood.
+18. If narration_text mentions a person, show that same person type, their visible emotion, and their visible action.
+19. If narration_text mentions an action, visual_prompt must show that exact visible action, not only a portrait.
+20. If narration_text mentions a place, product, object, tool, animal, vehicle, food, or situation, include it clearly.
+21. If narration_text mentions an object/prop, that object MUST appear in details and visual_prompt.
+22. If narration_text mentions multiple objects, include the most important 1-3 objects only.
+23. If narration_text is abstract, convert it into one concrete visible real-world moment that represents the meaning.
+24. Do not use abstract words alone such as peace, wisdom, karma, hope, fear, success. Convert them into visible imagery.
+25. Maintain character and setting consistency across consecutive story scenes when relevant.
+26. Keep visual_prompt compact: maximum 45-65 English words.
+27. Put the most important visible elements at the beginning of visual_prompt.
+28. Avoid long repeated style phrases.
+29. Do not add text, subtitles, watermark, logo, letters, signs, or words inside generated images.
+30. For every scene, narration_text and visual_prompt must describe the SAME moment.
+
+DETAIL QUALITY RULES:
+31. main_subject must be specific, not generic. Example: "young office worker", not just "person".
+32. action must be a visible physical action. Example: "writing in a notebook", not "thinking about goals".
+33. location must be a concrete setting. Example: "small kitchen at sunrise", not "life".
+34. details must contain 3-5 visible items only, for example: ["wooden desk", "morning window light", "notebook and pen", "cup of coffee"].
+35. details must NOT contain abstract ideas.
+36. Add background when useful: what is behind or around the subject.
+37. Add appearance/clothing cues when useful, especially for human/story characters.
+38. Add posture/body language when useful, especially for emotional or action scenes.
+39. shot must be specific: close-up, medium shot, medium-long shot, wide shot, full body, overhead, low angle.
+40. lighting must include time or lighting quality: morning light, warm sunset, soft window light, candlelight, neon glow, dramatic side light.
+41. composition must guide the frame: centered subject, subject on left third, foreground object, safe margins, full body visible.
+
+STOCK QUERY RULES:
+42. stock_query must be a short English search query with subject + action + setting + mood/style.
+43. Do NOT use one-word or vague stock_query.
+44. Good stock_query example: "young woman planning day at desk morning light lifestyle photo".
+45. For fitness/yoga/exercise, use simple realistic stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
+46. If visual_source is stock, stock_query must be strong and practical for Pexels/local stock search.
+47. If a scene is realistic daily life, business, family, office, travel, food, nature, fitness, product use, or promo, prefer visual_source="stock".
+
+AI IMAGE PROMPT RULES:
+48. If visual_source="ai", simplify the visual: one clear subject, simple pose, clean object shapes, simple background.
+49. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex products, messy backgrounds, or too many small objects.
+50. For humans, include natural face, correct anatomy, realistic hands, normal fingers, clear eyes, and physically possible body posture when relevant.
+51. For vertical 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
+52. For landscape 16:9, use balanced cinematic framing and enough background context.
+
+VISUAL SOURCE RULES:
+53. Choose visual_source="stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports/product-use scenes that can use existing photos.
+54. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
+55. Choose visual_source="ai" for unique fictional characters, Buddhist/fantasy/spiritual/ancient/surreal/mystical scenes, or anything clearly hard to find in stock assets.
+56. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
+57. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
+
+VIDEO STRUCTURE RULES:
+58. If the user asks for a product/review/sales video, scenes should follow: hook, product close-up, benefit/use case, trust/social proof, call-to-action.
+59. If the user asks for a story video, scenes should follow narrative progression: opening, conflict/context, turning point, insight, ending.
+60. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-19. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
-19a. For lifestyle: choose visual_source="stock" by default. Use realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
-19b. For cinematic_glow: choose visual_source="stock" by default. Use cinematic but realistic stock photos with soft glow and polished lighting.
-19c. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
-20. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
-21. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
-22. For warm_storybook: mixed visual mode. Do not mark every scene as AI. Use AI for key characters/turning points; use stock for generic village, nature, temple, road, hands, daily-life moments.
-23. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
-24. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
-25. Hard rule: For zen_soft, warm_storybook, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". The rest should be visual_source="stock" with strong stock_query.
+61. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
+62. For lifestyle: choose visual_source="stock" by default. Use realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
+63. For cinematic_glow: choose visual_source="stock" by default. Use cinematic but realistic stock photos with soft glow and polished lighting.
+64. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
+65. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
+66. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
+67. For warm_storybook: mixed visual mode. Do not mark every scene as AI. Use AI for key characters/turning points; use stock for generic village, nature, temple, road, hands, daily-life moments.
+68. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
+69. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
+70. Hard rule: For zen_soft, warm_storybook, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". The rest should be visual_source="stock" with strong stock_query.
+
+SELF-CHECK BEFORE FINAL JSON:
+71. For each scene, verify: Does visual_prompt show the same moment as narration_text?
+72. Verify every mentioned object/action/place appears in visual_prompt.
+73. Verify stock_query is useful if visual_source="stock".
+74. Verify no visual_prompt asks for text, logo, watermark, subtitles, or unreadable signs.
+75. Verify scenes are visually different and flow naturally.
 
 Return JSON exactly with this schema:
 {{
@@ -2260,10 +2372,14 @@ Return JSON exactly with this schema:
       "stock_query": "English search query for stock/local asset, or empty string",
       "visual_prompt": "English SDXL prompt, concrete and style-consistent",
       "main_subject": "short specific visual subject",
-      "action": "short visible action",
+      "action": "short visible physical action",
       "expression": "visible emotion if relevant",
       "location": "specific realistic/appropriate setting",
-      "details": ["detail 1", "detail 2", "detail 3"],
+      "details": ["visible detail 1", "visible detail 2", "visible detail 3"],
+      "background": "visible surrounding environment",
+      "appearance": "visible clothing/appearance cues if relevant",
+      "camera_shot": "camera shot/framing",
+      "composition": "subject/object placement and framing",
       "shot": "camera shot/framing",
       "lighting": "lighting condition",
       "time_of_day": "morning / afternoon / night / neutral",
@@ -2914,6 +3030,7 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
         scene_id=scene["scene_id"],
     )
+    maybe_apply_style_image_grade(img_path, scene.get("video_style_preset", ""))
     scene["visual_used"] = "ai"
     scene["visual_file"] = os.path.basename(img_path)
     return img_path
@@ -2956,6 +3073,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             if stock:
                 print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                 prepare_stock_image(stock["path"], img_path, width, height)
+                maybe_apply_style_image_grade(img_path, video_style_preset)
                 scene["visual_used"] = "stock_local"
                 scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
@@ -2969,6 +3087,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             print(f"📸 Using Pexels stock for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
             ok = prepare_pexels_image(pexels["url"], img_path, width, height)
             if ok:
+                maybe_apply_style_image_grade(img_path, video_style_preset)
                 scene["visual_used"] = "stock_pexels"
                 scene["visual_source"] = "stock"
                 scene["stock_query_used"] = pexels.get("query", "")
@@ -2983,6 +3102,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         else:
             print(f"⚡ No stock/Pexels for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled by 60% budget, using fast placeholder")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+            maybe_apply_style_image_grade(img_path, video_style_preset)
             scene["visual_used"] = "placeholder_stock_missing"
             scene["visual_source"] = "stock"
             scene["visual_file"] = os.path.basename(img_path)
