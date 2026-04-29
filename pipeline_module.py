@@ -1309,6 +1309,12 @@ def get_image_source_mode(job_config=None) -> str:
     return _normalize_image_source_mode()
 
 def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
+    """Detect whether the scene belongs to narrative/storytelling domain.
+
+    This does NOT mean every story scene must use AI. In smart mode:
+    - key story moments use AI for better plot matching
+    - safe background/context shots may use stock/Pexels for speed
+    """
     joined = " ".join([
         str(narration or ""), str(video_style_preset or ""),
         str(scene_plan.get("main_subject", "") or ""),
@@ -1320,25 +1326,97 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
         return True
     return _has_any_term(joined, _STORYTELLING_WORDS)
 
+
+def is_key_story_scene(narration: str, scene_plan: Dict[str, Any]) -> bool:
+    """Key story scenes should use AI so the image matches the actual plot."""
+    text = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("expression", "") or ""),
+        str(scene_plan.get("mood", "") or ""),
+    ]).lower()
+
+    has_character = scene_has_human(scene_plan, narration)
+
+    has_dialogue_or_action = _has_any_term(text, {
+        "nói", "hỏi", "trả lời", "khóc", "cười", "mỉm cười", "suy nghĩ", "quyết định",
+        "cúi đầu", "quỳ", "chắp tay", "giúp", "cho đi", "tha thứ", "nhận ra", "hiểu ra",
+        "gặp", "thấy", "nghe", "bước đi", "đứng trước", "ngồi bên", "nhìn", "đưa",
+        "said", "asked", "answered", "cried", "smiled", "thought", "decided",
+        "realized", "forgave", "helped", "gave", "met", "saw", "heard", "looked"
+    })
+
+    has_spiritual_or_moral_meaning = _has_any_term(text, {
+        "bài học", "nhân quả", "nghiệp", "từ bi", "vô thường", "giác ngộ", "thiền", "phật",
+        "đức phật", "nhà sư", "thiền sư", "ngôi chùa", "lòng tốt", "tâm", "trí tuệ",
+        "lesson", "karma", "compassion", "impermanence", "enlightenment", "buddha",
+        "monk", "zen master", "temple", "wisdom", "kindness", "mindfulness"
+    })
+
+    return bool(has_character and (has_dialogue_or_action or has_spiritual_or_moral_meaning)) or bool(has_spiritual_or_moral_meaning)
+
+
+def is_story_background_scene(narration: str, scene_plan: Dict[str, Any]) -> bool:
+    """Story context shots that can safely use stock/Pexels to save time."""
+    text = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+
+    background_terms = {
+        "bối cảnh", "khung cảnh", "ngôi làng", "làng", "con đường", "đường làng", "rừng", "núi", "sông",
+        "bình minh", "hoàng hôn", "mưa", "sương", "đêm", "sáng sớm", "căn nhà", "mái nhà",
+        "ngôi chùa", "sân chùa", "chuông chùa", "nến", "hoa sen", "tượng phật", "ánh sáng",
+        "quiet village", "village", "road", "forest", "mountain", "river", "sunrise", "sunset",
+        "rain", "mist", "temple exterior", "candle", "lotus", "buddha statue", "peaceful landscape"
+    }
+
+    has_background = _has_any_term(text, background_terms)
+    has_key_action = is_key_story_scene(narration, scene_plan)
+    has_complex_character = scene_has_human(scene_plan, narration) and not has_background
+    return bool(has_background and not has_key_action and not has_complex_character)
+
+
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
-    """Return 'stock' or 'ai' for one scene. Default smart mode balances speed and scene-match."""
+    """Return 'stock' or 'ai' for one scene.
+
+    smart mode balances scene-match and speed:
+    - key storytelling scenes -> AI
+    - safe story backgrounds -> stock/Pexels
+    - daily-life/business/nature/fitness -> stock/Pexels
+    """
     mode = _normalize_image_source_mode(image_source_mode)
+
     if mode == "ai_first":
         return "ai"
+
     if mode == "stock_first":
         if scene_requires_ai(narration, scene_plan, video_style_preset):
             return "ai"
         return "stock"
 
-    # SMART MODE
-    if scene_is_storytelling(narration, scene_plan, video_style_preset):
-        return "ai"
     if scene_requires_ai(narration, scene_plan, video_style_preset):
+        if scene_is_storytelling(narration, scene_plan, video_style_preset) and is_story_background_scene(narration, scene_plan):
+            return "stock"
         return "ai"
+
+    if scene_is_storytelling(narration, scene_plan, video_style_preset):
+        if is_key_story_scene(narration, scene_plan):
+            return "ai"
+        if is_story_background_scene(narration, scene_plan):
+            return "stock"
+        return "ai"
+
     if scene_has_complex_body_pose(narration, scene_plan):
         return "stock"
+
     if scene_stock_friendly(narration, scene_plan, video_style_preset):
         return "stock"
+
     return "ai"
 
 
@@ -1454,17 +1532,33 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
 
 
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    parts = [
-        scene_plan.get("main_subject", ""),
-        scene_plan.get("action", ""),
-        scene_plan.get("location", ""),
-        scene_plan.get("mood", ""),
-        narration,
-    ]
-    if scene_has_complex_body_pose(narration, scene_plan):
-        parts.extend(["realistic stock photo", "natural composition", "clean details"])
+    """Build a short, searchable Pexels/local-stock query.
+
+    Pexels matches better with concrete English phrases, not a long narration paragraph.
+    For storytelling, only safe background shots are sent to stock search.
+    """
+    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 7)
+    action = _clean_prompt_piece(scene_plan.get("action", ""), 7)
+    location = _clean_prompt_piece(scene_plan.get("location", ""), 8)
+    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 6)
+    narration_short = _clean_prompt_piece(narration, 12)
+
+    if is_story_background_scene(narration, scene_plan):
+        joined = " ".join([location, subject, narration_short]).lower()
+        if _has_any_term(joined, {"chùa", "temple", "phật", "buddha", "thiền", "zen", "lotus", "hoa sen"}):
+            parts = ["peaceful buddhist temple", "lotus", "soft light", "cinematic documentary photo"]
+        elif _has_any_term(joined, {"làng", "village", "đường", "road", "forest", "rừng", "mountain", "núi"}):
+            parts = ["quiet village road", "natural landscape", "cinematic documentary photo"]
+        else:
+            parts = [location or subject or narration_short, "peaceful atmosphere", "cinematic documentary photo"]
+    elif scene_has_complex_body_pose(narration, scene_plan):
+        parts = [subject or "person", action, location, "realistic stock photo", "natural composition", "clean details"]
+    else:
+        parts = [subject, action, location, mood, "realistic photo"]
+
     parts.append("portrait photo" if is_vertical else "landscape photo")
-    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
+    query = " ".join([str(p) for p in parts if p]).strip()
+    return shorten_prompt_for_sdxl(query or narration_short or "daily life realistic photo", max_chars=130, max_words=20)
 
 
 def _load_stock_metadata():
@@ -1672,69 +1766,80 @@ def build_grounded_visual_prompt(
     scene_plan: Dict[str, Any],
     is_vertical: bool = False,
 ) -> str:
-    """
-    Make image prompt more grounded:
-    - prioritize visible subject/action/location from the narration/scene plan
-    - avoid abstract/symbolic prompts
-    - add human anatomy safeguards only when people appear
-    - keep prompt short enough to reduce CLIP truncation
+    """Build a stronger SDXL prompt that matches the current narration.
+
+    Improvements:
+    - exact subject/action/location first
+    - one concrete visual moment
+    - compact narration grounding
+    - stronger anatomy/composition safeguards
     """
     style_name = (video_style.get("name") or "").strip().lower()
-    anchor = _scene_anchor_from_plan(scene_plan, narration, is_vertical)
+    scene_plan = validate_and_repair_scene_plan(scene_plan, narration, is_vertical=is_vertical)
+
+    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 9)
+    action = _clean_prompt_piece(scene_plan.get("action", ""), 10)
+    location = _clean_prompt_piece(scene_plan.get("location", ""), 9)
+    expression = _clean_prompt_piece(scene_plan.get("expression", ""), 7)
+    shot = _clean_prompt_piece(scene_plan.get("shot", ""), 8)
+    lighting = _clean_prompt_piece(scene_plan.get("lighting", ""), 8)
+    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 7)
+
+    if not subject:
+        subject = "main character" if scene_has_human(scene_plan, narration) else "main subject"
+    if not action:
+        action = "clear visible action matching the narration"
+    if not location:
+        location = "specific setting matching the narration"
+
+    anchor = ", ".join([x for x in [subject, action, f"in {location}" if location else "", expression] if x])
 
     if style_name == "cinematic_realistic":
-        style_terms = "cinematic realistic photo, natural light, realistic faces, clear subject"
+        style_terms = "cinematic realistic photo, documentary realism, natural light, real environment"
     elif style_name == "dramatic_cinematic":
-        style_terms = "photorealistic cinematic frame, dramatic light, realistic proportions"
+        style_terms = "photorealistic cinematic frame, dramatic lighting, strong emotion, realistic proportions"
     elif style_name == "zen_soft":
-        style_terms = "calm soft visual, peaceful composition, gentle light"
+        style_terms = "calm soft visual, peaceful composition, gentle light, minimal clean background"
     elif style_name == "warm_storybook":
-        style_terms = "warm storybook illustration, clean composition, expressive subject"
+        style_terms = "warm storybook illustration, expressive subject, clean composition, soft light"
     elif style_name == "watercolor_poetic":
-        style_terms = "poetic watercolor, soft brush texture, clear subject"
+        style_terms = "poetic watercolor, soft brush texture, clear subject, lyrical atmosphere"
     else:
         style_terms = str(video_style.get("prompt_style", "") or "")
 
-    human_terms = ""
+    human_guard = ""
     if scene_has_human(scene_plan, narration):
-        human_terms = (
-            "one clear human subject, natural face, correct anatomy, realistic hands, "
-            "normal fingers, detailed eyes, realistic arms and legs"
-        )
+        human_guard = "one clear human subject, natural face, correct anatomy, realistic hands, normal fingers, clear eyes"
 
     pose_guard = ""
     if scene_has_complex_body_pose(narration, scene_plan):
-        # SDXL often fails on extreme yoga/fitness poses. When AI fallback is needed,
-        # make the pose simpler and anatomically plausible instead of asking for contortion.
-        pose_guard = (
-            "simple natural athletic pose, anatomically plausible body, both arms and legs clearly connected, "
-            "no extreme bending, no contortion, realistic joints"
-        )
+        pose_guard = "simple natural pose, anatomically plausible body, connected limbs, no extreme bending"
 
     abstract_guard = ""
     if scene_is_abstract(narration, scene_plan):
-        abstract_guard = "show a concrete real moment, not abstract symbolism"
+        abstract_guard = "concrete physical scene, not abstract symbolism, no floating symbols"
 
     if is_vertical:
-        composition = "portrait framing, subject centered, safe margins, no cropped head or feet"
+        composition = "portrait framing, centered subject, safe top and bottom margins, no cropped head or feet"
     else:
-        composition = "landscape framing, balanced composition, eye-level camera"
+        composition = "landscape cinematic framing, balanced composition, eye-level camera"
 
-    # Keep AI prompt, but only as support after the structured anchor.
-    base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=160, max_words=32)
-    narration_hint = shorten_prompt_for_sdxl(f"matches narration: {narration}", max_chars=100, max_words=18)
+    camera = ", ".join([x for x in [shot, lighting, mood] if x])
+    base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=120, max_words=24)
+    narration_hint = shorten_prompt_for_sdxl(f"same moment as narration: {narration}", max_chars=90, max_words=16)
 
     prompt = ", ".join([
         anchor,
+        camera,
         style_terms,
-        human_terms,
+        human_guard,
         pose_guard,
         abstract_guard,
         composition,
         base_prompt,
         narration_hint,
     ])
-    return shorten_prompt_for_sdxl(prompt, max_chars=260, max_words=58)
+    return shorten_prompt_for_sdxl(prompt, max_chars=280, max_words=60)
 
 
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
@@ -2006,11 +2111,14 @@ IMPORTANT PLANNING RULES:
 19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
 20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
 21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
-21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
-21c. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
-21d. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
-21e. Provide stock_query in English whenever visual_source is "stock". For fitness/yoga/exercise, use simple stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
-21f. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
+21b. Use mixed image routing. Choose visual_source="stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
+21c. For STORY videos, choose visual_source="ai" for key plot moments: specific character action, dialogue, emotion, moral lesson, Buddhist/spiritual turning point, or unique ancient/fantasy scenes.
+21d. For STORY videos, choose visual_source="stock" only for safe background/context shots: village road, peaceful temple exterior, lotus, candle, forest, river, sunrise, rain, quiet room, mountains, general atmosphere.
+21e. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts, unless the scene is a key story moment.
+21f. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
+21g. Provide stock_query in English whenever visual_source is "stock". Keep it short and searchable, e.g. "peaceful buddhist temple lotus soft light", "quiet village road sunrise", "person exercising at gym realistic photo".
+21h. If visual_source="ai", make visual_prompt very grounded: exact subject + visible action + location + expression + camera shot + lighting. Avoid generic portraits and decorative symbolism.
+21i. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
 22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
@@ -2275,9 +2383,15 @@ def create_adaptive_video_plan(
             image_source_mode=image_source_mode,
         )
         if raw_visual_source in {"stock", "ai"}:
-            # Respect planner only when it does not conflict with narrative/fantasy requirements.
-            if scene_is_storytelling(chunk, scene_plan, video_style_preset) or scene_requires_ai(chunk, scene_plan, video_style_preset):
-                raw_visual_source = "ai"
+            # Respect planner only when it does not conflict with hard AI requirements.
+            # For storytelling, allow mixed mode: key story scenes use AI; background/context scenes may use stock.
+            if scene_requires_ai(chunk, scene_plan, video_style_preset):
+                if scene_is_storytelling(chunk, scene_plan, video_style_preset) and is_story_background_scene(chunk, scene_plan):
+                    raw_visual_source = "stock"
+                else:
+                    raw_visual_source = "ai"
+            elif scene_is_storytelling(chunk, scene_plan, video_style_preset):
+                raw_visual_source = smart_visual_source
         else:
             raw_visual_source = smart_visual_source
         stock_query = str(raw_scene_plan.get("stock_query", "") or "").strip()
@@ -2723,9 +2837,16 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     except Exception:
         smart_source = visual_source if visual_source in {"stock", "ai"} else "ai"
 
-    # Protect storytelling scenes from generic Pexels mismatch.
-    if scene_is_storytelling(narration, scene_plan, video_style_preset) or scene_requires_ai(narration, scene_plan, video_style_preset):
-        smart_source = "ai"
+    # Mixed storytelling protection:
+    # - key story scenes remain AI for better plot matching
+    # - safe background/context story scenes may use stock/Pexels for speed
+    if scene_requires_ai(narration, scene_plan, video_style_preset):
+        if scene_is_storytelling(narration, scene_plan, video_style_preset) and is_story_background_scene(narration, scene_plan):
+            smart_source = "stock"
+        else:
+            smart_source = "ai"
+    elif scene_is_storytelling(narration, scene_plan, video_style_preset):
+        smart_source = "ai" if is_key_story_scene(narration, scene_plan) else ("stock" if is_story_background_scene(narration, scene_plan) else "ai")
 
     if smart_source == "stock":
         stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
