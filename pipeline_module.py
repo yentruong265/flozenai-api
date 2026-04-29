@@ -293,12 +293,6 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # Image source routing: smart | stock_first | ai_first
         "image_source_mode": _safe_str(job_config.get("image_source_mode"), os.getenv("IMAGE_SOURCE_MODE", "smart")).lower(),
 
-        # Story visual routing controls.
-        # For Buddhist/spiritual/storytelling videos, keep AI images high-value but capped.
-        # Default: at most 60% AI scenes for story videos; the rest will try stock/Pexels first.
-        "story_ai_ratio": _clamp_float(job_config.get("story_ai_ratio"), float(os.getenv("STORY_AI_RATIO", "0.60")), min_value=0.0, max_value=1.0),
-        "enable_visual_harmonization": _safe_bool(job_config.get("enable_visual_harmonization"), os.getenv("ENABLE_VISUAL_HARMONIZATION", "1").strip().lower() in {"1", "true", "yes", "y"}),
-
         "created_at": _safe_str(job_config.get("created_at"), now_str()),
         "meta": meta,
     }
@@ -316,7 +310,7 @@ import time
 import torch
 import threading
 import requests
-from PIL import Image, ImageEnhance
+from PIL import Image
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
 IMAGE_ACCELERATION = "none"  # SDXL Base only. Ignore Lightning env for stability.
@@ -340,11 +334,6 @@ STOCK_MIN_MATCH_SCORE = float(os.getenv("STOCK_MIN_MATCH_SCORE", "0.18"))
 # Smart image routing mode:
 # smart = best default; stock_first = fastest; ai_first = best for storytelling
 IMAGE_SOURCE_MODE = os.getenv("IMAGE_SOURCE_MODE", "smart").strip().lower()
-
-# Story videos used to drift toward 100% AI because storytelling scenes were forced to SDXL.
-# Default cap: story/Buddhist/spiritual videos use at most 60% AI scenes; remaining scenes try stock/Pexels.
-STORY_AI_RATIO = float(os.getenv("STORY_AI_RATIO", "0.60"))
-ENABLE_VISUAL_HARMONIZATION = os.getenv("ENABLE_VISUAL_HARMONIZATION", "1").strip().lower() in {"1", "true", "yes", "y"}
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
@@ -839,6 +828,56 @@ STYLE_PRESETS = {
         "motion_mode": "standard",
         "duration_profile": "standard",
     },
+    # Frontend styles used by FlozenAI dropdown.
+    "lifestyle": {
+        "name": "lifestyle",
+        "prompt_style": (
+            "realistic lifestyle stock photo, natural people, daily life, authentic environment, "
+            "clean documentary photography, natural light"
+        ),
+        "negative_style": (
+            "cartoon, anime, illustration, drawing, painting, fantasy, surreal, fake people, plastic skin, "
+            "watermark, text, logo"
+        ),
+        "motion_mode": "standard",
+        "duration_profile": "standard",
+    },
+    "cinematic_glow": {
+        "name": "cinematic_glow",
+        "prompt_style": (
+            "photorealistic cinematic stock photo, soft glow, beautiful lighting, realistic environment, "
+            "film still, clear subject, polished color grade"
+        ),
+        "negative_style": (
+            "cartoon, anime, illustration, painting, low realism, fake face, distorted body, text, logo, watermark"
+        ),
+        "motion_mode": "standard",
+        "duration_profile": "standard",
+    },
+    "bold_promo": {
+        "name": "bold_promo",
+        "prompt_style": (
+            "commercial lifestyle stock photo, bold clean composition, product or benefit focused, "
+            "bright professional lighting, modern advertising look"
+        ),
+        "negative_style": (
+            "cartoon, anime, illustration, painting, messy composition, fake product, broken text, logo, watermark"
+        ),
+        "motion_mode": "standard",
+        "duration_profile": "standard",
+    },
+    "mystic_light": {
+        "name": "mystic_light",
+        "prompt_style": (
+            "mystic cinematic light, spiritual atmosphere, soft volumetric glow, mysterious but elegant, "
+            "clear subject, clean composition"
+        ),
+        "negative_style": (
+            "horror gore, ugly monster, chaotic frame, messy symbols, unreadable text, watermark, logo, bad anatomy"
+        ),
+        "motion_mode": "dramatic",
+        "duration_profile": "standard",
+    },
 }
 
 BASE_NEGATIVE_PROMPT = (
@@ -919,6 +958,32 @@ def normalize_style_preset(style_value: str) -> str:
         "photorealistic": "cinematic_realistic",
         "cinematic_realistic": "cinematic_realistic",
 
+        # FlozenAI frontend dropdown aliases
+        "lifestyle": "lifestyle",
+        "doi_song": "lifestyle",
+        "đời_sống": "lifestyle",
+        "đời sống": "lifestyle",
+        "life_style": "lifestyle",
+
+        "cinematic_glow": "cinematic_glow",
+        "cinematic glow": "cinematic_glow",
+        "dien_anh": "cinematic_glow",
+        "điện_ảnh": "cinematic_glow",
+        "điện ảnh": "cinematic_glow",
+
+        "bold_promo": "bold_promo",
+        "bold promo": "bold_promo",
+        "quang_ba": "bold_promo",
+        "quảng_bá": "bold_promo",
+        "quảng bá": "bold_promo",
+        "promo": "bold_promo",
+
+        "mystic_light": "mystic_light",
+        "mystic light": "mystic_light",
+        "huyen_bi": "mystic_light",
+        "huyền_bí": "mystic_light",
+        "huyền bí": "mystic_light",
+
         "dramatic": "dramatic_cinematic",
         "drama": "dramatic_cinematic",
         "dramatic_cinematic": "dramatic_cinematic",
@@ -930,6 +995,11 @@ def normalize_style_preset(style_value: str) -> str:
         "storybook": "warm_storybook",
         "warm": "warm_storybook",
         "warm_storybook": "warm_storybook",
+        "warm_story": "warm_storybook",
+        "warm story": "warm_storybook",
+        "cau_chuyen": "warm_storybook",
+        "câu_chuyện": "warm_storybook",
+        "câu chuyện": "warm_storybook",
 
         "watercolor": "watercolor_poetic",
         "poetic": "watercolor_poetic",
@@ -1300,6 +1370,115 @@ _STORYTELLING_WORDS = {
     "bài học", "lòng tốt", "từ bi", "vô thường", "giác ngộ", "tâm linh", "huyền bí"
 }
 
+
+# ===== Frontend style routing rules =====
+STORY_MIXED_STYLE_PRESETS = {"zen_soft", "warm_storybook", "mystic_light", "watercolor_poetic"}
+STOCK_FIRST_STYLE_PRESETS = {"lifestyle", "cinematic_glow", "bold_promo", "cinematic_realistic", "dramatic_cinematic"}
+
+def is_story_mixed_style(video_style_preset: str) -> bool:
+    return str(video_style_preset or "").strip().lower() in STORY_MIXED_STYLE_PRESETS
+
+def is_stock_first_style(video_style_preset: str) -> bool:
+    return str(video_style_preset or "").strip().lower() in STOCK_FIRST_STYLE_PRESETS
+
+def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> float:
+    """Score scenes that deserve AI more. Used only for mixed story/spiritual styles."""
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    txt = " ".join([
+        str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+    ]).lower()
+    score = 0.0
+    if idx == 0:
+        score += 3.0
+    if idx == total - 1:
+        score += 2.0
+    if scene_requires_ai(scene_obj.get("voice_text", ""), scene_plan, scene_obj.get("video_style_preset", "")):
+        score += 5.0
+    if _has_any_term(txt, {"turning point", "cao trào", "bước ngoặt", "giác ngộ", "nhận ra", "huyền bí", "mystic", "buddha", "phật", "thiền sư", "nhà sư"}):
+        score += 2.5
+    if scene_has_human(scene_plan, scene_obj.get("voice_text", "")):
+        score += 1.0
+    if scene_is_abstract(scene_obj.get("voice_text", ""), scene_plan):
+        score += 0.8
+    return score
+
+def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Final hard guard before image generation.
+    - Zen Soft / Warm Story / Mystic Light: max 60% AI images; the rest stock/Pexels and NO AI fallback.
+    - Lifestyle / Cinematic Glow / Bold Promo: stock/Pexels first; AI only when stock fails or scene truly requires AI.
+    """
+    if not scene_objects:
+        return scene_objects
+
+    style = str(video_style_preset or "").strip().lower()
+    total = len(scene_objects)
+
+    if is_story_mixed_style(style):
+        max_ai = int(job_config.get("story_ai_image_budget", 0) or 0)
+        if max_ai <= 0:
+            max_ai = max(1, int(math.ceil(total * 0.60)))
+        max_ai = max(1, min(max_ai, int(math.ceil(total * 0.60)), total))
+
+        ranked = sorted(
+            range(total),
+            key=lambda i: _scene_priority_for_ai(scene_objects[i], i, total),
+            reverse=True,
+        )
+        ai_indices = set(ranked[:max_ai])
+        for i, s in enumerate(scene_objects):
+            if i in ai_indices:
+                s["visual_source"] = "ai"
+                s["ai_fallback_allowed"] = True
+                s["routing_reason"] = f"story_mixed_ai_budget_{max_ai}_of_{total}"
+            else:
+                s["visual_source"] = "stock"
+                s["ai_fallback_allowed"] = False
+                s["routing_reason"] = f"story_mixed_stock_remaining_max_ai_60pct_{max_ai}_of_{total}"
+            if not s.get("stock_query"):
+                s["stock_query"] = build_stock_query(s.get("voice_text", ""), s.get("scene_plan", {}) or {}, is_vertical=(s.get("aspect_ratio") == "9:16"))
+        return scene_objects
+
+    if is_stock_first_style(style):
+        for s in scene_objects:
+            scene_plan = s.get("scene_plan", {}) or {}
+            narration = s.get("voice_text") or s.get("source_chunk") or ""
+            if scene_requires_ai(narration, scene_plan, style):
+                s["visual_source"] = "ai"
+                s["ai_fallback_allowed"] = True
+                s["routing_reason"] = "stock_first_but_scene_requires_ai"
+            else:
+                s["visual_source"] = "stock"
+                # User requested: AI only when no suitable Pexels/stock image exists.
+                s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), True)
+                s["routing_reason"] = "stock_first_style_use_pexels_stock_then_ai_if_missing"
+            if not s.get("stock_query"):
+                s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=(s.get("aspect_ratio") == "9:16"))
+        return scene_objects
+
+    return scene_objects
+
+def create_fast_placeholder_image(out_path: str, width: int, height: int, title: str = "FlozenAI"):
+    """Last-resort fast visual so a job never hangs because stock is missing and AI budget is locked."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img = Image.new("RGB", (int(width), int(height)), (24, 28, 40))
+    try:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        for y in range(int(height)):
+            r = int(24 + 28 * y / max(1, height))
+            g = int(28 + 20 * y / max(1, height))
+            b = int(40 + 50 * y / max(1, height))
+            draw.line([(0, y), (int(width), y)], fill=(r, g, b))
+    except Exception:
+        pass
+    save_image_safely(img, out_path)
+    return out_path
+
 def _normalize_image_source_mode(mode: str = None) -> str:
     mode = str(mode or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE) or "smart").strip().lower()
     mode = mode.replace("-", "_").replace(" ", "_")
@@ -1327,38 +1506,30 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
         str(scene_plan.get("location", "") or ""),
         " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
     ]).lower()
-    if video_style_preset in {"warm_storybook", "watercolor_poetic", "zen_soft"}:
-        return True
+    # Being in a story-like style does not automatically mean every scene needs AI.
+    # The final 60% AI budget decides how many AI images are allowed.
     return _has_any_term(joined, _STORYTELLING_WORDS)
 
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
-    """Return 'stock' or 'ai' for one scene.
-
-    Final routing rule:
-    - ai_first: force AI.
-    - stock_first: stock/Pexels first, except scenes that truly require AI.
-    - smart: non-story videos behave like stock-first for speed/cost;
-      story/Buddhist/spiritual videos are handled later by apply_story_ai_budget_to_scenes(),
-      where AI is capped by STORY_AI_RATIO, default 60%.
-    """
+    """Return 'stock' or 'ai' for one scene. Default smart mode balances speed and scene-match."""
     mode = _normalize_image_source_mode(image_source_mode)
-
     if mode == "ai_first":
         return "ai"
-
-    # For stock_first and smart, hard-AI scenes still need SDXL.
-    if scene_hard_requires_ai(narration, scene_plan, video_style_preset):
-        return "ai"
-
     if mode == "stock_first":
+        if scene_requires_ai(narration, scene_plan, video_style_preset):
+            return "ai"
         return "stock"
 
     # SMART MODE
-    # Default behavior for normal / non-story videos: stock/Pexels first.
-    # Story videos are detected at the whole-video level and balanced later by
-    # apply_story_ai_budget_to_scenes(), where AI is capped by STORY_AI_RATIO.
-    # Therefore, never force AI here just because one scene looks like storytelling.
-    return "stock"
+    if scene_is_storytelling(narration, scene_plan, video_style_preset):
+        return "ai"
+    if scene_requires_ai(narration, scene_plan, video_style_preset):
+        return "ai"
+    if scene_has_complex_body_pose(narration, scene_plan):
+        return "stock"
+    if scene_stock_friendly(narration, scene_plan, video_style_preset):
+        return "stock"
+    return "ai"
 
 
 def detect_language(text: str) -> str:
@@ -1398,191 +1569,6 @@ def tokenize_for_match(text: str):
     t = re.sub(r"[^0-9a-zA-Zăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ\s_-]", " ", t)
     return {w for w in re.split(r"[\s_-]+", t) if len(w) >= 3}
 
-
-
-
-
-# ===== Strong visual grounding rules =====
-# These rules prevent prompts from dropping critical visible details such as:
-# "novice monk carrying two water jars with a shoulder pole, one cracked".
-# They are intentionally lightweight and deterministic: no extra API call, no dependency.
-
-VISUAL_PHRASE_RULES = [
-    (r"chú\s+tiểu|tiểu\s+tăng|sa\s+di", "young novice monk"),
-    (r"nhà\s+sư|vị\s+sư|thiền\s+sư", "Buddhist monk"),
-    (r"gánh\s+nước|gánh\s+hai\s+.*bình|gánh\s+.*bình", "carrying water with a wooden shoulder pole"),
-    (r"hai\s+(chiếc\s+)?bình|2\s+(chiếc\s+)?bình", "two clay water jars hanging from both ends of the pole"),
-    (r"bình\s+nước|bình\s+đựng\s+nước", "clay water jar"),
-    (r"bị\s+nứt|nứt\s+một\s+đường\s+dài|vết\s+nứt", "one jar has a long visible crack"),
-    (r"rò\s+nước|nước\s+rỉ|chảy\s+nước", "water dripping from the cracked jar"),
-    (r"con\s+suối|dòng\s+suối|suối\s+dưới\s+chân\s+núi", "mountain stream at the foot of a hill"),
-    (r"về\s+chùa|ngôi\s+chùa|sân\s+chùa|chùa", "ancient Buddhist temple"),
-    (r"mỗi\s+sáng|buổi\s+sáng|sáng\s+sớm", "early morning soft light"),
-    (r"đường\s+mòn|lối\s+mòn|chân\s+núi", "mountain path"),
-    (r"cầm|nắm", "holding the object clearly"),
-    (r"đọc\s+sách", "reading a book"),
-    (r"viết|ghi\s+chép", "writing on paper"),
-    (r"khóc|rơi\s+nước\s+mắt", "tears visible on the face"),
-    (r"mỉm\s+cười|cười", "gentle smile"),
-    (r"quỳ|chắp\s+tay", "hands joined in prayer"),
-    (r"đi\s+bộ|bước\s+đi", "walking with visible full body movement"),
-    (r"ngồi\s+thiền|thiền\s+định", "sitting meditation pose"),
-    (r"novice monk|young monk", "young novice monk"),
-    (r"shoulder pole|carrying pole", "wooden shoulder pole across the shoulders"),
-    (r"two water jars|two clay jars|two pots", "two clay water jars hanging from both ends of the pole"),
-    (r"cracked jar|cracked pot|long crack", "one jar has a long visible crack"),
-    (r"water dripping|leaking water", "water dripping from the cracked jar"),
-]
-
-
-def extract_must_keep_visual_phrases(narration: str, max_items: int = 10) -> List[str]:
-    """Extract action + object + object state details that must not be dropped."""
-    t = re.sub(r"\s+", " ", str(narration or "")).strip().lower()
-    out = []
-    for pattern, phrase in VISUAL_PHRASE_RULES:
-        try:
-            if re.search(pattern, t, flags=re.IGNORECASE) and phrase not in out:
-                out.append(phrase)
-        except Exception:
-            continue
-        if len(out) >= max_items:
-            break
-    return out
-
-
-def build_must_keep_visual_clause(narration: str, scene_plan: Dict[str, Any] = None, max_items: int = 10) -> str:
-    phrases = extract_must_keep_visual_phrases(narration, max_items=max_items)
-    sp = scene_plan or {}
-    for key in ["key_objects", "object_states", "must_keep_visuals"]:
-        vals = sp.get(key, [])
-        if isinstance(vals, str):
-            vals = [vals]
-        if isinstance(vals, list):
-            for v in vals:
-                vv = str(v).strip()
-                if vv and vv not in phrases:
-                    phrases.append(vv)
-    return ", ".join(phrases[:max_items])
-
-
-def protect_must_keep_details_in_prompt(prompt: str, narration: str, scene_plan: Dict[str, Any] = None, max_chars: int = 340, max_words: int = 72) -> str:
-    """Shorten prompt while preserving the most important visible details first."""
-    must_keep = build_must_keep_visual_clause(narration, scene_plan, max_items=10)
-    prompt = re.sub(r"\s+", " ", str(prompt or "")).strip(" ,")
-    if must_keep:
-        prefix = f"MUST SHOW: {must_keep}"
-        if prefix.lower() not in prompt.lower():
-            prompt = f"{prefix}, {prompt}"
-    return shorten_prompt_for_sdxl(prompt, max_chars=max_chars, max_words=max_words)
-
-def extract_visual_keywords_for_prompt(text: str, max_keywords: int = 10) -> List[str]:
-    """Extract useful nouns/actions from narration for stronger scene matching.
-
-    This is lightweight: no extra model call, no new dependency. It helps both
-    SDXL prompts and Pexels queries keep the same concrete objects/actions as
-    the narration instead of drifting into generic decorative visuals.
-    """
-    raw = re.sub(r"\s+", " ", str(text or "")).strip().lower()
-    if not raw:
-        return []
-    stop_words = {
-        "the", "and", "with", "from", "into", "onto", "this", "that", "there", "their", "about",
-        "when", "while", "after", "before", "because", "through", "video", "scene", "story",
-        "một", "những", "các", "cho", "với", "trong", "ngoài", "rằng", "thì", "là", "của",
-        "người", "này", "kia", "đó", "được", "không", "khi", "vào", "ra", "đến", "từ", "về",
-        "câu", "chuyện", "video", "cảnh", "hãy", "nên", "như", "nếu", "sau", "trước"
-    }
-    tokens = re.findall(r"[0-9a-zA-Zăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]+", raw)
-    out = []
-    for tok in tokens:
-        if len(tok) < 3 or tok in stop_words:
-            continue
-        if tok not in out:
-            out.append(tok)
-        if len(out) >= max_keywords:
-            break
-    return out
-
-
-def infer_scene_intent_label(narration: str, scene_plan: Dict[str, Any]) -> str:
-    """A compact intent label used inside prompts/queries to reduce visual drift."""
-    joined = " ".join([
-        str(narration or ""),
-        str(scene_plan.get("main_subject", "") or ""),
-        str(scene_plan.get("action", "") or ""),
-        str(scene_plan.get("location", "") or ""),
-        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
-    ]).lower()
-    if any(k in joined for k in ["phật", "buddha", "thiền", "zen", "chùa", "temple", "monk", "nhà sư", "tâm linh"]):
-        return "buddhist spiritual storytelling moment"
-    if any(k in joined for k in ["sản phẩm", "product", "review", "shop", "shopee", "mua", "bán"]):
-        return "product review sales moment"
-    if any(k in joined for k in ["văn phòng", "office", "business", "marketing", "meeting", "customer"]):
-        return "modern business realistic moment"
-    if any(k in joined for k in ["gia đình", "family", "home", "mẹ", "cha", "child", "children"]):
-        return "family daily life realistic moment"
-    if any(k in joined for k in ["yoga", "gym", "fitness", "exercise", "chạy", "running", "sports"]):
-        return "fitness wellness realistic moment"
-    if any(k in joined for k in ["thiên nhiên", "nature", "forest", "river", "mountain", "biển", "sea"]):
-        return "nature peaceful realistic moment"
-    return "literal scene matching narration"
-
-
-def enrich_scene_plan_from_narration(scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> Dict[str, Any]:
-    """Fill weak planner fields using narration keywords so each scene remains concrete."""
-    sp = dict(scene_plan or {})
-    keywords = extract_visual_keywords_for_prompt(narration, max_keywords=8)
-    joined_keywords = ", ".join(keywords[:5])
-
-    if not str(sp.get("main_subject", "") or "").strip():
-        if scene_has_human(sp, narration):
-            sp["main_subject"] = "one clear person related to the narration"
-        elif joined_keywords:
-            sp["main_subject"] = f"main subject: {joined_keywords}"
-        else:
-            sp["main_subject"] = "clear main subject matching narration"
-    if not str(sp.get("action", "") or "").strip():
-        sp["action"] = "visible action that directly matches the narration"
-    if not str(sp.get("location", "") or "").strip():
-        sp["location"] = "specific realistic setting from the narration"
-    if not str(sp.get("shot", "") or "").strip():
-        sp["shot"] = "portrait medium shot" if is_vertical else "eye-level medium shot"
-    if not str(sp.get("lighting", "") or "").strip():
-        sp["lighting"] = "natural soft cinematic light"
-
-    details = sp.get("details", []) or []
-    if not isinstance(details, list):
-        details = [str(details)]
-
-    # Strong must-keep visual extraction: action + object + object state.
-    # Example: "chú tiểu gánh nước bằng hai chiếc bình, một bình bị nứt"
-    # must become visible in prompt, not just "young monk".
-    must_keep_visuals = extract_must_keep_visual_phrases(narration, max_items=10)
-    key_objects = []
-    object_states = []
-    for phrase in must_keep_visuals:
-        low = phrase.lower()
-        if any(x in low for x in ["jar", "jars", "pole", "book", "paper", "temple", "stream", "path"]):
-            key_objects.append(phrase)
-        if any(x in low for x in ["crack", "dripping", "visible", "intact", "broken", "leaking"]):
-            object_states.append(phrase)
-
-    details_text = " ".join([str(d).lower() for d in details])
-    for phrase in must_keep_visuals[:6]:
-        if phrase and phrase.lower() not in details_text:
-            details.append(phrase)
-    for kw in keywords[:4]:
-        if kw and kw not in details_text:
-            details.append(kw)
-
-    sp["details"] = [str(d).strip() for d in details if str(d).strip()][:8]
-    sp["must_keep_visuals"] = must_keep_visuals
-    if key_objects:
-        sp["key_objects"] = key_objects[:5]
-    if object_states:
-        sp["object_states"] = object_states[:5]
-    sp["scene_intent"] = infer_scene_intent_label(narration, sp)
-    return sp
 
 def _has_any_term(text: str, terms) -> bool:
     t = (text or "").lower()
@@ -1631,8 +1617,8 @@ def scene_requires_ai(narration: str, scene_plan: Dict[str, Any], video_style_pr
         str(scene_plan.get("location", "") or ""),
         " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
     ]).lower()
-    if video_style_preset in {"warm_storybook", "watercolor_poetic", "zen_soft"}:
-        return True
+    # Frontend story/spiritual styles are mixed mode, not AI-only.
+    # AI is required only for genuinely hard-to-find scenes: spiritual/fantasy/ancient/surreal.
     # Risky realistic scenes with humans/objects/animals are usually better as stock photos;
     # do not force AI unless the scene is spiritual/fantasy/ancient/etc.
     if scene_has_complex_body_pose(narration, scene_plan) and not _has_any_term(joined, _AI_REQUIRED_WORDS):
@@ -1640,219 +1626,10 @@ def scene_requires_ai(narration: str, scene_plan: Dict[str, Any], video_style_pr
     return _has_any_term(joined, _AI_REQUIRED_WORDS)
 
 
-
-
-def scene_hard_requires_ai(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
-    """True only when stock/Pexels is unlikely to represent the scene.
-
-    This is intentionally stricter than scene_requires_ai(). It prevents story/style presets
-    from forcing every scene into SDXL, while still protecting genuinely spiritual/fantasy/
-    ancient/surreal scenes where stock photos usually mismatch.
-    """
-    joined = " ".join([
-        str(narration or ""),
-        str(video_style_preset or ""),
-        str(scene_plan.get("main_subject", "") or ""),
-        str(scene_plan.get("action", "") or ""),
-        str(scene_plan.get("location", "") or ""),
-        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
-    ]).lower()
-    return _has_any_term(joined, _AI_REQUIRED_WORDS)
-
-
-def get_story_ai_ratio(job_config=None) -> float:
-    raw = None
-    if isinstance(job_config, dict):
-        raw = job_config.get("story_ai_ratio")
-    if raw in (None, ""):
-        raw = os.getenv("STORY_AI_RATIO", str(STORY_AI_RATIO))
-    try:
-        return max(0.0, min(float(raw), 1.0))
-    except Exception:
-        return 0.60
-
-
-def detect_story_video(job_config: Dict[str, Any] = None, scene_objects: List[Dict[str, Any]] = None, video_style_preset: str = "") -> bool:
-    """Detect whether the whole video is a story / Buddhist / spiritual / narrative video.
-
-    Important production rule:
-    - Only these videos receive the STORY_AI_RATIO cap, default 60% AI.
-    - Normal videos keep stock/Pexels-first behavior.
-    """
-    job_config = job_config or {}
-    scene_objects = scene_objects or []
-
-    meta = job_config.get("meta", {}) if isinstance(job_config, dict) else {}
-    if not isinstance(meta, dict):
-        meta = {}
-
-    explicit_values = " ".join([
-        str(job_config.get("video_category", "") or ""),
-        str(job_config.get("content_type", "") or ""),
-        str(job_config.get("template", "") or ""),
-        str(job_config.get("video_type", "") or ""),
-        str(job_config.get("job_type", "") or ""),
-        str(meta.get("video_category", "") or ""),
-        str(meta.get("content_type", "") or ""),
-        str(meta.get("template", "") or ""),
-        str(video_style_preset or ""),
-    ]).lower()
-
-    explicit_story_terms = {
-        "story", "storytelling", "narrative", "buddhist", "buddhism", "spiritual",
-        "parable", "fable", "legend", "folklore", "tale",
-        "kể chuyện", "ke chuyen", "câu chuyện", "cau chuyen", "truyện", "truyen",
-        "phật giáo", "phat giao", "phật", "phat", "tâm linh", "tam linh",
-        "nhân quả", "nhan qua", "vô thường", "vo thuong", "thiền", "thien"
-    }
-    if any(term in explicit_values for term in explicit_story_terms):
-        return True
-
-    story_text = " ".join([
-        str(job_config.get("story_text", "") or ""),
-        str(job_config.get("prompt", "") or ""),
-    ]).lower()
-
-    # Strong story signal from the source text itself.
-    if _has_any_term(story_text, _STORYTELLING_WORDS) or _has_any_term(story_text, _AI_REQUIRED_WORDS):
-        return True
-
-    # Fallback: if most scenes are storytelling, treat the entire video as story.
-    if scene_objects:
-        story_count = 0
-        for scene in scene_objects:
-            narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-            scene_plan = scene.get("scene_plan", {}) or {}
-            style_name = scene.get("video_style_preset") or video_style_preset or ""
-            if scene_is_storytelling(narration, scene_plan, style_name):
-                story_count += 1
-        return (story_count / max(len(scene_objects), 1)) >= 0.50
-
-    return False
-
-
-def harmonized_story_stock_query(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", is_vertical: bool = False) -> str:
-    """Build a stock/Pexels query that visually stays close to AI-generated story scenes."""
-    base = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
-    style_terms = {
-        "cinematic_realistic": "cinematic warm light emotional realistic photo",
-        "dramatic_cinematic": "cinematic dramatic light emotional realistic photo",
-        "zen_soft": "peaceful soft light calm zen realistic photo",
-        "warm_storybook": "warm cinematic soft light emotional realistic photo",
-        "watercolor_poetic": "soft poetic warm light peaceful realistic photo",
-    }.get(str(video_style_preset or "").strip().lower(), "cinematic warm soft light realistic photo")
-    return shorten_prompt_for_sdxl(f"{base} {style_terms}", max_chars=150, max_words=22)
-
-
-def apply_visual_harmonization(image_path: str, visual_style: str = "warm_cinematic") -> str:
-    """Light post-processing so AI and stock/Pexels images feel less disconnected.
-
-    It keeps the image natural but nudges contrast, warmth, and sharpness into one shared look.
-    This is intentionally cheap and CPU-light compared with generating another AI image.
-    """
-    if not ENABLE_VISUAL_HARMONIZATION:
-        return image_path
-    try:
-        img = Image.open(image_path).convert("RGB")
-        img = ImageEnhance.Contrast(img).enhance(1.06)
-        img = ImageEnhance.Color(img).enhance(0.94)
-        img = ImageEnhance.Sharpness(img).enhance(1.05)
-        arr = np.asarray(img).astype(np.float32)
-        arr[..., 0] = np.clip(arr[..., 0] * 1.025, 0, 255)
-        arr[..., 1] = np.clip(arr[..., 1] * 1.005, 0, 255)
-        arr[..., 2] = np.clip(arr[..., 2] * 0.975, 0, 255)
-        img = Image.fromarray(arr.astype(np.uint8), "RGB")
-        img.save(image_path, format="PNG")
-    except Exception as e:
-        print("WARN: visual harmonization skipped:", repr(e))
-    return image_path
-
-
-def apply_story_ai_budget_to_scenes(scene_objects: List[Dict[str, Any]], job_config: Dict[str, Any], video_style_preset: str = "") -> List[Dict[str, Any]]:
-    """Cap AI usage for Buddhist/spiritual/storytelling videos.
-
-    Default behavior: story scenes use at most STORY_AI_RATIO (60%) AI images.
-    Hard-AI scenes (Buddha, deity, ancient, fantasy, spiritual/surreal terms) are prioritized.
-    Remaining story scenes are routed to stock/Pexels with harmonized queries.
-    """
-    if not scene_objects:
-        return scene_objects
-
-    image_source_mode = get_image_source_mode(job_config)
-    if image_source_mode == "ai_first":
-        return scene_objects
-
-    # CRITICAL: apply the 60% AI cap ONLY to whole story/Buddhist/spiritual/narrative videos.
-    # Normal videos must remain stock/Pexels-first like the old routing.
-    if not detect_story_video(job_config, scene_objects, video_style_preset):
-        for scene in scene_objects:
-            narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-            scene_plan = scene.get("scene_plan", {}) or {}
-            style_name = scene.get("video_style_preset") or video_style_preset or ""
-            if scene_hard_requires_ai(narration, scene_plan, style_name):
-                scene["visual_source"] = "ai"
-                scene["visual_routing_reason"] = "non_story_hard_ai_required"
-            else:
-                scene["visual_source"] = "stock"
-                scene["visual_routing_reason"] = "non_story_stock_pexels_first"
-                if not scene.get("stock_query"):
-                    is_vertical = str(scene.get("aspect_ratio", "")).strip() == "9:16"
-                    scene["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
-        return scene_objects
-
-    ratio = get_story_ai_ratio(job_config)
-    story_indexes = []
-    hard_ai_indexes = []
-
-    for idx, scene in enumerate(scene_objects):
-        narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-        scene_plan = scene.get("scene_plan", {}) or {}
-        style_name = scene.get("video_style_preset") or video_style_preset or ""
-        if scene_is_storytelling(narration, scene_plan, style_name):
-            story_indexes.append(idx)
-            if scene_hard_requires_ai(narration, scene_plan, style_name):
-                hard_ai_indexes.append(idx)
-
-    if not story_indexes:
-        return scene_objects
-
-    max_ai = int(math.ceil(len(story_indexes) * ratio))
-    if ratio > 0 and max_ai < 1:
-        max_ai = 1
-    max_ai = min(max_ai, len(story_indexes))
-
-    ai_indexes = set(hard_ai_indexes[:max_ai])
-    for idx in story_indexes:
-        if len(ai_indexes) >= max_ai:
-            break
-        ai_indexes.add(idx)
-
-    for idx in story_indexes:
-        scene = scene_objects[idx]
-        narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-        scene_plan = scene.get("scene_plan", {}) or {}
-        style_name = scene.get("video_style_preset") or video_style_preset or ""
-        is_vertical = str(scene.get("aspect_ratio", "")).strip() == "9:16"
-
-        if idx in ai_indexes:
-            scene["visual_source"] = "ai"
-            scene["story_visual_reason"] = "within_story_ai_budget_or_hard_ai"
-        else:
-            scene["visual_source"] = "stock"
-            scene["stock_query"] = harmonized_story_stock_query(narration, scene_plan, style_name, is_vertical=is_vertical)
-            scene["story_visual_reason"] = "story_ai_budget_exceeded_use_harmonized_stock"
-
-        scene["story_ai_ratio"] = ratio
-        scene["story_ai_budget_max"] = max_ai
-        scene["story_scene_count"] = len(story_indexes)
-
-    return scene_objects
-
-
 def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
     if scene_requires_ai(narration, scene_plan, video_style_preset):
         return False
-    if video_style_preset not in {"cinematic_realistic", "dramatic_cinematic", ""}:
+    if video_style_preset not in {"cinematic_realistic", "dramatic_cinematic", "lifestyle", "cinematic_glow", "bold_promo", ""}:
         return False
     joined = " ".join([
         str(narration or ""),
@@ -1867,28 +1644,17 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
 
 
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    """Build a more precise Pexels/local stock query from subject + action + location.
-
-    Keep it concrete and searchable. This greatly reduces mismatch versus generic queries.
-    """
-    scene_plan = enrich_scene_plan_from_narration(scene_plan, narration, is_vertical=is_vertical)
-    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 8)
-    action = _clean_prompt_piece(scene_plan.get("action", ""), 8)
-    location = _clean_prompt_piece(scene_plan.get("location", ""), 8)
-    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 5)
-    intent = scene_plan.get("scene_intent", "literal scene matching narration")
-    keywords = " ".join(extract_visual_keywords_for_prompt(narration, max_keywords=5))
-
-    style = "realistic cinematic stock photo natural light"
-    if scene_is_storytelling(narration, scene_plan, ""):
-        style = "cinematic warm peaceful realistic photo soft light"
+    parts = [
+        scene_plan.get("main_subject", ""),
+        scene_plan.get("action", ""),
+        scene_plan.get("location", ""),
+        scene_plan.get("mood", ""),
+        narration,
+    ]
     if scene_has_complex_body_pose(narration, scene_plan):
-        style += " clean anatomy natural pose"
-
-    orientation = "vertical portrait photo" if is_vertical else "horizontal landscape photo"
-    must_keep = build_must_keep_visual_clause(narration, scene_plan, max_items=6)
-    query = " ".join([must_keep, subject, action, location, mood, intent, keywords, style, orientation])
-    return protect_must_keep_details_in_prompt(query, narration, scene_plan, max_chars=190, max_words=30)
+        parts.extend(["realistic stock photo", "natural composition", "clean details"])
+    parts.append("portrait photo" if is_vertical else "landscape photo")
+    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
 
 
 def _load_stock_metadata():
@@ -2057,7 +1823,6 @@ def _clean_prompt_piece(value: str, max_words: int = 12) -> str:
 
 def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_vertical: bool) -> str:
     """Build a short, concrete visual anchor from structured planner fields."""
-    scene_plan = enrich_scene_plan_from_narration(scene_plan, narration, is_vertical=is_vertical)
     subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 10)
     action = _clean_prompt_piece(scene_plan.get("action", ""), 12)
     location = _clean_prompt_piece(scene_plan.get("location", ""), 10)
@@ -2078,10 +1843,17 @@ def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_verti
     elif not shot:
         shot = "eye-level medium shot"
 
+    details = scene_plan.get("details", []) or []
+    if isinstance(details, list):
+        details_text = _clean_prompt_piece(", ".join([str(x) for x in details[:4]]), 18)
+    else:
+        details_text = _clean_prompt_piece(str(details), 18)
+
     parts = [
         subject,
         action,
         location,
+        details_text,
         expression,
         shot,
         lighting or "natural light",
@@ -2105,15 +1877,20 @@ def build_grounded_visual_prompt(
     - keep prompt short enough to reduce CLIP truncation
     """
     style_name = (video_style.get("name") or "").strip().lower()
-    scene_plan = enrich_scene_plan_from_narration(scene_plan, narration, is_vertical=is_vertical)
     anchor = _scene_anchor_from_plan(scene_plan, narration, is_vertical)
-    visual_keywords = ", ".join(extract_visual_keywords_for_prompt(narration, max_keywords=8))
-    scene_intent = scene_plan.get("scene_intent", infer_scene_intent_label(narration, scene_plan))
 
     if style_name == "cinematic_realistic":
         style_terms = "cinematic realistic photo, natural light, realistic faces, clear subject"
+    elif style_name == "lifestyle":
+        style_terms = "realistic lifestyle stock photo look, natural light, authentic daily life"
+    elif style_name == "cinematic_glow":
+        style_terms = "photorealistic cinematic stock photo, soft glow, polished color grade"
+    elif style_name == "bold_promo":
+        style_terms = "commercial stock photo, bold clean advertising composition, professional lighting"
     elif style_name == "dramatic_cinematic":
         style_terms = "photorealistic cinematic frame, dramatic light, realistic proportions"
+    elif style_name == "mystic_light":
+        style_terms = "mystic cinematic light, spiritual glow, mysterious elegant atmosphere, clear subject"
     elif style_name == "zen_soft":
         style_terms = "calm soft visual, peaceful composition, gentle light"
     elif style_name == "warm_storybook":
@@ -2150,17 +1927,10 @@ def build_grounded_visual_prompt(
 
     # Keep AI prompt, but only as support after the structured anchor.
     base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=160, max_words=32)
-    narration_hint = shorten_prompt_for_sdxl(f"must visually match this narration: {narration}", max_chars=110, max_words=20)
-    keyword_hint = f"key visual details: {visual_keywords}" if visual_keywords else ""
-
-    must_keep_clause = build_must_keep_visual_clause(narration, scene_plan, max_items=10)
-    must_keep_hint = f"MUST SHOW: {must_keep_clause}" if must_keep_clause else ""
+    narration_hint = shorten_prompt_for_sdxl(f"matches narration: {narration}", max_chars=100, max_words=18)
 
     prompt = ", ".join([
-        must_keep_hint,
-        scene_intent,
         anchor,
-        keyword_hint,
         style_terms,
         human_terms,
         pose_guard,
@@ -2169,7 +1939,7 @@ def build_grounded_visual_prompt(
         base_prompt,
         narration_hint,
     ])
-    return protect_must_keep_details_in_prompt(prompt, narration, scene_plan, max_chars=360, max_words=76)
+    return shorten_prompt_for_sdxl(prompt, max_chars=260, max_words=58)
 
 
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
@@ -2199,8 +1969,19 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
 
 
 def validate_and_repair_scene_plan(scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> Dict[str, Any]:
-    """Defensive repair for incomplete AI planner output, with narration grounding."""
-    return enrich_scene_plan_from_narration(scene_plan, narration, is_vertical=is_vertical)
+    """Defensive repair for incomplete AI planner output."""
+    sp = dict(scene_plan or {})
+    if not str(sp.get("main_subject", "") or "").strip():
+        sp["main_subject"] = "main person" if scene_has_human(sp, narration) else "main subject"
+    if not str(sp.get("action", "") or "").strip():
+        sp["action"] = "visible action matching the narration"
+    if not str(sp.get("location", "") or "").strip():
+        sp["location"] = "realistic setting matching the narration"
+    if not str(sp.get("shot", "") or "").strip():
+        sp["shot"] = "portrait medium shot" if is_vertical else "eye-level medium shot"
+    if not str(sp.get("lighting", "") or "").strip():
+        sp["lighting"] = "natural soft light"
+    return sp
 
 
 def sanitize_scene_plan(scene_plan: Dict[str, Any], style_name: str, chunk: str, is_vertical: bool = False) -> Dict[str, Any]:
@@ -2423,28 +2204,22 @@ IMPORTANT PLANNING RULES:
 12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
 13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
 14. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
-14a. Before writing visual_prompt, identify the exact visible subject, action, location, object, emotion, and time context from narration_text.
-14b. visual_prompt must include the SAME visible subject/action/location/object as narration_text. Do not replace it with a generic symbol.
-14b1. NEVER drop key props or object states. If narration_text mentions tools, containers, product parts, clothing, vehicles, animals, books, money, food, water, fire, cracks, broken items, leaking items, or any visible condition, visual_prompt MUST include them clearly.
-14b2. If narration_text says someone carries/holds/uses something, visual_prompt must show the full action and the object, not only the person portrait.
-14b3. Example: Vietnamese "chú tiểu gánh nước bằng hai chiếc bình, một bình bị nứt" must become: "young novice monk carrying water with a wooden shoulder pole, two clay water jars hanging from both ends, one jar has a long visible crack, water dripping".
-14b4. Add fields key_objects, object_states, and must_keep_visuals when a scene has important props or object conditions.
-14c. If narration_text is abstract, translate it into a concrete realistic moment that still expresses the meaning and uses details from the script.
-14d. Do not use vague prompts like "peaceful scene", "beautiful background", "spiritual atmosphere", or "symbolic image" without a concrete subject and action.
-14e. stock_query must be search-friendly: 5-12 English words focused on subject + action + location + mood, not a long sentence.
 15. visual_prompt must be written in concise English for SDXL.
 16. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
 17. If narration_text mentions a person, visual_prompt must show that same person type, visible emotion, and visible action.
 18. If narration_text mentions an action, visual_prompt must show that visible action, not only a portrait.
 19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
 20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
-21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
+20a. Scene planning must be detailed enough for image matching: include the exact background, props/objects, clothing or item cues, body posture, and what the subject is doing with the object.
+20b. details must contain 3-5 visible items only, for example: ["wooden desk", "morning window light", "notebook and pen", "cup of coffee"]. Do not put abstract ideas in details.
+20c. stock_query must include subject + action + setting + mood/style, not just one generic word. Example: "young woman planning day at desk morning light lifestyle photo".
+20d. visual_prompt must describe the same visible moment as narration_text, including the key object if the narration mentions one.
+21. Keep visual_prompt compact: maximum 45-65 English words. Avoid long repeated style phrases.
 21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
 21c. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
 21d. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
-21e. Provide stock_query in English whenever visual_source is "stock". Make it specific and searchable, for example: "old monk walking in temple courtyard", "woman doing yoga at home realistic photo", "family talking at dinner table", "business team meeting office".
+21e. Provide stock_query in English whenever visual_source is "stock". For fitness/yoga/exercise, use simple stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
 21f. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
-21g. For Buddhist/spiritual/storytelling videos, do not mark every scene as AI. Prefer a mixed plan: key symbolic/ancient/spiritual scenes can be AI, while realistic transition, village, temple, nature, walking, listening, reflection, or daily-life scenes can be stock. Keep stock_query cinematic, warm, peaceful, and style-consistent.
 22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
@@ -2460,10 +2235,15 @@ IMPORTANT PLANNING RULES:
 
 STYLE-SPECIFIC RULES:
 19. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
+19a. For lifestyle: choose visual_source="stock" by default. Use realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
+19b. For cinematic_glow: choose visual_source="stock" by default. Use cinematic but realistic stock photos with soft glow and polished lighting.
+19c. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
 20. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
-21. For zen_soft: use calm, peaceful, minimal soft visual language.
-22. For warm_storybook: use warm storybook illustration.
-23. For watercolor_poetic: use poetic watercolor visual language.
+21. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
+22. For warm_storybook: mixed visual mode. Do not mark every scene as AI. Use AI for key characters/turning points; use stock for generic village, nature, temple, road, hands, daily-life moments.
+23. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
+24. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
+25. Hard rule: For zen_soft, warm_storybook, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". The rest should be visual_source="stock" with strong stock_query.
 
 Return JSON exactly with this schema:
 {{
@@ -2484,9 +2264,6 @@ Return JSON exactly with this schema:
       "expression": "visible emotion if relevant",
       "location": "specific realistic/appropriate setting",
       "details": ["detail 1", "detail 2", "detail 3"],
-      "key_objects": ["important visible prop 1", "important visible prop 2"],
-      "object_states": ["visible condition such as cracked, broken, leaking, intact"],
-      "must_keep_visuals": ["critical visual phrase that must appear in image prompt"],
       "shot": "camera shot/framing",
       "lighting": "lighting condition",
       "time_of_day": "morning / afternoon / night / neutral",
@@ -2500,7 +2277,7 @@ Return JSON exactly with this schema:
     resp = client.responses.create(
         model=OPENAI_MODEL,
         input=prompt,
-        temperature=0.18,
+        temperature=0.30,
     )
 
     text = _extract_text_from_responses_api(resp)
@@ -2712,9 +2489,8 @@ def create_adaptive_video_plan(
             image_source_mode=image_source_mode,
         )
         if raw_visual_source in {"stock", "ai"}:
-            # Respect planner unless the scene truly requires AI (fantasy/spiritual/ancient/surreal).
-            # Storytelling alone is NOT forced to AI here; a later budget step caps story AI usage at 60%.
-            if scene_hard_requires_ai(chunk, scene_plan, video_style_preset):
+            # Respect planner only when it does not conflict with narrative/fantasy requirements.
+            if scene_is_storytelling(chunk, scene_plan, video_style_preset) or scene_requires_ai(chunk, scene_plan, video_style_preset):
                 raw_visual_source = "ai"
         else:
             raw_visual_source = smart_visual_source
@@ -2738,9 +2514,8 @@ def create_adaptive_video_plan(
             "image_source_mode": image_source_mode,
         })
 
-    # Apply final story visual budget after all scene objects are built.
-    # This is where Buddhist/spiritual/storytelling videos are capped to 60% AI by default.
-    scene_objects = apply_story_ai_budget_to_scenes(scene_objects, job_config, video_style_preset=video_style_preset)
+    # Final style-aware routing guardrail. This is the hard rule requested from frontend dropdown.
+    scene_objects = enforce_frontend_style_visual_budget(scene_objects, video_style_preset, job_config)
 
     return {
         "used_ai_planner": used_ai,
@@ -3139,7 +2914,6 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
         scene_id=scene["scene_id"],
     )
-    apply_visual_harmonization(img_path)
     scene["visual_used"] = "ai"
     scene["visual_file"] = os.path.basename(img_path)
     return img_path
@@ -3166,22 +2940,15 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     except Exception:
         smart_source = visual_source if visual_source in {"stock", "ai"} else "ai"
 
-    # Do NOT force every storytelling scene to AI.
-    # Story scenes are pre-balanced by apply_story_ai_budget_to_scenes(): default max 60% AI.
-    # Only hard-AI scenes (Buddha/deity/ancient/fantasy/spiritual/surreal) must stay AI.
-    if scene_hard_requires_ai(narration, scene_plan, video_style_preset):
+    # Do NOT force all storytelling scenes to AI. Frontend mixed styles are budget-controlled.
+    # The final scene["visual_source"] and scene["ai_fallback_allowed"] are the source of truth.
+    if visual_source in {"stock", "ai"}:
+        smart_source = visual_source
+    elif scene_requires_ai(narration, scene_plan, video_style_preset):
         smart_source = "ai"
-    elif scene_is_storytelling(narration, scene_plan, video_style_preset):
-        smart_source = visual_source if visual_source in {"stock", "ai"} else smart_source
 
     if smart_source == "stock":
-        is_story_scene = scene_is_storytelling(narration, scene_plan, video_style_preset)
-        if is_story_scene:
-            stock_query = scene.get("stock_query") or harmonized_story_stock_query(narration, scene_plan, video_style_preset, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
-        else:
-            # Non-story videos should use the original stock/Pexels style query,
-            # not the story harmonized query, to avoid forcing a Buddhist/story mood.
-            stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
+        stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
 
         # 1) Try local stock asset folder first, if present.
         if ENABLE_STOCK_ASSETS:
@@ -3189,7 +2956,6 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             if stock:
                 print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                 prepare_stock_image(stock["path"], img_path, width, height)
-                apply_visual_harmonization(img_path)
                 scene["visual_used"] = "stock_local"
                 scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
@@ -3203,7 +2969,6 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             print(f"📸 Using Pexels stock for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
             ok = prepare_pexels_image(pexels["url"], img_path, width, height)
             if ok:
-                apply_visual_harmonization(img_path)
                 scene["visual_used"] = "stock_pexels"
                 scene["visual_source"] = "stock"
                 scene["stock_query_used"] = pexels.get("query", "")
@@ -3212,7 +2977,16 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
 
-        print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
+        ai_fallback_allowed = bool(scene.get("ai_fallback_allowed", True))
+        if ai_fallback_allowed:
+            print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
+        else:
+            print(f"⚡ No stock/Pexels for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled by 60% budget, using fast placeholder")
+            create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+            scene["visual_used"] = "placeholder_stock_missing"
+            scene["visual_source"] = "stock"
+            scene["visual_file"] = os.path.basename(img_path)
+            return img_path
 
     return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
@@ -3316,6 +3090,12 @@ def run_job(job_config, job_id):
         "stock_assets_enabled": ENABLE_STOCK_ASSETS,
         "stock_asset_dir": STOCK_ASSET_DIR,
         "lightning_lora": "",
+        "frontend_visual_routing": {
+            "story_mixed_styles": sorted(list(STORY_MIXED_STYLE_PRESETS)),
+            "stock_first_styles": sorted(list(STOCK_FIRST_STYLE_PRESETS)),
+            "ai_scene_count": sum(1 for s in scene_objects if s.get("visual_source") == "ai"),
+            "stock_scene_count": sum(1 for s in scene_objects if s.get("visual_source") == "stock"),
+        },
     })
 
     write_json(os.path.join(META_DIR, "scene_profiles.json"), scene_objects)
