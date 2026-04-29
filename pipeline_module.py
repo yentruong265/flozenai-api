@@ -293,6 +293,16 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # Image source routing: smart | stock_first | ai_first
         "image_source_mode": _safe_str(job_config.get("image_source_mode"), os.getenv("IMAGE_SOURCE_MODE", "smart")).lower(),
 
+        # Story speed/quality controls.
+        # story_visual_strategy: quality | balanced | fast
+        "story_visual_strategy": _safe_str(job_config.get("story_visual_strategy"), os.getenv("STORY_VISUAL_STRATEGY", "balanced")).lower(),
+        "auto_story_ai_budget": _safe_bool(job_config.get("auto_story_ai_budget"), os.getenv("AUTO_STORY_AI_BUDGET", "1").strip().lower() in {"1", "true", "yes", "y"}),
+        "story_ai_image_budget": _clamp_int(job_config.get("story_ai_image_budget"), int(os.getenv("STORY_AI_IMAGE_BUDGET", "4")), min_value=1, max_value=18),
+        "allow_story_visual_reuse": _safe_bool(job_config.get("allow_story_visual_reuse"), os.getenv("ALLOW_STORY_VISUAL_REUSE", "1").strip().lower() in {"1", "true", "yes", "y"}),
+        "enable_visual_unify": _safe_bool(job_config.get("enable_visual_unify"), os.getenv("ENABLE_VISUAL_UNIFY", "1").strip().lower() in {"1", "true", "yes", "y"}),
+        "visual_unify_strength": _clamp_float(job_config.get("visual_unify_strength"), float(os.getenv("VISUAL_UNIFY_STRENGTH", "0.62")), min_value=0.0, max_value=1.0),
+        "visual_film_grain": _clamp_float(job_config.get("visual_film_grain"), float(os.getenv("VISUAL_FILM_GRAIN", "2.0")), min_value=0.0, max_value=8.0),
+
         "created_at": _safe_str(job_config.get("created_at"), now_str()),
         "meta": meta,
     }
@@ -310,7 +320,7 @@ import time
 import torch
 import threading
 import requests
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
 IMAGE_ACCELERATION = "none"  # SDXL Base only. Ignore Lightning env for stability.
@@ -743,7 +753,7 @@ import edge_tts
 
 from pathlib import Path
 from typing import Dict, List, Any
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from moviepy import VideoClip
 from openai import OpenAI
 
@@ -1309,12 +1319,6 @@ def get_image_source_mode(job_config=None) -> str:
     return _normalize_image_source_mode()
 
 def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "") -> bool:
-    """Detect whether the scene belongs to narrative/storytelling domain.
-
-    This does NOT mean every story scene must use AI. In smart mode:
-    - key story moments use AI for better plot matching
-    - safe background/context shots may use stock/Pexels for speed
-    """
     joined = " ".join([
         str(narration or ""), str(video_style_preset or ""),
         str(scene_plan.get("main_subject", "") or ""),
@@ -1326,97 +1330,187 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
         return True
     return _has_any_term(joined, _STORYTELLING_WORDS)
 
-
-def is_key_story_scene(narration: str, scene_plan: Dict[str, Any]) -> bool:
-    """Key story scenes should use AI so the image matches the actual plot."""
-    text = " ".join([
-        str(narration or ""),
-        str(scene_plan.get("main_subject", "") or ""),
-        str(scene_plan.get("action", "") or ""),
-        str(scene_plan.get("expression", "") or ""),
-        str(scene_plan.get("mood", "") or ""),
-    ]).lower()
-
-    has_character = scene_has_human(scene_plan, narration)
-
-    has_dialogue_or_action = _has_any_term(text, {
-        "nói", "hỏi", "trả lời", "khóc", "cười", "mỉm cười", "suy nghĩ", "quyết định",
-        "cúi đầu", "quỳ", "chắp tay", "giúp", "cho đi", "tha thứ", "nhận ra", "hiểu ra",
-        "gặp", "thấy", "nghe", "bước đi", "đứng trước", "ngồi bên", "nhìn", "đưa",
-        "said", "asked", "answered", "cried", "smiled", "thought", "decided",
-        "realized", "forgave", "helped", "gave", "met", "saw", "heard", "looked"
-    })
-
-    has_spiritual_or_moral_meaning = _has_any_term(text, {
-        "bài học", "nhân quả", "nghiệp", "từ bi", "vô thường", "giác ngộ", "thiền", "phật",
-        "đức phật", "nhà sư", "thiền sư", "ngôi chùa", "lòng tốt", "tâm", "trí tuệ",
-        "lesson", "karma", "compassion", "impermanence", "enlightenment", "buddha",
-        "monk", "zen master", "temple", "wisdom", "kindness", "mindfulness"
-    })
-
-    return bool(has_character and (has_dialogue_or_action or has_spiritual_or_moral_meaning)) or bool(has_spiritual_or_moral_meaning)
+def _normalize_story_visual_strategy(strategy: str = None) -> str:
+    strategy = str(strategy or os.getenv("STORY_VISUAL_STRATEGY", "balanced") or "balanced").strip().lower()
+    strategy = strategy.replace("-", "_").replace(" ", "_")
+    aliases = {"auto": "balanced", "normal": "balanced", "smart": "balanced", "speed": "fast", "faster": "fast", "best": "quality", "high_quality": "quality"}
+    strategy = aliases.get(strategy, strategy)
+    return strategy if strategy in {"quality", "balanced", "fast"} else "balanced"
 
 
-def is_story_background_scene(narration: str, scene_plan: Dict[str, Any]) -> bool:
-    """Story context shots that can safely use stock/Pexels to save time."""
-    text = " ".join([
-        str(narration or ""),
-        str(scene_plan.get("main_subject", "") or ""),
-        str(scene_plan.get("action", "") or ""),
-        str(scene_plan.get("location", "") or ""),
-        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
-    ]).lower()
+def get_story_visual_strategy(job_config=None) -> str:
+    if isinstance(job_config, dict):
+        raw = job_config.get("story_visual_strategy") or job_config.get("story_mode") or job_config.get("visual_strategy")
+        if raw not in (None, ""):
+            return _normalize_story_visual_strategy(raw)
+    return _normalize_story_visual_strategy()
 
-    background_terms = {
-        "bối cảnh", "khung cảnh", "ngôi làng", "làng", "con đường", "đường làng", "rừng", "núi", "sông",
-        "bình minh", "hoàng hôn", "mưa", "sương", "đêm", "sáng sớm", "căn nhà", "mái nhà",
-        "ngôi chùa", "sân chùa", "chuông chùa", "nến", "hoa sen", "tượng phật", "ánh sáng",
-        "quiet village", "village", "road", "forest", "mountain", "river", "sunrise", "sunset",
-        "rain", "mist", "temple exterior", "candle", "lotus", "buddha statue", "peaceful landscape"
-    }
 
-    has_background = _has_any_term(text, background_terms)
-    has_key_action = is_key_story_scene(narration, scene_plan)
-    has_complex_character = scene_has_human(scene_plan, narration) and not has_background
-    return bool(has_background and not has_key_action and not has_complex_character)
+def _safe_job_float(job_config, keys, default=None):
+    if not isinstance(keys, (list, tuple)):
+        keys = [keys]
+    if isinstance(job_config, dict):
+        for k in keys:
+            v = job_config.get(k)
+            if v not in (None, ""):
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+    return default
+
+
+def get_story_ai_image_budget(job_config=None, total_scenes: int = 0) -> int:
+    """Adaptive cap for expensive SDXL calls in story videos.
+
+    A fixed value is not ideal: 4 AI images can be too much for 30s and too low for 3-5 min.
+    This adaptive rule keeps quality anchors while preventing every bridge scene from calling SDXL.
+    """
+    total_scenes = max(0, int(total_scenes or 0))
+    explicit_budget = None
+    auto_budget = True
+    strategy = get_story_visual_strategy(job_config)
+
+    if isinstance(job_config, dict):
+        auto_budget = str(job_config.get("auto_story_ai_budget", os.getenv("AUTO_STORY_AI_BUDGET", "1"))).strip().lower() in {"1", "true", "yes", "y"}
+        if job_config.get("story_ai_image_budget") not in (None, ""):
+            try:
+                explicit_budget = int(float(job_config.get("story_ai_image_budget")))
+            except Exception:
+                explicit_budget = None
+
+    env_budget = int(os.getenv("STORY_AI_IMAGE_BUDGET", "4") or 4)
+
+    if not auto_budget:
+        budget = explicit_budget if explicit_budget is not None else env_budget
+        upper = total_scenes if total_scenes > 0 else 18
+        return max(1, min(int(budget), upper, 18))
+
+    total_sec = _safe_job_float(job_config, ["target_total_video_sec", "target_total_sec"], None)
+    if not total_sec and total_scenes > 0:
+        total_sec = total_scenes * 9.0
+    if not total_sec:
+        total_sec = 60.0
+
+    if strategy == "fast":
+        by_time = int(math.ceil(float(total_sec) / 25.0)) + 1
+        by_scene = int(math.ceil(max(total_scenes, 1) * 0.45)) if total_scenes else by_time
+        hard_cap = 8
+    elif strategy == "quality":
+        by_time = int(math.ceil(float(total_sec) / 12.0)) + 1
+        by_scene = total_scenes if total_scenes else by_time
+        hard_cap = 18
+    else:
+        by_time = int(math.ceil(float(total_sec) / 18.0)) + 1
+        by_scene = int(math.ceil(max(total_scenes, 1) * 0.60)) if total_scenes else by_time
+        hard_cap = 12
+
+    budget = min(by_time, by_scene, hard_cap)
+    if total_scenes > 0:
+        budget = min(budget, total_scenes)
+
+    min_budget = 1 if total_sec <= 25 or total_scenes <= 2 else (2 if strategy == "fast" else 3)
+    return max(min_budget, int(budget))
+
+
+def allow_story_visual_reuse(job_config=None) -> bool:
+    if isinstance(job_config, dict):
+        raw = job_config.get("allow_story_visual_reuse", None)
+        if raw is not None:
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() in {"1", "true", "yes", "y"}
+    return os.getenv("ALLOW_STORY_VISUAL_REUSE", "1").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _scene_importance_score(scene: Dict[str, Any], idx: int, total: int) -> float:
+    narration = str(scene.get("voice_text") or scene.get("source_chunk") or "")
+    plan = scene.get("scene_plan", {}) or {}
+    joined = " ".join([narration, str(plan.get("main_subject", "") or ""), str(plan.get("action", "") or ""), str(plan.get("location", "") or ""), " ".join([str(x) for x in (plan.get("details", []) or [])])]).lower()
+    score = 0.0
+    if idx == 1: score += 4.0
+    if idx == total: score += 4.0
+    if total >= 4 and idx in {max(1, total // 2), max(1, total // 2 + 1)}: score += 2.0
+    if _has_any_term(joined, _AI_REQUIRED_WORDS): score += 5.0
+    if _has_any_term(joined, {"turning point", "realization", "insight", "bài học", "nhận ra", "giác ngộ", "chuyển biến", "cao trào", "kết thúc"}): score += 3.0
+    if scene_has_human(plan, narration): score += 1.0
+    if scene_is_abstract(narration, plan): score += 0.5
+    return score
+
+
+def assign_story_visual_strategy(scene_objects: List[Dict[str, Any]], job_config: Dict[str, Any], video_style_preset: str) -> List[Dict[str, Any]]:
+    """Reduce slow SDXL calls for story videos without destroying narrative match.
+
+    quality  = every story scene may generate AI as before.
+    balanced = generate key AI anchor scenes, use stock/reuse for bridge scenes.
+    fast     = fewer AI anchors for faster rendering.
+    """
+    if not scene_objects:
+        return scene_objects
+    total = len(scene_objects)
+    strategy = get_story_visual_strategy(job_config)
+    if strategy == "quality":
+        for sc in scene_objects:
+            sc["story_visual_strategy"] = "quality"
+        return scene_objects
+    story_flags = [scene_is_storytelling(sc.get("voice_text") or sc.get("source_chunk") or "", sc.get("scene_plan", {}) or {}, video_style_preset) for sc in scene_objects]
+    if not any(story_flags):
+        for sc in scene_objects:
+            sc["story_visual_strategy"] = strategy
+        return scene_objects
+    budget = get_story_ai_image_budget(job_config, total_scenes=total)
+    if strategy == "fast":
+        budget = max(2, min(budget, 3, total))
+    else:
+        budget = max(3 if total >= 5 else 2, min(budget, 5, total))
+    scored = [(_scene_importance_score(sc, i, total), i) for i, sc in enumerate(scene_objects, 1)]
+    anchor_ids = {i for _, i in sorted(scored, key=lambda x: (-x[0], x[1]))[:budget]}
+    anchor_ids.add(1); anchor_ids.add(total)
+    while len(anchor_ids) > budget:
+        removable = [i for _, i in sorted(scored, key=lambda x: (x[0], -x[1])) if i not in {1, total}]
+        if not removable: break
+        anchor_ids.remove(removable[0])
+    sorted_anchors = sorted(anchor_ids)
+    for i, sc in enumerate(scene_objects, 1):
+        sc["story_visual_strategy"] = strategy
+        sc["story_ai_anchor_budget"] = budget
+        sc["story_ai_anchor_ids"] = sorted_anchors
+        narration = sc.get("voice_text") or sc.get("source_chunk") or ""
+        plan = sc.get("scene_plan", {}) or {}
+        if i in anchor_ids or scene_requires_ai(narration, plan, video_style_preset):
+            sc["visual_source"] = "ai"
+            sc["visual_role"] = "story_anchor"
+        elif allow_story_visual_reuse(job_config):
+            nearest = min(sorted_anchors, key=lambda a: abs(a - i)) if sorted_anchors else 1
+            # Try stock first; if no match/API, copy nearest generated anchor instead of spending SDXL time.
+            sc["visual_source"] = "stock_or_reuse"
+            sc["visual_role"] = "story_bridge"
+            sc["reuse_from_scene_id"] = int(nearest)
+        else:
+            sc["visual_source"] = "stock"
+            sc["visual_role"] = "story_bridge_stock"
+    return scene_objects
 
 
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
-    """Return 'stock' or 'ai' for one scene.
-
-    smart mode balances scene-match and speed:
-    - key storytelling scenes -> AI
-    - safe story backgrounds -> stock/Pexels
-    - daily-life/business/nature/fitness -> stock/Pexels
-    """
+    """Return 'stock' or 'ai' for one scene. Default smart mode balances speed and scene-match."""
     mode = _normalize_image_source_mode(image_source_mode)
-
     if mode == "ai_first":
         return "ai"
-
     if mode == "stock_first":
         if scene_requires_ai(narration, scene_plan, video_style_preset):
             return "ai"
         return "stock"
 
-    if scene_requires_ai(narration, scene_plan, video_style_preset):
-        if scene_is_storytelling(narration, scene_plan, video_style_preset) and is_story_background_scene(narration, scene_plan):
-            return "stock"
-        return "ai"
-
+    # SMART MODE
     if scene_is_storytelling(narration, scene_plan, video_style_preset):
-        if is_key_story_scene(narration, scene_plan):
-            return "ai"
-        if is_story_background_scene(narration, scene_plan):
-            return "stock"
         return "ai"
-
+    if scene_requires_ai(narration, scene_plan, video_style_preset):
+        return "ai"
     if scene_has_complex_body_pose(narration, scene_plan):
         return "stock"
-
     if scene_stock_friendly(narration, scene_plan, video_style_preset):
         return "stock"
-
     return "ai"
 
 
@@ -1532,33 +1626,17 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
 
 
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    """Build a short, searchable Pexels/local-stock query.
-
-    Pexels matches better with concrete English phrases, not a long narration paragraph.
-    For storytelling, only safe background shots are sent to stock search.
-    """
-    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 7)
-    action = _clean_prompt_piece(scene_plan.get("action", ""), 7)
-    location = _clean_prompt_piece(scene_plan.get("location", ""), 8)
-    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 6)
-    narration_short = _clean_prompt_piece(narration, 12)
-
-    if is_story_background_scene(narration, scene_plan):
-        joined = " ".join([location, subject, narration_short]).lower()
-        if _has_any_term(joined, {"chùa", "temple", "phật", "buddha", "thiền", "zen", "lotus", "hoa sen"}):
-            parts = ["peaceful buddhist temple", "lotus", "soft light", "cinematic documentary photo"]
-        elif _has_any_term(joined, {"làng", "village", "đường", "road", "forest", "rừng", "mountain", "núi"}):
-            parts = ["quiet village road", "natural landscape", "cinematic documentary photo"]
-        else:
-            parts = [location or subject or narration_short, "peaceful atmosphere", "cinematic documentary photo"]
-    elif scene_has_complex_body_pose(narration, scene_plan):
-        parts = [subject or "person", action, location, "realistic stock photo", "natural composition", "clean details"]
-    else:
-        parts = [subject, action, location, mood, "realistic photo"]
-
+    parts = [
+        scene_plan.get("main_subject", ""),
+        scene_plan.get("action", ""),
+        scene_plan.get("location", ""),
+        scene_plan.get("mood", ""),
+        narration,
+    ]
+    if scene_has_complex_body_pose(narration, scene_plan):
+        parts.extend(["realistic stock photo", "natural composition", "clean details"])
     parts.append("portrait photo" if is_vertical else "landscape photo")
-    query = " ".join([str(p) for p in parts if p]).strip()
-    return shorten_prompt_for_sdxl(query or narration_short or "daily life realistic photo", max_chars=130, max_words=20)
+    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
 
 
 def _load_stock_metadata():
@@ -1630,7 +1708,117 @@ def find_stock_asset(stock_query: str, scene_plan: Dict[str, Any], is_vertical: 
     return None
 
 
-def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
+
+# ===== Visual unification for mixed AI + stock images =====
+# Lightweight common grading so AI-generated images, local stock and Pexels photos feel consistent.
+
+def _get_visual_unify_strength(job_config=None) -> float:
+    raw = None
+    if isinstance(job_config, dict):
+        raw = job_config.get("visual_unify_strength")
+    if raw in (None, ""):
+        raw = os.getenv("VISUAL_UNIFY_STRENGTH", "0.62")
+    try:
+        return max(0.0, min(float(raw), 1.0))
+    except Exception:
+        return 0.62
+
+
+def _visual_unify_enabled(job_config=None) -> bool:
+    if isinstance(job_config, dict):
+        raw = job_config.get("enable_visual_unify", None)
+        if raw is not None:
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() in {"1", "true", "yes", "y"}
+    return os.getenv("ENABLE_VISUAL_UNIFY", "1").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _get_visual_film_grain(job_config=None) -> float:
+    raw = None
+    if isinstance(job_config, dict):
+        raw = job_config.get("visual_film_grain")
+    if raw in (None, ""):
+        raw = os.getenv("VISUAL_FILM_GRAIN", "2.0")
+    try:
+        return max(0.0, min(float(raw), 8.0))
+    except Exception:
+        return 2.0
+
+
+def _style_grade_params(video_style_preset: str):
+    style = str(video_style_preset or "cinematic_realistic").strip().lower()
+    if style == "zen_soft":
+        return {"brightness": 1.015, "contrast": 0.965, "color": 0.92, "sharpness": 0.96, "rgb": (1.015, 1.018, 1.000), "vignette": 0.010}
+    if style == "warm_storybook":
+        return {"brightness": 1.020, "contrast": 0.985, "color": 0.98, "sharpness": 0.98, "rgb": (1.035, 1.012, 0.970), "vignette": 0.012}
+    if style == "watercolor_poetic":
+        return {"brightness": 1.025, "contrast": 0.955, "color": 0.90, "sharpness": 0.92, "rgb": (1.020, 1.010, 0.990), "vignette": 0.008}
+    if style == "dramatic_cinematic":
+        return {"brightness": 0.995, "contrast": 1.050, "color": 0.96, "sharpness": 1.015, "rgb": (1.025, 1.000, 0.970), "vignette": 0.018}
+    return {"brightness": 1.010, "contrast": 1.015, "color": 0.965, "sharpness": 1.005, "rgb": (1.020, 1.005, 0.980), "vignette": 0.012}
+
+
+def apply_image_unify(image: Image.Image, video_style_preset: str = "cinematic_realistic", job_config=None, source: str = "") -> Image.Image:
+    """Normalize mixed AI/stock images to one cinematic look with almost no time cost."""
+    if image is None:
+        return image
+    if not _visual_unify_enabled(job_config):
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    strength = _get_visual_unify_strength(job_config)
+    if strength <= 0:
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    img = image.convert("RGB")
+    params = _style_grade_params(video_style_preset)
+
+    def blend_value(target):
+        return 1.0 + (float(target) - 1.0) * strength
+
+    try:
+        img = ImageEnhance.Brightness(img).enhance(blend_value(params["brightness"]))
+        img = ImageEnhance.Contrast(img).enhance(blend_value(params["contrast"]))
+        img = ImageEnhance.Color(img).enhance(blend_value(params["color"]))
+        img = ImageEnhance.Sharpness(img).enhance(blend_value(params["sharpness"]))
+
+        arr = np.asarray(img).astype(np.float32)
+        for c, mult in enumerate(params.get("rgb", (1.0, 1.0, 1.0))):
+            arr[..., c] *= blend_value(mult)
+
+        grain = _get_visual_film_grain(job_config) * strength
+        if grain > 0:
+            rng = np.random.default_rng(abs(hash((source, arr.shape[0], arr.shape[1]))) % (2**32))
+            arr += rng.normal(0, grain, arr.shape).astype(np.float32)
+
+        vig_strength = float(params.get("vignette", 0.0)) * strength
+        if vig_strength > 0:
+            h, w = arr.shape[:2]
+            yy, xx = np.ogrid[:h, :w]
+            cx, cy = w / 2.0, h / 2.0
+            dist = ((xx - cx) ** 2 / max(cx ** 2, 1) + (yy - cy) ** 2 / max(cy ** 2, 1))
+            vignette = np.clip(1.0 - vig_strength * dist, 1.0 - (vig_strength * 2.2), 1.0)
+            arr *= vignette[..., None]
+
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr, mode="RGB")
+    except Exception as e:
+        print("WARN: visual unify failed:", repr(e))
+        return image.convert("RGB")
+
+
+def apply_image_unify_to_file(path: str, video_style_preset: str = "cinematic_realistic", job_config=None, source: str = ""):
+    if not path or not os.path.exists(path):
+        return path
+    try:
+        img = Image.open(path).convert("RGB")
+        img = apply_image_unify(img, video_style_preset=video_style_preset, job_config=job_config, source=source or path)
+        save_image_safely(img, path)
+    except Exception as e:
+        print("WARN: could not unify image file:", repr(e))
+    return path
+
+def prepare_stock_image(src_path: str, out_path: str, width: int, height: int, video_style_preset: str = "cinematic_realistic", job_config=None, source: str = "stock"):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     img = Image.open(src_path).convert("RGB")
     src_w, src_h = img.size
@@ -1645,6 +1833,7 @@ def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
         y1 = max(0, (src_h - new_h) // 2)
         img = img.crop((0, y1, src_w, y1 + new_h))
     img = img.resize((width, height), Image.LANCZOS)
+    img = apply_image_unify(img, video_style_preset=video_style_preset, job_config=job_config, source=source)
     save_image_safely(img, out_path)
     return out_path
 
@@ -1695,7 +1884,7 @@ def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
         return None
 
 
-def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int):
+def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int, video_style_preset: str = "cinematic_realistic", job_config=None):
     """Download and crop a Pexels image to target frame."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     try:
@@ -1704,7 +1893,7 @@ def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int)
         tmp_path = out_path + ".download"
         with open(tmp_path, "wb") as f:
             f.write(r.content)
-        prepare_stock_image(tmp_path, out_path, width, height)
+        prepare_stock_image(tmp_path, out_path, width, height, video_style_preset=video_style_preset, job_config=job_config, source="stock_pexels")
         try:
             os.remove(tmp_path)
         except Exception:
@@ -1766,80 +1955,72 @@ def build_grounded_visual_prompt(
     scene_plan: Dict[str, Any],
     is_vertical: bool = False,
 ) -> str:
-    """Build a stronger SDXL prompt that matches the current narration.
-
-    Improvements:
-    - exact subject/action/location first
-    - one concrete visual moment
-    - compact narration grounding
-    - stronger anatomy/composition safeguards
+    """
+    Make image prompt more grounded:
+    - prioritize visible subject/action/location from the narration/scene plan
+    - avoid abstract/symbolic prompts
+    - add human anatomy safeguards only when people appear
+    - keep prompt short enough to reduce CLIP truncation
     """
     style_name = (video_style.get("name") or "").strip().lower()
-    scene_plan = validate_and_repair_scene_plan(scene_plan, narration, is_vertical=is_vertical)
-
-    subject = _clean_prompt_piece(scene_plan.get("main_subject", ""), 9)
-    action = _clean_prompt_piece(scene_plan.get("action", ""), 10)
-    location = _clean_prompt_piece(scene_plan.get("location", ""), 9)
-    expression = _clean_prompt_piece(scene_plan.get("expression", ""), 7)
-    shot = _clean_prompt_piece(scene_plan.get("shot", ""), 8)
-    lighting = _clean_prompt_piece(scene_plan.get("lighting", ""), 8)
-    mood = _clean_prompt_piece(scene_plan.get("mood", ""), 7)
-
-    if not subject:
-        subject = "main character" if scene_has_human(scene_plan, narration) else "main subject"
-    if not action:
-        action = "clear visible action matching the narration"
-    if not location:
-        location = "specific setting matching the narration"
-
-    anchor = ", ".join([x for x in [subject, action, f"in {location}" if location else "", expression] if x])
+    anchor = _scene_anchor_from_plan(scene_plan, narration, is_vertical)
 
     if style_name == "cinematic_realistic":
-        style_terms = "cinematic realistic photo, documentary realism, natural light, real environment"
+        style_terms = "cinematic realistic photo, documentary realism, natural light, realistic faces, clear subject"
     elif style_name == "dramatic_cinematic":
-        style_terms = "photorealistic cinematic frame, dramatic lighting, strong emotion, realistic proportions"
+        style_terms = "photorealistic cinematic frame, dramatic light, realistic proportions, strong emotion"
     elif style_name == "zen_soft":
-        style_terms = "calm soft visual, peaceful composition, gentle light, minimal clean background"
+        style_terms = "calm soft visual, peaceful composition, gentle light, minimal background"
     elif style_name == "warm_storybook":
-        style_terms = "warm storybook illustration, expressive subject, clean composition, soft light"
+        style_terms = "warm storybook illustration, clean composition, expressive subject, consistent character design"
     elif style_name == "watercolor_poetic":
-        style_terms = "poetic watercolor, soft brush texture, clear subject, lyrical atmosphere"
+        style_terms = "poetic watercolor, soft brush texture, clear subject, consistent character design"
     else:
         style_terms = str(video_style.get("prompt_style", "") or "")
 
-    human_guard = ""
+    human_terms = ""
     if scene_has_human(scene_plan, narration):
-        human_guard = "one clear human subject, natural face, correct anatomy, realistic hands, normal fingers, clear eyes"
+        human_terms = (
+            "one clear human subject, natural face, correct anatomy, realistic hands, "
+            "normal fingers, detailed eyes, realistic arms and legs"
+        )
 
     pose_guard = ""
     if scene_has_complex_body_pose(narration, scene_plan):
-        pose_guard = "simple natural pose, anatomically plausible body, connected limbs, no extreme bending"
+        # SDXL often fails on extreme yoga/fitness poses. When AI fallback is needed,
+        # make the pose simpler and anatomically plausible instead of asking for contortion.
+        pose_guard = (
+            "simple natural athletic pose, anatomically plausible body, both arms and legs clearly connected, "
+            "no extreme bending, no contortion, realistic joints"
+        )
 
     abstract_guard = ""
     if scene_is_abstract(narration, scene_plan):
-        abstract_guard = "concrete physical scene, not abstract symbolism, no floating symbols"
+        abstract_guard = "turn the idea into one concrete visible action, no abstract symbolism"
 
     if is_vertical:
-        composition = "portrait framing, centered subject, safe top and bottom margins, no cropped head or feet"
+        composition = "portrait framing, subject centered, safe margins, no cropped head or feet, mobile safe"
     else:
-        composition = "landscape cinematic framing, balanced composition, eye-level camera"
+        composition = "landscape framing, balanced composition, eye-level camera"
 
-    camera = ", ".join([x for x in [shot, lighting, mood] if x])
-    base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=120, max_words=24)
-    narration_hint = shorten_prompt_for_sdxl(f"same moment as narration: {narration}", max_chars=90, max_words=16)
+    # Keep the visible anchor first because SDXL follows early tokens more strongly.
+    base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=130, max_words=26)
+    narration_hint = shorten_prompt_for_sdxl(f"literal moment from narration: {narration}", max_chars=90, max_words=16)
 
     prompt = ", ".join([
         anchor,
-        camera,
+        "single decisive story moment",
+        "subject and action clearly visible",
         style_terms,
-        human_guard,
+        human_terms,
         pose_guard,
         abstract_guard,
         composition,
+        "no text, no logo, no watermark",
         base_prompt,
         narration_hint,
     ])
-    return shorten_prompt_for_sdxl(prompt, max_chars=280, max_words=60)
+    return shorten_prompt_for_sdxl(prompt, max_chars=285, max_words=62)
 
 
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
@@ -2103,22 +2284,23 @@ IMPORTANT PLANNING RULES:
 11. narration_text must follow the user's requested content; do not invent unrelated facts.
 12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
 13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
-14. CRITICAL: visual_prompt MUST directly and literally represent narration_text.
+14. CRITICAL: visual_prompt MUST directly and literally represent narration_text as ONE decisive visible moment.
+14b. Make the first 12 words of visual_prompt contain the exact subject + action + place.
+14c. For story videos, keep character continuity: same character type, age, clothing tone, and setting logic across related scenes.
 15. visual_prompt must be written in concise English for SDXL.
 16. Do NOT create generic, symbolic, unrelated, abstract, or decorative visuals.
+16b. Avoid vague prompts like peaceful scene, spiritual light, beautiful temple, karma symbol. Replace them with concrete visible actions.
 17. If narration_text mentions a person, visual_prompt must show that same person type, visible emotion, and visible action.
 18. If narration_text mentions an action, visual_prompt must show that visible action, not only a portrait.
 19. If narration_text mentions a place, product, object, or situation, visual_prompt must include it clearly.
 20. Each visual_prompt must be concrete: subject + visible action + location/background + camera framing + mood + lighting.
 21. Keep visual_prompt compact: maximum 35-50 English words. Avoid long repeated style phrases.
-21b. Use mixed image routing. Choose visual_source="stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
-21c. For STORY videos, choose visual_source="ai" for key plot moments: specific character action, dialogue, emotion, moral lesson, Buddhist/spiritual turning point, or unique ancient/fantasy scenes.
-21d. For STORY videos, choose visual_source="stock" only for safe background/context shots: village road, peaceful temple exterior, lotus, candle, forest, river, sunrise, rain, quiet room, mountains, general atmosphere.
-21e. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts, unless the scene is a key story moment.
-21f. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
-21g. Provide stock_query in English whenever visual_source is "stock". Keep it short and searchable, e.g. "peaceful buddhist temple lotus soft light", "quiet village road sunrise", "person exercising at gym realistic photo".
-21h. If visual_source="ai", make visual_prompt very grounded: exact subject + visible action + location + expression + camera shot + lighting. Avoid generic portraits and decorative symbolism.
-21i. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
+21a. For each visual_prompt, include: subject identity, visible action, location, emotional expression, camera shot, lighting.
+21b. Choose visual_source as "stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports scenes that can use existing photos.
+21c. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
+21d. Choose visual_source="ai" for unique characters, Buddhist/fantasy/spiritual/ancient scenes, product-specific scenes, or anything hard to find in stock assets.
+21e. Provide stock_query in English whenever visual_source is "stock". For fitness/yoga/exercise, use simple stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
+21f. If visual_source="ai", simplify the visual: one clear subject, natural face, realistic hands, clean object shapes, simple pose, simple background. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex product details, or messy backgrounds unless absolutely necessary.
 22. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 23. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 24. If the narration is abstract, convert it into one concrete visible moment that represents the meaning.
@@ -2383,15 +2565,9 @@ def create_adaptive_video_plan(
             image_source_mode=image_source_mode,
         )
         if raw_visual_source in {"stock", "ai"}:
-            # Respect planner only when it does not conflict with hard AI requirements.
-            # For storytelling, allow mixed mode: key story scenes use AI; background/context scenes may use stock.
-            if scene_requires_ai(chunk, scene_plan, video_style_preset):
-                if scene_is_storytelling(chunk, scene_plan, video_style_preset) and is_story_background_scene(chunk, scene_plan):
-                    raw_visual_source = "stock"
-                else:
-                    raw_visual_source = "ai"
-            elif scene_is_storytelling(chunk, scene_plan, video_style_preset):
-                raw_visual_source = smart_visual_source
+            # Respect planner only when it does not conflict with narrative/fantasy requirements.
+            if scene_is_storytelling(chunk, scene_plan, video_style_preset) or scene_requires_ai(chunk, scene_plan, video_style_preset):
+                raw_visual_source = "ai"
         else:
             raw_visual_source = smart_visual_source
         stock_query = str(raw_scene_plan.get("stock_query", "") or "").strip()
@@ -2413,6 +2589,9 @@ def create_adaptive_video_plan(
             "video_style_preset": video_style_preset,
             "image_source_mode": image_source_mode,
         })
+
+    # Story optimization: fewer SDXL calls while keeping key story moments matched.
+    scene_objects = assign_story_visual_strategy(scene_objects, job_config, video_style_preset)
 
     return {
         "used_ai_planner": used_ai,
@@ -2798,7 +2977,7 @@ def _get_image_max_workers(job_config=None) -> int:
     return max(1, min(workers, 3))
 
 
-def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
+def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, job_config=None):
     generate_image(
         prompt=scene["visual_prompt"],
         out_path=img_path,
@@ -2811,12 +2990,24 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
         scene_id=scene["scene_id"],
     )
+    apply_image_unify_to_file(img_path, video_style_preset=scene.get("video_style_preset", "cinematic_realistic"), job_config=job_config, source="ai")
     scene["visual_used"] = "ai"
     scene["visual_file"] = os.path.basename(img_path)
     return img_path
 
 
-def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
+def _copy_reuse_visual(src_path: str, out_path: str, scene: Dict[str, Any]):
+    if not src_path or not os.path.exists(src_path):
+        return None
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    shutil.copy2(src_path, out_path)
+    scene["visual_used"] = "reuse_anchor"
+    scene["visual_file"] = os.path.basename(out_path)
+    scene["reuse_source_path"] = src_path
+    return out_path
+
+
+def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, existing_image_paths=None, job_config=None):
     """Use stock/Pexels for realistic or artifact-risk scenes; otherwise fall back to SDXL.
 
     Important fix:
@@ -2837,16 +3028,12 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     except Exception:
         smart_source = visual_source if visual_source in {"stock", "ai"} else "ai"
 
-    # Mixed storytelling protection:
-    # - key story scenes remain AI for better plot matching
-    # - safe background/context story scenes may use stock/Pexels for speed
-    if scene_requires_ai(narration, scene_plan, video_style_preset):
-        if scene_is_storytelling(narration, scene_plan, video_style_preset) and is_story_background_scene(narration, scene_plan):
-            smart_source = "stock"
-        else:
-            smart_source = "ai"
-    elif scene_is_storytelling(narration, scene_plan, video_style_preset):
-        smart_source = "ai" if is_key_story_scene(narration, scene_plan) else ("stock" if is_story_background_scene(narration, scene_plan) else "ai")
+    # Protect important storytelling anchor scenes from generic Pexels mismatch.
+    # Story bridge scenes are allowed to try stock first and then reuse an anchor image.
+    if visual_source == "stock_or_reuse":
+        smart_source = "stock"
+    elif scene_is_storytelling(narration, scene_plan, video_style_preset) or scene_requires_ai(narration, scene_plan, video_style_preset):
+        smart_source = "ai"
 
     if smart_source == "stock":
         stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
@@ -2856,7 +3043,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             stock = find_stock_asset(stock_query, scene_plan, is_vertical=is_vertical)
             if stock:
                 print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
-                prepare_stock_image(stock["path"], img_path, width, height)
+                prepare_stock_image(stock["path"], img_path, width, height, video_style_preset=video_style_preset, job_config=job_config, source="stock_local")
                 scene["visual_used"] = "stock_local"
                 scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
@@ -2868,7 +3055,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         pexels = fetch_pexels_photo(stock_query, is_vertical=is_vertical)
         if pexels:
             print(f"📸 Using Pexels stock for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
-            ok = prepare_pexels_image(pexels["url"], img_path, width, height)
+            ok = prepare_pexels_image(pexels["url"], img_path, width, height, video_style_preset=video_style_preset, job_config=job_config)
             if ok:
                 scene["visual_used"] = "stock_pexels"
                 scene["visual_source"] = "stock"
@@ -2878,9 +3065,20 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
 
+        if visual_source == "stock_or_reuse":
+            reuse_from = int(scene.get("reuse_from_scene_id") or 0)
+            src = None
+            if existing_image_paths and reuse_from > 0 and reuse_from <= len(existing_image_paths):
+                src = existing_image_paths[reuse_from - 1]
+            if src and os.path.exists(src):
+                print(f"♻️ Reusing story anchor image for scene {int(scene.get('scene_id', 0)):02d} from scene {reuse_from:02d}")
+                scene["visual_source"] = "reuse"
+                scene["reuse_from_scene_id"] = reuse_from
+                return _copy_reuse_visual(src, img_path, scene)
+
         print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
 
-    return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
+    return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, job_config=job_config)
 
 def run_job(job_config, job_id):
     """
@@ -2976,6 +3174,9 @@ def run_job(job_config, job_id):
         "selected_voice": selected_voice,
         "full_narration_text": adaptive_plan.get("full_narration_text", ""),
         "timeline_mode": "single_full_narration_audio",
+        "story_visual_strategy": get_story_visual_strategy(job_config),
+        "story_ai_image_budget": get_story_ai_image_budget(job_config, total_scenes),
+        "allow_story_visual_reuse": allow_story_visual_reuse(job_config),
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
@@ -2999,6 +3200,9 @@ def run_job(job_config, job_id):
     image_paths = [None] * total_scenes
     images_started_at = time.time()
     image_max_workers = _get_image_max_workers(job_config)
+    if any(str(sc.get("visual_source", "")).lower() in {"stock_or_reuse", "reuse"} for sc in scene_objects):
+        # Reuse depends on previous anchor images, so keep image generation sequential.
+        image_max_workers = 1
 
     # Workers are configurable but capped to avoid CUDA OOM on 24GB GPUs.
     # For SDXL Base, IMAGE_MAX_WORKERS=1 is safest; try 2 only on larger GPUs.
@@ -3013,6 +3217,8 @@ def run_job(job_config, job_id):
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 seed=seed,
+                existing_image_paths=image_paths,
+                job_config=job_config,
             )
 
             processed_images = sum(1 for x in image_paths if x)
