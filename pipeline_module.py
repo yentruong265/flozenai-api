@@ -275,7 +275,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # tts controls
         "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
         "tts_pitch": _safe_str(job_config.get("tts_pitch"), "+0Hz"),
-        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.28, min_value=0.7, max_value=1.45),
+        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.18, min_value=0.7, max_value=1.45),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
