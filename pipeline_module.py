@@ -1427,20 +1427,21 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
             s["routing_reason"] = "warm_storybook_full_ai_keep_full_content"
         return scene_objects
 
-    # All non-Warm-Story styles: do NOT reduce scene count and do NOT pre-route to AI.
-    # We first try local stock/Pexels for every scene. If nothing suitable is found,
-    # _prepare_one_scene_visual may fall back to AI according to ai_fallback_when_stock_missing.
+    # All non-Warm-Story styles: HARD STOCK ONLY.
+    # Do NOT reduce scene count. Do NOT pre-route to AI. Do NOT fallback to SDXL, even if the
+    # frontend/job_config accidentally sends ai_fallback_when_stock_missing=true.
+    # This protects Lifestyle / Đời sống / Cinematic Glow / Bold Promo from burning GPU cost.
     for s in scene_objects:
         scene_plan = s.get("scene_plan", {}) or {}
         narration = s.get("voice_text") or s.get("source_chunk") or ""
         s["visual_source"] = "stock"
-        # For non-Warm-Story styles, keep stock/Pexels as the default and do NOT burn GPU by default.
-        # If Pexels/local stock is missing, use a fast placeholder unless the caller explicitly sets
-        # ai_fallback_when_stock_missing=true.
-        s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), False)
-        s["routing_reason"] = "non_warm_story_stock_only_all_scenes_no_scene_limit"
-        if not s.get("stock_query"):
-            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=(s.get("aspect_ratio") == "9:16"))
+        s["ai_fallback_allowed"] = False
+        s["routing_reason"] = "hard_stock_only_non_warm_story_no_ai_no_scene_limit"
+        s["stock_query"] = build_stock_query(
+            narration,
+            scene_plan,
+            is_vertical=(s.get("aspect_ratio") == "9:16")
+        )
     return scene_objects
 
 def create_fast_placeholder_image(out_path: str, width: int, height: int, title: str = "FlozenAI"):
@@ -1492,25 +1493,18 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
     return _has_any_term(joined, _STORYTELLING_WORDS)
 
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
-    """Return 'stock' or 'ai' for one scene. Default smart mode balances speed and scene-match."""
-    mode = _normalize_image_source_mode(image_source_mode)
-    if mode == "ai_first":
-        return "ai"
-    if mode == "stock_first":
-        if scene_requires_ai(narration, scene_plan, video_style_preset):
-            return "ai"
-        return "stock"
+    """Hard frontend routing.
 
-    # SMART MODE
-    if scene_is_storytelling(narration, scene_plan, video_style_preset):
+    Warm Story = AI-only.
+    Every other style = stock/Pexels/local-stock only.
+
+    Important: this intentionally ignores IMAGE_SOURCE_MODE=ai_first for non-warm styles,
+    because the frontend style selection must be the source of truth.
+    """
+    style = str(video_style_preset or "").strip().lower()
+    if style == "warm_storybook":
         return "ai"
-    if scene_requires_ai(narration, scene_plan, video_style_preset):
-        return "ai"
-    if scene_has_complex_body_pose(narration, scene_plan):
-        return "stock"
-    if scene_stock_friendly(narration, scene_plan, video_style_preset):
-        return "stock"
-    return "ai"
+    return "stock"
 
 
 def detect_language(text: str) -> str:
@@ -1624,19 +1618,68 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
     return _has_any_term(joined, _STOCK_FRIENDLY_WORDS) or not scene_is_abstract(narration, scene_plan)
 
 
+def _stock_query_text_join(values) -> str:
+    parts = []
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple, set)):
+            parts.extend([str(x) for x in v if str(x).strip()])
+        else:
+            s = str(v).strip()
+            if s:
+                parts.append(s)
+    return " ".join(parts)
+
+
+def _lifestyle_stock_query_boost(text: str) -> str:
+    """Small bilingual query booster for Pexels. This does NOT choose AI; it only improves stock search."""
+    t = (text or "").lower()
+    boosts = []
+    if any(k in t for k in ["wake up", "waking up", "thức dậy", "dậy sớm", "5 giờ", "5h", "5 am", "5am"]):
+        boosts.append("person waking up early in bed morning")
+    if any(k in t for k in ["alarm", "alarm clock", "báo thức", "đồng hồ", "smartphone alarm", "7 giờ", "7h", "7 am", "7am"]):
+        boosts.append("alarm clock smartphone on bedside table morning")
+    if any(k in t for k in ["plan", "planning", "lập kế hoạch", "kế hoạch", "mục tiêu", "goal", "goals", "suy nghĩ", "reflect"]):
+        boosts.append("person planning day notebook coffee morning desk")
+    if any(k in t for k in ["work", "làm việc", "important task", "việc quan trọng", "focus", "tập trung"]):
+        boosts.append("focused person working on laptop morning")
+    if any(k in t for k in ["exercise", "workout", "tập thể dục", "chạy bộ", "yoga", "gym"]):
+        boosts.append("healthy morning exercise lifestyle")
+    if any(k in t for k in ["sleep", "ngủ", "bed", "giường", "bedroom", "phòng ngủ"]):
+        boosts.append("realistic bedroom morning lifestyle")
+    return " ".join(boosts)
+
+
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
+    """Build a strong English-oriented Pexels/local stock query.
+
+    Priority:
+    1) Planner-provided stock_query, if available.
+    2) Structured planner fields: subject + visible action + key objects + location + time.
+    3) Bilingual booster for common lifestyle scenes.
+    """
+    planner_query = str(scene_plan.get("stock_query", "") or "").strip()
+    key_objects = scene_plan.get("key_objects") or scene_plan.get("must_show") or []
     parts = [
+        planner_query,
         scene_plan.get("main_subject", ""),
         scene_plan.get("action", ""),
+        _stock_query_text_join(key_objects),
         scene_plan.get("location", ""),
+        scene_plan.get("background", ""),
+        scene_plan.get("time_of_day", ""),
         scene_plan.get("mood", ""),
-        narration,
+        scene_plan.get("visual_entity_type", ""),
+        _lifestyle_stock_query_boost(_stock_query_text_join([narration, planner_query, key_objects, scene_plan.get("action", ""), scene_plan.get("location", "")]))
     ]
     if scene_has_complex_body_pose(narration, scene_plan):
         parts.extend(["realistic stock photo", "natural composition", "clean details"])
     parts.append("portrait photo" if is_vertical else "landscape photo")
-    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
-
+    q = " ".join([str(p) for p in parts if str(p).strip()])
+    q = re.sub(r"\b(cinematic|beautiful|professional|high quality|ultra realistic|dramatic)\b", " ", q, flags=re.I)
+    q = re.sub(r"\s+", " ", q).strip()
+    return shorten_prompt_for_sdxl(q, max_chars=220, max_words=34)
 
 def _load_stock_metadata():
     items = []
@@ -1726,51 +1769,53 @@ def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
     return out_path
 
 
+def _pexels_query_variants(query: str):
+    query = shorten_prompt_for_sdxl(query or "daily life", max_chars=140, max_words=20)
+    variants = []
+    if query:
+        variants.append(query)
+    words = query.split()
+    if len(words) > 8:
+        variants.append(" ".join(words[:8]))
+    variants.append("realistic daily life morning routine")
+    clean = []
+    seen = set()
+    for v in variants:
+        v = re.sub(r"\s+", " ", str(v or "").strip())
+        if v and v.lower() not in seen:
+            clean.append(v)
+            seen.add(v.lower())
+    return clean[:3]
+
+
 def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
-    """Fetch one suitable Pexels photo URL for stock-friendly scenes.
-    Returns metadata dict or None. Does not raise.
-    """
+    """Fetch one suitable Pexels photo URL for stock-friendly scenes. Returns metadata dict or None."""
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
-
-    query = shorten_prompt_for_sdxl(stock_query or "daily life", max_chars=120, max_words=18)
-    if not query:
-        query = "daily life"
-
     orientation = "portrait" if is_vertical else "landscape"
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {
-        "query": query,
-        "orientation": orientation,
-        "per_page": max(1, min(int(PEXELS_PER_PAGE), 20)),
-    }
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
-        if resp.status_code != 200:
-            print(f"WARN: Pexels API status={resp.status_code} query={query!r}")
-            return None
-        data = resp.json()
-        photos = data.get("photos", []) or []
-        if not photos:
-            return None
-
-        # Prefer larger, non-empty images. Use deterministic first result to reduce randomness.
-        photo = photos[0]
-        src = photo.get("src", {}) or {}
-        image_url = src.get("large2x") or src.get("large") or src.get("original")
-        if not image_url:
-            return None
-        return {
-            "url": image_url,
-            "query": query,
-            "photographer": photo.get("photographer", ""),
-            "pexels_id": photo.get("id", ""),
-        }
-    except Exception as e:
-        print("WARN: Pexels fetch failed:", repr(e))
-        return None
-
+    for query in _pexels_query_variants(stock_query):
+        params = {"query": query, "orientation": orientation, "per_page": max(1, min(int(PEXELS_PER_PAGE), 20))}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=6)
+            if resp.status_code != 200:
+                print(f"WARN: Pexels API status={resp.status_code} query={query!r}")
+                continue
+            data = resp.json()
+            photos = data.get("photos", []) or []
+            if not photos:
+                continue
+            photo = photos[0]
+            src = photo.get("src", {}) or {}
+            image_url = src.get("large") or src.get("large2x") or src.get("original")
+            if not image_url:
+                continue
+            return {"url": image_url, "query": query, "photographer": photo.get("photographer", ""), "pexels_id": photo.get("id", "")}
+        except Exception as e:
+            print("WARN: Pexels fetch failed:", repr(e))
+            continue
+    return None
 
 def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int):
     """Download and crop a Pexels image to target frame."""
@@ -2391,6 +2436,9 @@ STOCK QUERY RULES:
 45. For fitness/yoga/exercise, use simple realistic stock queries such as "woman doing yoga at home realistic photo" or "person exercising at gym realistic photo".
 46. If visual_source is stock, stock_query must be strong and practical for Pexels/local stock search.
 47. If a scene is realistic daily life, business, family, office, travel, food, nature, fitness, product use, or promo, prefer visual_source="stock".
+47A. For stock_query, be literal and searchable: include the exact visible action + key object + location + time of day. Do NOT use only a generic person/mood query.
+47B. Example: if narration says someone wakes up at 5am while the alarm was set for 7am, stock_query must include "person waking up early in bed alarm clock morning" or "smartphone alarm bedside table morning", not just "man in bed".
+47C. If narration mentions a clock, phone, notebook, laptop, coffee cup, product, tool, vehicle, food, animal, or other object, that object must appear in stock_query, must_show, and visual_prompt.
 
 AI IMAGE PROMPT RULES:
 48. If visual_source="ai", simplify the visual: one clear subject, simple pose, clean object shapes, simple background.
@@ -3152,7 +3200,14 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
 
     narration = scene.get("voice_text") or scene.get("source_chunk") or ""
     scene_plan = scene.get("scene_plan", {}) or {}
-    video_style_preset = scene.get("video_style_preset", "") or ""
+    video_style_preset = str(scene.get("video_style_preset", "") or "").strip().lower()
+
+    # Hard lock: only Warm Story is allowed to use AI by default.
+    # All other styles must stay stock/Pexels/local-stock only.
+    if video_style_preset != "warm_storybook":
+        visual_source = "stock"
+        scene["visual_source"] = "stock"
+        scene["ai_fallback_allowed"] = False
 
     image_source_mode = scene.get("image_source_mode") or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE)
     try:
@@ -3200,6 +3255,9 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 return img_path
 
         ai_fallback_allowed = bool(scene.get("ai_fallback_allowed", True))
+        if video_style_preset != "warm_storybook":
+            ai_fallback_allowed = False
+
         if ai_fallback_allowed:
             print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
         else:
@@ -3210,6 +3268,16 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             scene["visual_source"] = "stock"
             scene["visual_file"] = os.path.basename(img_path)
             return img_path
+
+    # Final guard: never call SDXL for non-Warm-Story styles.
+    if video_style_preset != "warm_storybook":
+        print(f"⚡ Non-Warm-Story scene {int(scene.get('scene_id', 0)):02d}; SDXL blocked, using fast placeholder")
+        create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+        maybe_apply_style_image_grade(img_path, video_style_preset)
+        scene["visual_used"] = "placeholder_ai_blocked"
+        scene["visual_source"] = "stock"
+        scene["visual_file"] = os.path.basename(img_path)
+        return img_path
 
     return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
