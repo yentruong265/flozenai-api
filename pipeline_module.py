@@ -1434,8 +1434,11 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         scene_plan = s.get("scene_plan", {}) or {}
         narration = s.get("voice_text") or s.get("source_chunk") or ""
         s["visual_source"] = "stock"
-        s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), True)
-        s["routing_reason"] = "non_warm_story_stock_first_all_scenes_no_scene_limit"
+        # For non-Warm-Story styles, keep stock/Pexels as the default and do NOT burn GPU by default.
+        # If Pexels/local stock is missing, use a fast placeholder unless the caller explicitly sets
+        # ai_fallback_when_stock_missing=true.
+        s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), False)
+        s["routing_reason"] = "non_warm_story_stock_only_all_scenes_no_scene_limit"
         if not s.get("stock_query"):
             s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=(s.get("aspect_ratio") == "9:16"))
     return scene_objects
@@ -2268,6 +2271,18 @@ WARM STORYBOOK FULL-AI MODE:
 - Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
 """
 
+    non_warm_instruction = ""
+    if not warm_story_ai_full_mode:
+        non_warm_instruction = f"""
+NON-WARM-STORY STRICT MODE:
+- The selected style is not warm_storybook.
+- Do NOT reduce, merge away, summarize away, or drop scenes from CURRENT ROUGH TEXT CHUNKS.
+- Create exactly {len(scene_chunks)} scenes: one scene for each item in CURRENT ROUGH TEXT CHUNKS, in the same order.
+- Each scene's narration_text must preserve the corresponding rough chunk's full meaning and important details.
+- Keep visual_source="stock" for every scene. Do not mark AI for non-warm styles.
+- Make stock_query highly specific and practical: subject + visible action + key object + location + mood/style.
+"""
+
     prompt = f"""
 You are FlozenAI's senior cinematic director, visual prompt engineer, and stock-image search planner.
 
@@ -2286,6 +2301,7 @@ STYLE LOCKED:
 {style_locked}
 
 {warm_story_instruction}
+{non_warm_instruction}
 ASPECT RATIO:
 {aspect_text}
 
@@ -2315,7 +2331,7 @@ IMPORTANT STYLE RULES:
 
 SCENE PLANNING RULES:
 5. Understand the user request and turn it into a coherent short video.
-6. Choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes as a soft target, not a hard cap.
+6. For warm_storybook only, choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes. For all non-warm-story styles, create exactly one scene per CURRENT ROUGH TEXT CHUNK; do not reduce scene count. as a soft target, not a hard cap.
 7. HARD RULE: Preserve 100% of the USER REQUEST content across all narration_text fields. Do not omit endings, examples, dialogue, lessons, calls to action, or any important sentence.
 8. If the script is long, create additional scenes rather than deleting content.
 9. For Warm Story full-AI mode, reduce render cost by merging adjacent narration into richer coherent story beats, but never cut the narration.
@@ -2386,7 +2402,7 @@ AI IMAGE PROMPT RULES:
 VISUAL SOURCE RULES:
 53. For warm_storybook full-AI mode only: choose visual_source="ai" for every scene.
 54. For ALL OTHER styles, choose visual_source="stock" by default for every scene, including lifestyle, cinematic_glow, bold_promo, cinematic_realistic, dramatic_cinematic, zen_soft, mystic_light, and watercolor_poetic.
-55. For non-warm-story styles, do NOT mark scenes as AI just because the topic is spiritual, ancient, mystical, Buddhist, emotional, or cinematic. The pipeline will try stock/Pexels first and only fall back to AI if no suitable stock/Pexels image exists.
+55. For non-warm-story styles, do NOT mark scenes as AI just because the topic is spiritual, ancient, mystical, Buddhist, emotional, or cinematic. Always return visual_source="stock" for non-warm-story styles. The pipeline will use stock/Pexels/local stock; if stock is missing, the pipeline may use a placeholder instead of AI unless the user explicitly enables AI fallback.
 56. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 57. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 
@@ -2405,7 +2421,7 @@ STYLE-SPECIFIC RULES:
 67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats, but preserve 100% of the original narration content. If needed, exceed the target scene count rather than dropping content.
 68. For watercolor_poetic: set visual_source="stock" unless this is warm_storybook full-AI mode. Keep stock_query practical and poetic but searchable.
 69. For mystic_light: set visual_source="stock". Use stock-search-friendly candles, night sky, forest, temple, silhouette, light rays, fog, meditation, or mysterious ambience.
-70. Hard rule: Only warm_storybook uses 100% AI. All other styles should keep all scenes and use stock/Pexels first; AI fallback is handled later by the pipeline only when stock/Pexels is missing.
+70. Hard rule: Only warm_storybook uses AI visuals by default. All other styles must keep all rough chunks as scenes and use stock/Pexels/local stock first. Do not reduce scene count for non-warm styles.
 
 SELF-CHECK BEFORE FINAL JSON:
 71. Verify the concatenation of all narration_text fields preserves the full USER REQUEST content and does not remove any important sentence or ending.
@@ -2598,10 +2614,22 @@ def create_adaptive_video_plan(
 
     plan_scenes = clean_ai_scene_list(ai_plan or {}, min_scenes=min_scenes, max_scenes=max_scenes)
 
-    # Critical fix:
-    # If AI planner returns multiple scenes, those scenes become the source of truth.
-    # Otherwise fallback creates multiple chunks from the story text.
-    if used_ai and len(plan_scenes) >= 2:
+    # Critical routing/content fix:
+    # - Warm Story may use the AI planner's richer narration grouping, but must preserve content.
+    # - All other styles must NOT let the planner reduce/merge scene count. We keep the original
+    #   chunk list as the source of truth and only borrow planner visual fields when available.
+    if video_style_preset != "warm_storybook":
+        base_chunks = initial_chunks
+        if len(base_chunks) < 2:
+            base_chunks = force_scene_chunks_by_words(story_text, min_scenes=min_scenes, max_scenes=max_scenes)
+        scene_source = []
+        for idx, chunk in enumerate(base_chunks, 1):
+            plan_scene = plan_scenes[idx - 1] if used_ai and idx - 1 < len(plan_scenes) else {}
+            scene_source.append({
+                "chunk": chunk,
+                "scene_plan": plan_scene,
+            })
+    elif used_ai and len(plan_scenes) >= 2:
         scene_source = []
         for idx, scene in enumerate(plan_scenes, 1):
             fallback = initial_chunks[min(idx - 1, len(initial_chunks) - 1)] if initial_chunks else story_text
@@ -2677,10 +2705,12 @@ def create_adaptive_video_plan(
             video_style_preset=video_style_preset,
             image_source_mode=image_source_mode,
         )
-        if raw_visual_source in {"stock", "ai"}:
-            # Respect planner only when it does not conflict with narrative/fantasy requirements.
-            if scene_is_storytelling(chunk, scene_plan, video_style_preset) or scene_requires_ai(chunk, scene_plan, video_style_preset):
-                raw_visual_source = "ai"
+        if video_style_preset != "warm_storybook":
+            # Non-Warm-Story styles must remain stock/Pexels-first and must not be pre-routed to AI.
+            raw_visual_source = "stock"
+        elif raw_visual_source in {"stock", "ai"}:
+            # Warm Story is AI-only for visual consistency.
+            raw_visual_source = "ai"
         else:
             raw_visual_source = smart_visual_source
         stock_query = str(raw_scene_plan.get("stock_query", "") or "").strip()
@@ -3173,7 +3203,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         if ai_fallback_allowed:
             print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
         else:
-            print(f"⚡ No stock/Pexels for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled by 60% budget, using fast placeholder")
+            print(f"⚡ No stock/Pexels for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled, using fast placeholder")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
             maybe_apply_style_image_grade(img_path, video_style_preset)
             scene["visual_used"] = "placeholder_stock_missing"
