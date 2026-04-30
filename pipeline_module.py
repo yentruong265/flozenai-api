@@ -1091,7 +1091,7 @@ def chunk_story(story_text: str, target_words: int = 40) -> List[str]:
         else:
             merged.append(c)
 
-    return [c for c in merged if c][:18]
+    return [c for c in merged if c]
 
 
 
@@ -1112,13 +1112,13 @@ def force_scene_chunks_by_words(story_text: str, min_scenes: int = 4, max_scenes
     )
     explicit = [x.strip(" .,:;|-") for x in explicit if x and x.strip(" .,:;|-")]
     if len(explicit) >= 2:
-        return explicit[:max_scenes]
+        return explicit
 
     # Try sentence split.
     sentences = re.split(r"(?<=[\.\!\?\…])\s+|\n+", text)
     sentences = [s.strip() for s in sentences if s.strip()]
     if len(sentences) >= min_scenes:
-        return sentences[:max_scenes]
+        return sentences
 
     words = text.split()
     if len(words) <= 12:
@@ -1138,7 +1138,7 @@ def force_scene_chunks_by_words(story_text: str, min_scenes: int = 4, max_scenes
         chunks[-2] = (chunks[-2] + " " + chunks[-1]).strip()
         chunks.pop()
 
-    return chunks[:max_scenes]
+    return chunks
 
 
 def clean_ai_scene_list(ai_plan: Dict[str, Any], min_scenes: int = 4, max_scenes: int = 8) -> List[Dict[str, Any]]:
@@ -1154,7 +1154,7 @@ def clean_ai_scene_list(ai_plan: Dict[str, Any], min_scenes: int = 4, max_scenes
         item["scene_id"] = int(item.get("scene_id") or idx)
         cleaned.append(item)
 
-    return cleaned[:max_scenes]
+    return cleaned
 
 
 def get_ai_scene_narration(scene: Dict[str, Any], fallback_text: str = "") -> str:
@@ -2267,7 +2267,9 @@ WARM STORYBOOK FULL-AI MODE:
 - The selected style is warm_storybook, so every scene should use visual_source="ai".
 - To control cost and render time, do NOT over-split the story.
 - Create fewer but richer scenes based on duration/content: target {min_scenes}-{max_scenes} scenes for about {target_total_video_sec} seconds and {word_count} words.
-- Each scene may cover a slightly longer narration segment if the visual moment is coherent.
+- HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
+- If preserving the full content requires more scenes than the target range, you may exceed the target range. Completeness is more important than scene count.
+- Each scene may cover a longer narration segment if the visual moment is coherent.
 - Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
 - Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
 """
@@ -2319,14 +2321,14 @@ IMPORTANT STYLE RULES:
 
 SCENE PLANNING RULES:
 5. Understand the user request and turn it into a coherent short video.
-6. Choose the scene count naturally based on the content and target length, within {min_scenes} to {max_scenes} scenes.
-7. For short videos under 45 seconds, usually create 4-7 scenes, but use your judgment.
-8. Even if the input is one paragraph, create multiple coherent scenes when the video needs visual progression.
-9. Each scene must represent a different moment, action, camera framing, or visual idea.
-10. Each scene must include narration_text. This is the spoken narration for that scene.
-11. narration_text must follow the user's requested content; do not invent unrelated facts.
-12. Keep each narration_text short and natural: ideally 8-16 words, one short sentence.
-13. No scene narration should feel longer than about 4.5 seconds when spoken; split long narration into multiple scenes.
+6. Choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes as a soft target, not a hard cap.
+7. HARD RULE: Preserve 100% of the USER REQUEST content across all narration_text fields. Do not omit endings, examples, dialogue, lessons, calls to action, or any important sentence.
+8. If the script is long, create additional scenes rather than deleting content.
+9. For Warm Story full-AI mode, reduce render cost by merging adjacent narration into richer coherent story beats, but never cut the narration.
+10. Even if the input is one paragraph, create coherent scenes when the video needs visual progression.
+11. Each scene must represent a different moment, action, camera framing, or visual idea.
+12. Each scene must include narration_text. This is the spoken narration for that scene.
+13. narration_text must follow the user's requested content; do not invent unrelated facts and do not remove original meaning.
 
 VISUAL GROUNDING RULES — VERY IMPORTANT:
 CULTURAL / HISTORICAL / ENTITY ACCURACY RULES — VERY IMPORTANT:
@@ -2406,17 +2408,18 @@ STYLE-SPECIFIC RULES:
 64. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
 65. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
 66. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
-67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats. If not active, mixed visual mode is acceptable.
+67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats, but preserve 100% of the original narration content. If needed, exceed the target scene count rather than dropping content. If not active, mixed visual mode is acceptable.
 68. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
 69. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
-70. Hard rule: For zen_soft, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". For warm_storybook, use 100% visual_source="ai" when WARM STORYBOOK FULL-AI MODE is active, but keep scene count efficient and duration-aware.
+70. Hard rule: For zen_soft, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". For warm_storybook, use 100% visual_source="ai" when WARM STORYBOOK FULL-AI MODE is active, keep scene count efficient and duration-aware, but never cut or drop narration content.
 
 SELF-CHECK BEFORE FINAL JSON:
-71. For each scene, verify: Does visual_prompt show the same moment as narration_text?
-72. Verify every mentioned object/action/place appears in visual_prompt.
-73. Verify stock_query is useful if visual_source="stock".
-74. Verify no visual_prompt asks for text, logo, watermark, subtitles, or unreadable signs.
-75. Verify scenes are visually different and flow naturally.
+71. Verify the concatenation of all narration_text fields preserves the full USER REQUEST content and does not remove any important sentence or ending.
+72. For each scene, verify: Does visual_prompt show the same moment as narration_text?
+73. Verify every mentioned object/action/place appears in visual_prompt.
+74. Verify stock_query is useful if visual_source="stock".
+75. Verify no visual_prompt asks for text, logo, watermark, subtitles, or unreadable signs.
+76. Verify scenes are visually different and flow naturally.
 
 Return JSON exactly with this schema:
 {{
@@ -2482,7 +2485,7 @@ Return JSON exactly with this schema:
     else:
         data["video_style_preset"] = normalize_style_preset(data.get("video_style_preset", ""))
 
-    # Production guardrail: enforce minimum useful scene count.
+    # Production guardrail: keep all planner scenes to avoid cutting user content.
     scenes = clean_ai_scene_list(data, min_scenes=min_scenes, max_scenes=max_scenes)
     if len(scenes) < 2:
         raise ValueError(f"AI planner returned too few scenes: {len(scenes)}")
