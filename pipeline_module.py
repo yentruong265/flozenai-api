@@ -1409,41 +1409,35 @@ def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> f
 def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Final hard guard before image generation.
-    - Zen Soft / Warm Story / Mystic Light: max 60% AI images; the rest stock/Pexels and NO AI fallback.
-    - Lifestyle / Cinematic Glow / Bold Promo: stock/Pexels first; AI only when stock fails or scene truly requires AI.
+    - Warm Story only: 100% AI visuals for style consistency.
+    - All other frontend styles: keep every scene and prefer stock/Pexels first.
+      AI is allowed only as a fallback when stock/Pexels/local stock cannot provide a suitable image.
     """
     if not scene_objects:
         return scene_objects
 
     style = str(video_style_preset or "").strip().lower()
-    total = len(scene_objects)
 
+    # Warm Story: 100% AI, but scene count must be optimized by planner/chunking
+    # without cutting or dropping narration content.
     if is_story_mixed_style(style):
-        # Warm Story now uses 100% AI visuals for style consistency.
-        # Time/cost is controlled earlier by the AI planner through smarter, duration-aware scene count.
         for s in scene_objects:
             s["visual_source"] = "ai"
             s["ai_fallback_allowed"] = True
-            s["routing_reason"] = "warm_storybook_full_ai_duration_aware_scene_plan"
+            s["routing_reason"] = "warm_storybook_full_ai_keep_full_content"
         return scene_objects
 
-    if is_stock_first_style(style):
-        for s in scene_objects:
-            scene_plan = s.get("scene_plan", {}) or {}
-            narration = s.get("voice_text") or s.get("source_chunk") or ""
-            if scene_requires_ai(narration, scene_plan, style):
-                s["visual_source"] = "ai"
-                s["ai_fallback_allowed"] = True
-                s["routing_reason"] = "stock_first_but_scene_requires_ai"
-            else:
-                s["visual_source"] = "stock"
-                # User requested: AI only when no suitable Pexels/stock image exists.
-                s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), True)
-                s["routing_reason"] = "stock_first_style_use_pexels_stock_then_ai_if_missing"
-            if not s.get("stock_query"):
-                s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=(s.get("aspect_ratio") == "9:16"))
-        return scene_objects
-
+    # All non-Warm-Story styles: do NOT reduce scene count and do NOT pre-route to AI.
+    # We first try local stock/Pexels for every scene. If nothing suitable is found,
+    # _prepare_one_scene_visual may fall back to AI according to ai_fallback_when_stock_missing.
+    for s in scene_objects:
+        scene_plan = s.get("scene_plan", {}) or {}
+        narration = s.get("voice_text") or s.get("source_chunk") or ""
+        s["visual_source"] = "stock"
+        s["ai_fallback_allowed"] = _safe_bool(job_config.get("ai_fallback_when_stock_missing"), True)
+        s["routing_reason"] = "non_warm_story_stock_first_all_scenes_no_scene_limit"
+        if not s.get("stock_query"):
+            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=(s.get("aspect_ratio") == "9:16"))
     return scene_objects
 
 def create_fast_placeholder_image(out_path: str, width: int, height: int, title: str = "FlozenAI"):
@@ -2390,9 +2384,9 @@ AI IMAGE PROMPT RULES:
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
 VISUAL SOURCE RULES:
-53. Choose visual_source="stock" for realistic daily-life/business/nature/family/office/travel/fitness/yoga/exercise/sports/product-use scenes that can use existing photos.
-54. Strong preference: choose visual_source="stock" for realistic humans, hands, faces, products, animals, vehicles, food, architecture, fitness, sports, dance, or any scene where AI can easily create visible artifacts.
-55. Choose visual_source="ai" for unique fictional characters, Buddhist/fantasy/spiritual/ancient/surreal/mystical scenes, or anything clearly hard to find in stock assets.
+53. For warm_storybook full-AI mode only: choose visual_source="ai" for every scene.
+54. For ALL OTHER styles, choose visual_source="stock" by default for every scene, including lifestyle, cinematic_glow, bold_promo, cinematic_realistic, dramatic_cinematic, zen_soft, mystic_light, and watercolor_poetic.
+55. For non-warm-story styles, do NOT mark scenes as AI just because the topic is spiritual, ancient, mystical, Buddhist, emotional, or cinematic. The pipeline will try stock/Pexels first and only fall back to AI if no suitable stock/Pexels image exists.
 56. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
 57. Avoid repeating the same subject/action/location across scenes unless the story requires continuity.
 
@@ -2402,16 +2396,16 @@ VIDEO STRUCTURE RULES:
 60. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-61. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Avoid illustration/cartoon/anime/painting.
-62. For lifestyle: choose visual_source="stock" by default. Use realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
-63. For cinematic_glow: choose visual_source="stock" by default. Use cinematic but realistic stock photos with soft glow and polished lighting.
-64. For bold_promo: choose visual_source="stock" by default. Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
-65. For dramatic_cinematic: use photorealistic cinematic frames, dramatic lighting, strong emotion.
-66. For zen_soft: mixed visual mode. Do not mark every scene as AI. Use AI only for key spiritual/meditative scenes; use stock for generic nature, candle, room, sunrise, person meditating.
-67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats, but preserve 100% of the original narration content. If needed, exceed the target scene count rather than dropping content. If not active, mixed visual mode is acceptable.
-68. For watercolor_poetic: mixed visual mode. Use AI only for highly stylized poetic scenes; otherwise stock is acceptable.
-69. For mystic_light: mixed visual mode. Use AI for hard-to-find mystical/spiritual/fantasy scenes; use stock for candles, night sky, forest, temple, silhouette, light rays, meditation.
-70. Hard rule: For zen_soft, mystic_light, watercolor_poetic, MAXIMUM about 60% of scenes should be visual_source="ai". For warm_storybook, use 100% visual_source="ai" when WARM STORYBOOK FULL-AI MODE is active, keep scene count efficient and duration-aware, but never cut or drop narration content.
+61. For cinematic_realistic: use real-life photography, documentary realism, natural humans, realistic locations, natural lighting. Set visual_source="stock".
+62. For lifestyle: set visual_source="stock". Use realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
+63. For cinematic_glow: set visual_source="stock". Use cinematic but realistic stock photos with soft glow and polished lighting.
+64. For bold_promo: set visual_source="stock". Use commercial stock photo style, product/benefit/use-case focus, clean and bold composition.
+65. For dramatic_cinematic: set visual_source="stock". Use cinematic but still stock-search-friendly visual descriptions.
+66. For zen_soft: set visual_source="stock". Use stock-search-friendly nature, meditation, room, sunrise, candle, peaceful human scenes where possible.
+67. For warm_storybook: if WARM STORYBOOK FULL-AI MODE is active, mark every scene visual_source="ai" and reduce scene count intelligently by merging adjacent narration into coherent story beats, but preserve 100% of the original narration content. If needed, exceed the target scene count rather than dropping content.
+68. For watercolor_poetic: set visual_source="stock" unless this is warm_storybook full-AI mode. Keep stock_query practical and poetic but searchable.
+69. For mystic_light: set visual_source="stock". Use stock-search-friendly candles, night sky, forest, temple, silhouette, light rays, fog, meditation, or mysterious ambience.
+70. Hard rule: Only warm_storybook uses 100% AI. All other styles should keep all scenes and use stock/Pexels first; AI fallback is handled later by the pipeline only when stock/Pexels is missing.
 
 SELF-CHECK BEFORE FINAL JSON:
 71. Verify the concatenation of all narration_text fields preserves the full USER REQUEST content and does not remove any important sentence or ending.
@@ -2628,7 +2622,7 @@ def create_adaptive_video_plan(
                 "chunk": chunk,
                 "scene_plan": {},
             }
-            for chunk in fallback_chunks[:max_scenes]
+            for chunk in fallback_chunks
         ]
 
     if not scene_source:
