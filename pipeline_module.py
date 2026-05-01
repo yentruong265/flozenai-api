@@ -1617,17 +1617,77 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
 
 
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    parts = [
-        scene_plan.get("main_subject", ""),
-        scene_plan.get("action", ""),
-        scene_plan.get("location", ""),
-        scene_plan.get("mood", ""),
-        narration,
+    """Build a practical Pippit-style stock search query.
+
+    Principle:
+    - Do NOT hard-code specific stories.
+    - Prefer the AI planner's structured visual fields.
+    - Query must be short, concrete, English-friendly, and useful for Pexels/local stock.
+    """
+    def _field(name, max_words=8):
+        value = scene_plan.get(name, "") if isinstance(scene_plan, dict) else ""
+        if isinstance(value, list):
+            value = " ".join([str(x) for x in value[:4]])
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
+        if not value:
+            return ""
+        words = value.split()
+        return " ".join(words[:max_words])
+
+    subject = _field("main_subject", 7)
+    action = _field("action", 8)
+    location = _field("location", 7)
+    background = _field("background", 6)
+    time_of_day = _field("time_of_day", 3)
+    mood = _field("mood", 4)
+
+    must_show = scene_plan.get("must_show", []) if isinstance(scene_plan, dict) else []
+    details = scene_plan.get("details", []) if isinstance(scene_plan, dict) else []
+
+    object_terms = []
+    for arr in [must_show, details]:
+        if isinstance(arr, list):
+            for x in arr[:5]:
+                x = re.sub(r"\s+", " ", str(x or "")).strip(" ,.;:")
+                if x and len(x.split()) <= 5:
+                    object_terms.append(x)
+
+    # Keep only a few concrete elements so Pexels search stays effective.
+    object_text = " ".join(object_terms[:3])
+
+    # Fallback to narration only if planner fields are weak.
+    narration_short = ""
+    if not any([subject, action, location, object_text]):
+        narration_short = shorten_prompt_for_sdxl(narration or "daily life", max_chars=90, max_words=14)
+
+    query_parts = [
+        subject,
+        action,
+        object_text,
+        location or background,
+        time_of_day,
+        mood,
+        narration_short,
     ]
-    if scene_has_complex_body_pose(narration, scene_plan):
-        parts.extend(["realistic stock photo", "natural composition", "clean details"])
-    parts.append("portrait photo" if is_vertical else "landscape photo")
-    return shorten_prompt_for_sdxl(" ".join([str(p) for p in parts if p]), max_chars=180, max_words=32)
+
+    query = " ".join([str(p).strip() for p in query_parts if str(p).strip()])
+    query = re.sub(r"[^0-9a-zA-Z\s\-]", " ", query)
+    query = re.sub(r"\s+", " ", query).strip().lower()
+
+    # Remove common abstract words that usually hurt stock search.
+    abstract_stop = {
+        "meaning", "lesson", "wisdom", "karma", "hope", "fear", "success", "failure",
+        "happiness", "suffering", "impermanence", "truth", "destiny", "fate"
+    }
+    words = [w for w in query.split() if w not in abstract_stop]
+    query = " ".join(words)
+
+    if not query:
+        query = "realistic daily life"
+
+    # Orientation hint helps local metadata and sometimes Pexels results.
+    query = query + (" vertical" if is_vertical else " landscape")
+    return shorten_prompt_for_sdxl(query, max_chars=150, max_words=24)
 
 
 def _load_stock_metadata():
@@ -1783,6 +1843,130 @@ def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int)
         print("WARN: Pexels image download failed:", repr(e))
         return None
 
+
+
+# ===== Pippit-style stock VIDEO helpers =====
+# These functions make the pipeline feel more dynamic without paying for AI video.
+# Priority for non-Warm styles becomes: local stock video -> Pexels stock video -> local/pexels image -> placeholder.
+
+def _load_stock_video_assets():
+    items = []
+    if not ENABLE_STOCK_ASSETS or not STOCK_ASSET_DIR or not os.path.isdir(STOCK_ASSET_DIR):
+        return []
+    exts = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+    for root, _, files in os.walk(STOCK_ASSET_DIR):
+        for fn in files:
+            if os.path.splitext(fn)[1].lower() in exts:
+                path = os.path.join(root, fn)
+                rel = os.path.relpath(path, STOCK_ASSET_DIR)
+                tags = re.split(r"[\s_\-/.]+", os.path.splitext(rel)[0].lower())
+                items.append({"path": path, "tags": tags, "title": rel, "category": os.path.basename(root)})
+    return items
+
+
+def find_stock_video_asset(stock_query: str, scene_plan: Dict[str, Any], is_vertical: bool = False):
+    items = _load_stock_video_assets()
+    if not items:
+        return None
+    q_tokens = tokenize_for_match(stock_query)
+    best = None
+    best_score = 0.0
+    for item in items:
+        tag_text = " ".join(item.get("tags", []) + [item.get("title", ""), item.get("category", "")])
+        t_tokens = tokenize_for_match(tag_text)
+        if not t_tokens:
+            continue
+        overlap = len(q_tokens & t_tokens)
+        score = overlap / max(6, len(q_tokens))
+        if is_vertical and ({"vertical", "portrait", "reels", "shorts"} & t_tokens):
+            score += 0.10
+        if (not is_vertical) and ({"landscape", "wide", "horizontal"} & t_tokens):
+            score += 0.10
+        if score > best_score:
+            best_score = score
+            best = item
+    if best and best_score >= STOCK_MIN_MATCH_SCORE:
+        return {**best, "match_score": round(best_score, 3), "query": stock_query}
+    return None
+
+
+def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
+    """Fetch one suitable Pexels video URL. Returns metadata dict or None."""
+    if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
+        return None
+
+    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=110, max_words=16)
+    orientation = "portrait" if is_vertical else "landscape"
+    url = "https://api.pexels.com/videos/search"
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {
+        "query": query,
+        "orientation": orientation,
+        "per_page": max(1, min(int(PEXELS_PER_PAGE), 12)),
+    }
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"WARN: Pexels VIDEO API status={resp.status_code} query={query!r}")
+            return None
+        data = resp.json()
+        videos = data.get("videos", []) or []
+        if not videos:
+            return None
+
+        # Deterministic: pick the first result with a downloadable mp4 file.
+        for video in videos:
+            files = video.get("video_files", []) or []
+            if not files:
+                continue
+            # Prefer HD-ish but not huge. Avoid original 4K files for speed/cost.
+            files = sorted(
+                files,
+                key=lambda f: (
+                    0 if (f.get("file_type") == "video/mp4") else 1,
+                    abs(int(f.get("width") or 0) - (720 if is_vertical else 1280)),
+                    int(f.get("width") or 9999) * int(f.get("height") or 9999),
+                )
+            )
+            for vf in files:
+                link = vf.get("link")
+                if link and str(vf.get("file_type", "")).lower() in {"video/mp4", ""}:
+                    return {
+                        "url": link,
+                        "query": query,
+                        "pexels_id": video.get("id", ""),
+                        "duration": video.get("duration", ""),
+                        "width": vf.get("width", ""),
+                        "height": vf.get("height", ""),
+                        "quality": vf.get("quality", ""),
+                    }
+        return None
+    except Exception as e:
+        print("WARN: Pexels video fetch failed:", repr(e))
+        return None
+
+
+def prepare_pexels_video(video_url: str, out_path: str):
+    """Download Pexels video file. Does not transcode; render stage will crop/resize frames."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        with requests.get(video_url, timeout=30, stream=True) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 512):
+                    if chunk:
+                        f.write(chunk)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+            return out_path
+        return None
+    except Exception as e:
+        print("WARN: Pexels video download failed:", repr(e))
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        return None
 
 def is_warm_story_style(video_style_preset: str) -> bool:
     """Return True for Warm Story / storybook styles from frontend."""
@@ -2408,6 +2592,8 @@ SELF-CHECK BEFORE FINAL JSON:
 72. For each scene, verify: Does visual_prompt show the same moment as narration_text?
 73. Verify every mentioned object/action/place appears in visual_prompt.
 74. Verify stock_query is useful if visual_source="stock".
+75. Provide text_overlay as a short readable caption that supports the narration but does not cover too much of the screen.
+76. Provide motion_intent to help choose stock video/motion template.
 75. Verify no visual_prompt asks for text, logo, watermark, subtitles, or unreadable signs.
 76. Verify scenes are visually different and flow naturally.
 
@@ -2424,6 +2610,8 @@ Return JSON exactly with this schema:
       "narration_text": "spoken narration in the same language as USER REQUEST",
       "visual_source": "stock or ai",
       "stock_query": "English search query for stock/local asset, or empty string",
+      "text_overlay": "short on-screen caption, same language as narration, maximum 8 words",
+      "motion_intent": "short description of desired motion, e.g. slow zoom, pan left, person walking, hands typing",
       "visual_prompt": "English SDXL prompt, concrete and style-consistent",
       "main_subject": "short specific visual subject",
       "visual_entity_type": "human / animal / object / statue / landscape / symbolic",
@@ -2692,6 +2880,8 @@ def create_adaptive_video_plan(
             "aspect_ratio": "9:16" if is_vertical else "16:9",
             "video_style_preset": video_style_preset,
             "image_source_mode": image_source_mode,
+            "text_overlay": str(raw_scene_plan.get("text_overlay", "") or raw_scene_plan.get("caption", "") or "").strip(),
+            "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
         })
 
     # Final style-aware routing guardrail. This is the hard rule requested from frontend dropdown.
@@ -2961,6 +3151,152 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
 
     return VideoClip(frame_function=make_frame, duration=float(duration)).with_fps(int(fps))
 
+
+def _resize_crop_frame_array(frame, out_w, out_h):
+    """Resize/crop BGR/RGB frame array to target size, return RGB uint8."""
+    if frame is None:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    # OpenCV reads BGR; convert if needed by caller before or here.
+    if frame.ndim == 3 and frame.shape[2] == 3:
+        # Most frames from cv2 are BGR. Convert to RGB.
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w = frame.shape[:2]
+    target_ratio = out_w / max(out_h, 1)
+    src_ratio = w / max(h, 1)
+    if src_ratio > target_ratio:
+        new_w = int(h * target_ratio)
+        x1 = max(0, (w - new_w) // 2)
+        frame = frame[:, x1:x1 + new_w]
+    else:
+        new_h = int(w / max(target_ratio, 1e-6))
+        y1 = max(0, (h - new_h) // 2)
+        frame = frame[y1:y1 + new_h, :]
+    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    return frame.astype(np.uint8)
+
+
+def make_stock_video_clip(video_path, duration, width, height, scene_profile="standard", fps=24, video_style=None):
+    """Create a clip from a stock video file with safe crop/resize and looping.
+
+    This avoids paid AI video while making scenes feel naturally alive.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print("WARN: could not open stock video:", video_path)
+        return None
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    need_frames = max(2, int(float(duration) * int(fps)) + 2)
+    max_read = min(max(need_frames * 2, 48), 240)
+    frames = []
+
+    # Read evenly from the beginning of the clip. This is deterministic and cheap.
+    step = max(1, int(round(source_fps / max(float(fps), 1.0))))
+    i = 0
+    while len(frames) < max_read:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if i % step == 0:
+            frames.append(_resize_crop_frame_array(frame, int(width), int(height)))
+        i += 1
+    cap.release()
+
+    if not frames:
+        return None
+
+    def make_frame(t):
+        idx = int(max(0, t) * int(fps)) % len(frames)
+        frame = frames[idx]
+        # Tiny cinematic finish for stock video.
+        if video_style and video_style.get("name") in {"cinematic_realistic", "dramatic_cinematic", "cinematic_glow"}:
+            arr = frame.astype(np.float32)
+            arr = np.clip(arr * 1.015, 0, 255)
+            frame = arr.astype(np.uint8)
+        return frame
+
+    return VideoClip(frame_function=make_frame, duration=float(duration)).with_fps(int(fps))
+
+
+def _wrap_overlay_text(text: str, max_chars_per_line: int = 28, max_lines: int = 2) -> str:
+    text = sanitize_tts_text(text or "", max_chars=180)
+    if not text:
+        return ""
+    words = text.split()
+    lines = []
+    current = []
+    for w in words:
+        if len(" ".join(current + [w])) > max_chars_per_line and current:
+            lines.append(" ".join(current))
+            current = [w]
+        else:
+            current.append(w)
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(" ".join(current))
+    return "\n".join(lines[:max_lines]).strip()
+
+
+def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_style_preset: str = ""):
+    """Draw lightweight animated text overlay without ImageMagick/TextClip dependency."""
+    overlay_text = _wrap_overlay_text(text, max_chars_per_line=30 if width >= height else 22, max_lines=2)
+    if not overlay_text:
+        return clip
+
+    duration = float(getattr(clip, "duration", 0) or 0)
+    font_size = max(22, int(min(width, height) * (0.055 if width >= height else 0.060)))
+    try:
+        from PIL import ImageDraw, ImageFont
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except Exception:
+        from PIL import ImageDraw, ImageFont
+        font = ImageFont.load_default()
+
+    def make_frame(t):
+        frame = clip.get_frame(t).astype(np.uint8)
+        img = Image.fromarray(frame).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+
+        # Fade in/out like short-form template text.
+        fade = 1.0
+        if duration > 0:
+            fade = min(1.0, max(0.0, t / 0.25), max(0.0, (duration - t) / 0.25))
+        alpha = int(230 * fade)
+        if alpha <= 0:
+            return frame
+
+        lines = overlay_text.split("\n")
+        line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=2) for line in lines]
+        text_w = max([b[2] - b[0] for b in line_boxes] or [0])
+        line_h = max([b[3] - b[1] for b in line_boxes] or [font_size])
+        text_h = line_h * len(lines) + int(font_size * 0.28) * (len(lines) - 1)
+        pad_x = int(font_size * 0.75)
+        pad_y = int(font_size * 0.45)
+
+        x = int((width - text_w) / 2)
+        y = int(height * (0.76 if width >= height else 0.70))
+        box = [x - pad_x, y - pad_y, x + text_w + pad_x, y + text_h + pad_y]
+
+        # Rounded semi-transparent black box.
+        draw.rounded_rectangle(box, radius=int(font_size * 0.45), fill=(0, 0, 0, int(132 * fade)))
+
+        yy = y
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=2)
+            lw = bbox[2] - bbox[0]
+            lx = int((width - lw) / 2)
+            draw.text(
+                (lx, yy), line, font=font, fill=(255, 255, 255, alpha),
+                stroke_width=2, stroke_fill=(0, 0, 0, int(190 * fade))
+            )
+            yy += line_h + int(font_size * 0.28)
+
+        return np.array(img.convert("RGB"))
+
+    return VideoClip(frame_function=make_frame, duration=duration).with_fps(int(getattr(clip, "fps", 24) or 24))
+
 # ===== CELL 7 =====
 # B7 — run_job FIXED FULL (single narration audio, no overlap, with progress, safe return)
 
@@ -3100,11 +3436,12 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
 
 
 def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
-    """Prepare one scene visual with final style-based routing.
+    """Prepare one scene visual with Pippit-style routing.
 
     Final production rule:
-    - warm_storybook scenes are AI-only.
-    - all other styles are stock/Pexels/local-stock only by default.
+    - warm_storybook scenes are AI-image only.
+    - all other styles are stock-first and prefer real stock VIDEO for motion.
+    - if stock video is not available, use stock image + motion.
     - if stock is missing for non-Warm styles, use a fast placeholder instead of SDXL.
     """
     visual_source = str(scene.get("visual_source", "") or "").lower()
@@ -3120,36 +3457,67 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     except Exception:
         smart_source = "ai" if is_warm_story_style(video_style_preset) else "stock"
 
-    # The final scene["visual_source"] from B6 is the source of truth.
-    # If it is missing, fall back to style-based routing, not keyword-based routing.
     if visual_source in {"stock", "ai"}:
         smart_source = visual_source
 
     if smart_source == "stock":
         stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
+        scene["stock_query"] = stock_query
 
-        # 1) Try local stock asset folder first, if present.
+        # 1) Prefer local stock VIDEO assets. This is the closest low-cost Pippit-style behavior.
+        if ENABLE_STOCK_ASSETS:
+            stock_video = find_stock_video_asset(stock_query, scene_plan, is_vertical=is_vertical)
+            if stock_video:
+                print(f"🎞️ Using local stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: {stock_video.get('path')} | score={stock_video.get('match_score')}")
+                scene["visual_used"] = "stock_video_local"
+                scene["visual_source"] = "stock"
+                scene["visual_video_path"] = stock_video.get("path")
+                scene["stock_asset_path"] = stock_video.get("path")
+                scene["stock_match_score"] = stock_video.get("match_score")
+                # Create a tiny placeholder image for metadata compatibility.
+                create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 2) Try Pexels stock VIDEO before still image.
+        pexels_video = fetch_pexels_video(stock_query, is_vertical=is_vertical)
+        if pexels_video:
+            video_path = os.path.splitext(img_path)[0] + ".mp4"
+            ok_video = prepare_pexels_video(pexels_video["url"], video_path)
+            if ok_video:
+                print(f"🎞️ Using Pexels stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: query={pexels_video.get('query')!r}")
+                scene["visual_used"] = "stock_video_pexels"
+                scene["visual_source"] = "stock"
+                scene["visual_video_path"] = ok_video
+                scene["stock_query_used"] = pexels_video.get("query", "")
+                scene["pexels_id"] = pexels_video.get("pexels_id", "")
+                scene["pexels_video_quality"] = pexels_video.get("quality", "")
+                create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 3) Try local stock image assets.
         if ENABLE_STOCK_ASSETS:
             stock = find_stock_asset(stock_query, scene_plan, is_vertical=is_vertical)
             if stock:
-                print(f"🖼️ Using local stock asset for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
+                print(f"🖼️ Using local stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                 prepare_stock_image(stock["path"], img_path, width, height)
                 maybe_apply_style_image_grade(img_path, video_style_preset)
-                scene["visual_used"] = "stock_local"
+                scene["visual_used"] = "stock_image_local"
                 scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
                 scene["stock_match_score"] = stock.get("match_score")
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
 
-        # 2) Try Pexels API if user has no local asset folder.
+        # 4) Try Pexels photo as fallback.
         pexels = fetch_pexels_photo(stock_query, is_vertical=is_vertical)
         if pexels:
-            print(f"📸 Using Pexels stock for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
+            print(f"📸 Using Pexels stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
             ok = prepare_pexels_image(pexels["url"], img_path, width, height)
             if ok:
                 maybe_apply_style_image_grade(img_path, video_style_preset)
-                scene["visual_used"] = "stock_pexels"
+                scene["visual_used"] = "stock_image_pexels"
                 scene["visual_source"] = "stock"
                 scene["stock_query_used"] = pexels.get("query", "")
                 scene["pexels_id"] = pexels.get("pexels_id", "")
@@ -3159,9 +3527,9 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
 
         ai_fallback_allowed = bool(scene.get("ai_fallback_allowed", False))
         if ai_fallback_allowed and is_warm_story_style(video_style_preset):
-            print(f"ℹ️ No suitable stock/Pexels image found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
+            print(f"ℹ️ No suitable stock/Pexels visual found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
         else:
-            print(f"⚡ No stock/Pexels for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled for non-Warm style, using fast placeholder")
+            print(f"⚡ No stock/Pexels visual for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled for non-Warm style, using fast placeholder")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
             maybe_apply_style_image_grade(img_path, video_style_preset)
             scene["visual_used"] = "placeholder_stock_missing"
@@ -3170,6 +3538,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             return img_path
 
     return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
+
 
 def run_job(job_config, job_id):
     """
@@ -3264,7 +3633,7 @@ def run_job(job_config, job_id):
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
         "full_narration_text": adaptive_plan.get("full_narration_text", ""),
-        "timeline_mode": "single_full_narration_audio",
+        "timeline_mode": "pippit_style_stock_video_single_full_narration_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
@@ -3500,17 +3869,45 @@ def run_job(job_config, job_id):
         scene_id = int(scene.get("scene_id", idx))
         duration = max(float(duration or 0), 0.35)
 
-        vclip = make_motion_clip(
-            image_path=img_path,
-            duration=duration,
-            width=width,
-            height=height,
-            scene_profile=scene["profile"],
-            fps=fps,
-            video_style=video_style,
-        )
+        # Pippit-style: use real stock video when available; otherwise animate still image.
+        stock_video_path = scene.get("visual_video_path", "")
+        if stock_video_path and os.path.exists(str(stock_video_path)):
+            vclip = make_stock_video_clip(
+                video_path=stock_video_path,
+                duration=duration,
+                width=width,
+                height=height,
+                scene_profile=scene["profile"],
+                fps=fps,
+                video_style=video_style,
+            )
+            if vclip is None:
+                vclip = make_motion_clip(
+                    image_path=img_path,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    scene_profile=scene["profile"],
+                    fps=fps,
+                    video_style=video_style,
+                )
+        else:
+            vclip = make_motion_clip(
+                image_path=img_path,
+                duration=duration,
+                width=width,
+                height=height,
+                scene_profile=scene["profile"],
+                fps=fps,
+                video_style=video_style,
+            )
 
         vclip = apply_visual_finish(vclip, video_style_preset)
+
+        # Lightweight Pippit-like caption layer. Can be disabled by setting enable_text_overlay=False.
+        if _safe_bool(job_config.get("enable_text_overlay"), True):
+            overlay_text = str(scene.get("text_overlay") or scene.get("hook_text") or scene.get("voice_text") or "")
+            vclip = add_pippit_text_overlay(vclip, overlay_text, width, height, video_style_preset)
 
         if idx < total_scenes:
             transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.12, duration / 4)
