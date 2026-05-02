@@ -726,6 +726,10 @@ def generate_image(
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
+
+# ===== CELL 6 =====
+# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
+
 import os
 import re
 import gc
@@ -2077,7 +2081,7 @@ def _scene_anchor_from_plan(scene_plan: Dict[str, Any], narration: str, is_verti
     must_show = scene_plan.get("must_show", []) or []
     must_show_text = ""
     if isinstance(must_show, list) and must_show:
-        must_show_text = _clean_prompt_piece("must show: " + ", ".join([str(x) for x in must_show[:5]]), 24)
+        must_show_text = _clean_prompt_piece("must show: " + ", ".join([str(x) for x in must_show[:8]]), 34)
 
     parts = [
         subject,
@@ -2162,7 +2166,7 @@ def build_grounded_visual_prompt(
 
     # Keep AI prompt, but only as support after the structured anchor.
     base_prompt = shorten_prompt_for_sdxl(base_prompt, max_chars=160, max_words=32)
-    narration_hint = shorten_prompt_for_sdxl(f"matches narration: {narration}", max_chars=100, max_words=18)
+    narration_hint = shorten_prompt_for_sdxl(f"matches narration: {narration}", max_chars=150, max_words=28)
 
     prompt = ", ".join([
         anchor,
@@ -2180,22 +2184,34 @@ def build_grounded_visual_prompt(
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
     """Add scene-specific negatives without making the negative prompt too long."""
     extras = []
+
+    # General mismatch / artifact guards. Apply to every AI scene, not only body-pose scenes.
+    extras.extend([
+        "wrong object", "missing required object", "unrelated scene",
+        "extra person", "wrong age", "wrong clothing",
+        "object floating", "object fused with body",
+        "duplicate hands", "melted objects"
+    ])
+
     if scene_has_human(scene_plan, narration):
         extras.extend([
             "bad face", "uncanny face", "asymmetrical eyes", "bad hands",
             "fused fingers", "extra fingers", "missing fingers", "extra arms", "extra legs",
             "detached limbs", "disconnected body parts", "broken anatomy"
         ])
+
     if scene_has_complex_body_pose(narration, scene_plan):
         extras.extend([
             "twisted limbs", "impossible yoga pose", "impossible leg position", "extra feet",
             "deformed feet", "floating foot", "reversed knee", "broken knee", "broken ankle",
             "unnatural body bend", "contorted body", "body horror", "disconnected legs"
         ])
+
     if is_vertical:
         extras.extend([
             "cropped head", "cut off feet", "subject too close", "extreme close-up", "off-center subject"
         ])
+
     if scene_is_abstract(narration, scene_plan):
         extras.extend(["abstract symbols", "floating objects", "surreal unrelated scene"])
 
@@ -2205,26 +2221,49 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
 
     visual_entity_type = str(scene_plan.get("visual_entity_type", "") or "").strip().lower()
     if visual_entity_type == "human":
-        extras.extend(["statue", "sculpture", "stone figure", "marble figure", "idol", "figurine", "painting of a person instead of a living person"])
+        extras.extend([
+            "statue", "sculpture", "stone figure", "marble figure", "idol", "figurine",
+            "painting of a person instead of a living person"
+        ])
 
     neg = ", ".join([global_negative_prompt or "", ", ".join(extras)])
-    return shorten_prompt_for_sdxl(neg, max_chars=300, max_words=65)
+    return shorten_prompt_for_sdxl(neg, max_chars=350, max_words=80)
+
 
 
 def validate_and_repair_scene_plan(scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> Dict[str, Any]:
-    """Defensive repair for incomplete AI planner output."""
+    """Defensive repair for incomplete AI planner output.
+
+    Important: do not use hard-coded keyword extraction here.
+    The OpenAI planner must extract must_show/must_not_show dynamically from each scene narration.
+    This function only normalizes missing/invalid fields so the prompt builder does not crash.
+    """
     sp = dict(scene_plan or {})
+
     if not str(sp.get("main_subject", "") or "").strip():
         sp["main_subject"] = "main person" if scene_has_human(sp, narration) else "main subject"
+
     if not str(sp.get("action", "") or "").strip():
         sp["action"] = "visible action matching the narration"
+
     if not str(sp.get("location", "") or "").strip():
         sp["location"] = "realistic setting matching the narration"
+
+    # Planner-owned fields: normalize only, never fill with fixed keyword rules.
+    if not isinstance(sp.get("must_show"), list):
+        sp["must_show"] = []
+
+    if not isinstance(sp.get("must_not_show"), list):
+        sp["must_not_show"] = []
+
     if not str(sp.get("shot", "") or "").strip():
         sp["shot"] = "portrait medium shot" if is_vertical else "eye-level medium shot"
+
     if not str(sp.get("lighting", "") or "").strip():
         sp["lighting"] = "natural soft light"
+
     return sp
+
 
 
 def sanitize_scene_plan(scene_plan: Dict[str, Any], style_name: str, chunk: str, is_vertical: bool = False) -> Dict[str, Any]:
@@ -2398,7 +2437,10 @@ def plan_video_with_ai(
     - understand the user's requested content,
     - split it into multiple visually different scenes,
     - generate prompt-ready scene plans,
-    - keep the exact frontend style when style is locked.
+    - keep the exact frontend style when style is locked,
+    - for each scene, extract exact visible elements from narration:main_subject, action, location, must_show, must_not_show, clothing_or_appearance, emotion, time_of_day,
+    - do not create generic symbolic images,
+    - the visual_prompt must show the exact action/object mentioned in narration.
     """
     if not ENABLE_AI_B6:
         raise RuntimeError("AI planner disabled")
@@ -2504,6 +2546,15 @@ SCENE PLANNING RULES:
 13. narration_text must follow the user's requested content; do not invent unrelated facts and do not remove original meaning.
 
 VISUAL GROUNDING RULES — VERY IMPORTANT:
+VISUAL MATCHING EXTRACTION RULES — CRITICAL:
+- For each scene, scene_plan.must_show is mandatory and must contain 3-8 concrete visible elements directly extracted from that scene's narration_text.
+- must_show must be dynamic for every video. Do not rely on fixed keyword lists.
+- must_show must include exact visible subjects, actions, objects, props, places, clothing, tools, animals, vehicles, documents, food, product elements, light sources, or environmental elements mentioned in narration_text.
+- If narration_text says a character carries, holds, opens, gives, receives, walks, looks, cries, cooks, writes, buys, sells, prays, discovers, enters, leaves, points at, picks up, or uses something, include BOTH the action and the object/place in must_show.
+- Do not use abstract words as must_show, such as wisdom, hope, sadness, lesson, karma, peace, success, destiny, happiness, suffering, or fear. Convert abstract meanings into concrete visible elements.
+- visual_prompt must include the exact main_subject, action, location, clothing_or_appearance, and the most important must_show elements.
+- Do not create symbolic, metaphorical, decorative, or unrelated images when the narration contains a concrete action or object.
+
 CULTURAL / HISTORICAL / ENTITY ACCURACY RULES — VERY IMPORTANT:
 - For every scene, infer the correct country_or_culture, historical_period, clothing_or_appearance, and environment from the script context.
 - Do NOT mix cultures incorrectly. If a scene is in ancient India, clothing, architecture, and props must match ancient India; do not use Chinese robes, Chinese temples, Japanese clothing, or modern fashion unless the script explicitly says so.
@@ -2617,7 +2668,7 @@ Return JSON exactly with this schema:
       "country_or_culture": "planner-inferred country/culture if relevant",
       "historical_period": "planner-inferred era/time period if relevant",
       "clothing_or_appearance": "historically/culturally appropriate clothing and appearance if relevant",
-      "must_show": ["concrete required visual element 1", "concrete required visual element 2"],
+      "must_show": ["3-8 concrete visible elements extracted from narration_text", "exact required action/object/place/prop"],
       "must_not_show": ["wrong visual substitution to avoid", "wrong culture/style/entity to avoid"],
       "action": "short visible physical action",
       "expression": "visible emotion if relevant",
