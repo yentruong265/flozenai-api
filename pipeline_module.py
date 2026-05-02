@@ -1486,7 +1486,6 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
         " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
     ]).lower()
     # Being in a story-like style does not automatically mean every scene needs AI.
-    # The final 60% AI budget decides how many AI images are allowed.
     return _has_any_term(joined, _STORYTELLING_WORDS)
 
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
@@ -2425,10 +2424,10 @@ def plan_video_with_ai(
     # Warm Story uses 100% AI visuals, so we reduce cost by asking the planner
     # to make fewer, richer scenes based on duration/content instead of hard-capping a fixed number.
     if warm_story_ai_full_mode:
-        duration_based = max(3, min(10, int(math.ceil(max(target_total_video_sec, 30) / 32.0))))
-        content_based = max(3, min(10, int(math.ceil(max(word_count, 40) / 55.0))))
+        duration_based = max(4, min(10, int(math.ceil(max(target_total_video_sec, 30) / 16.0))))
+        content_based = max(4, min(10, int(math.ceil(max(word_count, 40) / 40.0))))
         smart_warm_max = max(duration_based, content_based)
-        smart_warm_min = max(2, min(4, smart_warm_max))
+        smart_warm_min = max(3, min(5, smart_warm_max))
         min_scenes = max(min_scenes, smart_warm_min)
         max_scenes = min(max_scenes, smart_warm_max)
         max_scenes = max(min_scenes, max_scenes)
@@ -2440,7 +2439,7 @@ WARM STORYBOOK FULL-AI MODE:
 This block applies ONLY when video_style_preset == "warm_storybook". DO NOT apply these rules to other styles.
 - The selected style is warm_storybook, so every scene should use visual_source="ai".
 - To control cost and render time, do NOT over-split the story.
-- Create fewer but richer scenes based on duration/content: target {min_scenes}-{max_scenes} scenes for about {target_total_video_sec} seconds and {word_count} words.
+- Create a balanced number of scenes. Do not over-split the story, but do not merge different actions, locations, or emotional turning points into one scene. Each scene should cover one clear story beat, usually 12–18 seconds.
 - HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
 - If preserving the full content requires more scenes than the target range, you may exceed the target range. Completeness is more important than scene count.
 - Each scene may cover a longer narration segment if the visual moment is coherent.
