@@ -769,13 +769,12 @@ STYLE_PRESETS = {
     "warm_storybook": {
         "name": "warm_storybook",
         "prompt_style": (
-            "photorealistic cinematic storytelling, natural warm light, documentary realism, "
-            "real-life texture, soft shadows, authentic environment, emotional but realistic framing, "
-            "35mm film still, cohesive color tone matching stock footage"
+            "storybook illustration, warm tones, soft light, painterly texture, "
+            "expressive composition, emotional storytelling, beautiful framing"
         ),
         "negative_style": (
-            "cartoon, anime, illustration, painting, painterly texture, storybook drawing, 2d, vector art, "
-            "fantasy glow, oversaturated colors, plastic skin, fake face, low detail, harsh flash, watermark, text"
+            "photorealistic, realistic photography, live action, harsh flash, ugly composition, "
+            "low detail, flat background"
         ),
         "motion_mode": "gentle",
         "duration_profile": "standard",
@@ -1405,156 +1404,13 @@ def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> f
         score += 0.8
     return score
 
-
-# ===== Warm Story hybrid visual routing helpers =====
-# Goal: 60% Pexels video + 40% AI image, with consistent realistic look.
-WARM_STORY_PEXELS_RATIO = float(os.getenv("WARM_STORY_PEXELS_RATIO", "0.60"))
-WARM_STORY_AI_RATIO = float(os.getenv("WARM_STORY_AI_RATIO", "0.40"))
-WARM_STORY_AI_REALISTIC = os.getenv("WARM_STORY_AI_REALISTIC", "1").strip().lower() in {"1", "true", "yes", "y"}
-
-_WARM_PEXELS_FRIENDLY_TERMS = {
-    "forest", "mountain", "river", "stream", "sunrise", "sunset", "road", "path", "walking", "rain", "cloud", "sky",
-    "village", "street", "city", "people", "person", "man", "woman", "child", "old man", "old woman", "home",
-    "temple", "pagoda", "monastery", "nature", "water", "candle", "light", "morning", "night", "garden", "field",
-    "rừng", "núi", "sông", "suối", "bình minh", "hoàng hôn", "con đường", "đi bộ", "mưa", "mây", "bầu trời",
-    "làng", "đường phố", "người", "đàn ông", "phụ nữ", "đứa trẻ", "ông lão", "bà lão", "nhà", "chùa",
-    "ngôi chùa", "thiên nhiên", "nước", "ngọn nến", "ánh sáng", "buổi sáng", "ban đêm", "khu vườn", "cánh đồng",
-}
-
-_WARM_AI_FRIENDLY_TERMS = {
-    "buddha", "monk", "novice monk", "zen master", "ancient", "myth", "karma", "moral", "parable", "symbolic",
-    "buddhist", "temple ritual", "spiritual", "enlightenment", "broken jar", "clay jar", "water jar", "bucket",
-    "đức phật", "phật", "nhà sư", "chú tiểu", "thiền sư", "cổ xưa", "nhân quả", "bài học", "ngụ ngôn",
-    "biểu tượng", "tâm linh", "giác ngộ", "bình nứt", "chiếc bình", "bình nước", "gánh nước",
-}
-
-
-def _warm_scene_text(scene_obj: Dict[str, Any]) -> str:
-    scene_plan = scene_obj.get("scene_plan", {}) or {}
-    return " ".join([
-        str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or ""),
-        str(scene_plan.get("main_subject", "") or ""),
-        str(scene_plan.get("action", "") or ""),
-        str(scene_plan.get("location", "") or ""),
-        str(scene_plan.get("mood", "") or ""),
-        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
-        " ".join([str(x) for x in (scene_plan.get("must_show", []) or [])]),
-    ]).lower()
-
-
-def warm_scene_prefers_pexels(scene_obj: Dict[str, Any]) -> bool:
-    """Prefer Pexels for real-world motion/background scenes."""
-    txt = _warm_scene_text(scene_obj)
-    if _has_any_term(txt, _WARM_AI_FRIENDLY_TERMS):
-        return False
-    if _has_any_term(txt, _WARM_PEXELS_FRIENDLY_TERMS):
-        return True
-    scene_plan = scene_obj.get("scene_plan", {}) or {}
-    # Generic action/background scenes usually look better as real video.
-    if scene_has_complex_body_pose(scene_obj.get("voice_text", ""), scene_plan):
-        return True
-    return False
-
-
-def warm_scene_prefers_ai(scene_obj: Dict[str, Any]) -> bool:
-    """Prefer AI for Buddhist/symbolic/character-specific story beats."""
-    txt = _warm_scene_text(scene_obj)
-    if _has_any_term(txt, _WARM_AI_FRIENDLY_TERMS):
-        return True
-    scene_plan = scene_obj.get("scene_plan", {}) or {}
-    if scene_requires_ai(scene_obj.get("voice_text", ""), scene_plan, scene_obj.get("video_style_preset", "")):
-        return True
-    return False
-
-
-def enforce_pexels_like_ai_prompt(prompt: str, scene_plan: Dict[str, Any] = None, narration: str = "") -> str:
-    """Make AI images visually compatible with Pexels real footage."""
-    prompt = str(prompt or "").strip()
-    scene_plan = scene_plan or {}
-    context = re.sub(r"\s+", " ", str(narration or "")).strip()[:120]
-    realism_pack = (
-        "photorealistic cinematic still, realistic documentary style, natural warm daylight, soft shadows, "
-        "real-world environment, authentic human proportions, natural skin texture, 35mm film look, "
-        "subtle color grading, cohesive tone matching modern stock footage, high detail, clean composition"
-    )
-    avoid_style = (
-        "not illustration, not painting, not cartoon, not anime, not storybook drawing, no fantasy glow, "
-        "no oversaturated colors, no plastic skin, no distorted body"
-    )
-    parts = [prompt, realism_pack, avoid_style]
-    if context:
-        parts.append(f"narrative context: {context}")
-    return shorten_prompt_for_sdxl(", ".join([p for p in parts if p]), max_chars=330, max_words=62)
-
-
-def enforce_pexels_like_negative_prompt(negative_prompt: str = "") -> str:
-    extra = (
-        "illustration, painting, cartoon, anime, storybook drawing, 2d, vector art, painterly texture, "
-        "fantasy glow, neon glow, oversaturated, plastic skin, fake face, uncanny, low resolution, blurry, "
-        "jpeg artifacts, watermark, logo, text, subtitles"
-    )
-    return shorten_prompt_for_sdxl((negative_prompt or BASE_NEGATIVE_PROMPT) + ", " + extra, max_chars=320, max_words=70)
-
-
-def assign_warm_story_hybrid_sources(scene_objects: List[Dict[str, Any]], target_pexels_ratio: float = 0.60) -> List[Dict[str, Any]]:
-    """Assign around 60% Pexels video and 40% AI image for Warm Story.
-
-    Priority:
-    - Pexels: real-world motion/background/action scenes.
-    - AI: Buddhist/symbolic/character-specific scenes.
-    """
-    total = len(scene_objects or [])
-    if total <= 0:
-        return scene_objects
-
-    target_pexels = int(round(total * clamp(float(target_pexels_ratio), 0.0, 1.0)))
-    target_pexels = max(0, min(total, target_pexels))
-
-    scored = []
-    for idx, s in enumerate(scene_objects):
-        score = 0.0
-        if warm_scene_prefers_pexels(s):
-            score += 3.0
-        if warm_scene_prefers_ai(s):
-            score -= 3.0
-        # Opening/ending often benefit from AI consistency if they are symbolic.
-        if idx == 0 or idx == total - 1:
-            score -= 0.4
-        # Alternate a little to avoid 3-4 consecutive AI or video scenes.
-        score += (0.15 if idx % 2 == 1 else 0.0)
-        scored.append((score, idx, s))
-
-    pexels_idx = {idx for _, idx, _ in sorted(scored, key=lambda x: x[0], reverse=True)[:target_pexels]}
-
-    for idx, s in enumerate(scene_objects):
-        scene_plan = s.get("scene_plan", {}) or {}
-        narration = s.get("voice_text") or s.get("source_chunk") or ""
-        is_vertical = (s.get("aspect_ratio") == "9:16")
-        if not s.get("stock_query"):
-            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
-
-        if idx in pexels_idx:
-            s["visual_source"] = "stock"
-            s["ai_fallback_allowed"] = True
-            s["routing_reason"] = "warm_story_hybrid_60pct_pexels_video"
-        else:
-            s["visual_source"] = "ai"
-            s["ai_fallback_allowed"] = True
-            s["routing_reason"] = "warm_story_hybrid_40pct_pexels_like_ai_image"
-            if WARM_STORY_AI_REALISTIC:
-                s["visual_prompt"] = enforce_pexels_like_ai_prompt(s.get("visual_prompt", ""), scene_plan, narration)
-                s["negative_prompt"] = enforce_pexels_like_negative_prompt(s.get("negative_prompt", ""))
-
-    return scene_objects
-
 def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Final routing guardrail for FlozenAI frontend styles.
+    Final hard routing guardrail for FlozenAI frontend styles.
 
     STRICT RULES:
-    - Warm Story / warm_storybook: hybrid 60% Pexels video + 40% AI image.
-      AI images are forced into a photorealistic, Pexels-compatible look.
-    - Every other style: stock/Pexels/local-stock visuals by default.
+    - Warm Story / warm_storybook: 100% AI visuals.
+    - Every other style: 100% stock/Pexels/local-stock visuals by default.
     - Non-Warm styles must NOT call SDXL/AI from this routing layer.
     - Non-Warm styles must NOT reduce scene count for cost reasons.
     """
@@ -1569,20 +1425,19 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         narration = s.get("voice_text") or s.get("source_chunk") or ""
         is_vertical = (s.get("aspect_ratio") == "9:16")
 
-        if not s.get("stock_query"):
-            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
-
-        if not is_warm:
+        if is_warm:
+            s["visual_source"] = "ai"
+            s["ai_fallback_allowed"] = True
+            s["routing_reason"] = "warm_storybook_100pct_ai_preserve_full_content"
+        else:
             # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
+            # Do not let scene_requires_ai(), scene_is_storytelling(), planner visual_source, or image_source_mode override this.
             s["visual_source"] = "stock"
             s["ai_fallback_allowed"] = False
             s["routing_reason"] = "non_warm_style_stock_only_no_ai_no_scene_reduction"
 
-    if is_warm:
-        scene_objects = assign_warm_story_hybrid_sources(
-            scene_objects,
-            target_pexels_ratio=WARM_STORY_PEXELS_RATIO,
-        )
+        if not s.get("stock_query"):
+            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
 
     return scene_objects
 
@@ -1638,14 +1493,17 @@ def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_
     """
     Final source decision is style-based, not keyword-based.
 
-    - warm_storybook: follow the per-scene hybrid routing assigned by enforce_frontend_style_visual_budget().
-      If no per-scene value exists, default to AI for consistency.
+    - warm_storybook: AI-only for visual consistency.
     - all other styles: stock/Pexels/local-stock only by default.
+
+    This intentionally ignores scene_requires_ai() for non-Warm styles because that function
+    previously caused lifestyle/cinematic/promo videos to unexpectedly call SDXL and increase cost.
     """
     style = normalize_style_preset(video_style_preset)
     if is_warm_story_style(style):
         return "ai"
     return "stock"
+
 
 def detect_language(text: str) -> str:
     """Very small language detector for routing narration. Keeps Vietnamese narration in Vietnamese."""
@@ -2033,24 +1891,18 @@ def find_stock_video_asset(stock_query: str, scene_plan: Dict[str, Any], is_vert
 
 
 def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
-    """Fetch one suitable Pexels video URL. Returns metadata dict or None.
-
-    Quality logic:
-    - API-first for freshness.
-    - Prefer mp4, correct orientation, HD-ish size, 3-20s duration.
-    - Avoid picking very low-res or huge original files.
-    """
+    """Fetch one suitable Pexels video URL. Returns metadata dict or None."""
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
 
-    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=130, max_words=20)
+    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=110, max_words=16)
     orientation = "portrait" if is_vertical else "landscape"
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {
         "query": query,
         "orientation": orientation,
-        "per_page": max(4, min(int(PEXELS_PER_PAGE), 20)),
+        "per_page": max(1, min(int(PEXELS_PER_PAGE), 12)),
     }
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=10)
@@ -2062,78 +1914,37 @@ def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
         if not videos:
             return None
 
-        best = None
-        best_score = -999.0
-        target_w = 720 if is_vertical else 1280
-        target_h = 1280 if is_vertical else 720
-
-        q_tokens = tokenize_for_match(query)
-
-        for rank, video in enumerate(videos):
+        # Deterministic: pick the first result with a downloadable mp4 file.
+        for video in videos:
             files = video.get("video_files", []) or []
             if not files:
                 continue
-            page_url = str(video.get("url", "") or "")
-            duration = float(video.get("duration", 0) or 0)
-            user_name = str(video.get("user", {}).get("name", "") if isinstance(video.get("user"), dict) else "")
-            searchable_text = " ".join([page_url, user_name, query])
-            t_tokens = tokenize_for_match(searchable_text)
-            token_score = len(q_tokens & t_tokens) / max(6, len(q_tokens))
-
+            # Prefer HD-ish but not huge. Avoid original 4K files for speed/cost.
+            files = sorted(
+                files,
+                key=lambda f: (
+                    0 if (f.get("file_type") == "video/mp4") else 1,
+                    abs(int(f.get("width") or 0) - (720 if is_vertical else 1280)),
+                    int(f.get("width") or 9999) * int(f.get("height") or 9999),
+                )
+            )
             for vf in files:
                 link = vf.get("link")
-                if not link or str(vf.get("file_type", "")).lower() not in {"video/mp4", ""}:
-                    continue
-                w = int(vf.get("width") or 0)
-                h = int(vf.get("height") or 0)
-                if w <= 0 or h <= 0:
-                    continue
-
-                score = 0.0
-                score += token_score
-                score += max(0.0, 0.35 - (rank * 0.035))
-
-                # Orientation and size quality.
-                if is_vertical and h >= w:
-                    score += 0.20
-                if (not is_vertical) and w >= h:
-                    score += 0.20
-                if w >= 640 and h >= 360:
-                    score += 0.12
-                if w >= 960 or h >= 960:
-                    score += 0.08
-
-                # Prefer HD-ish, not oversized 4K original.
-                score -= abs(w - target_w) / max(target_w, 1) * 0.08
-                score -= abs(h - target_h) / max(target_h, 1) * 0.04
-                if w * h > 1920 * 1080 * 1.6:
-                    score -= 0.12
-
-                # Scene-length friendly.
-                if 3 <= duration <= 20:
-                    score += 0.10
-                elif duration > 35:
-                    score -= 0.08
-
-                cand = {
-                    "url": link,
-                    "query": query,
-                    "pexels_id": video.get("id", ""),
-                    "duration": video.get("duration", ""),
-                    "width": w,
-                    "height": h,
-                    "quality": vf.get("quality", ""),
-                    "page_url": page_url,
-                    "match_score": round(max(0.0, score), 3),
-                }
-                if score > best_score:
-                    best_score = score
-                    best = cand
-
-        return best
+                if link and str(vf.get("file_type", "")).lower() in {"video/mp4", ""}:
+                    return {
+                        "url": link,
+                        "query": query,
+                        "pexels_id": video.get("id", ""),
+                        "duration": video.get("duration", ""),
+                        "width": vf.get("width", ""),
+                        "height": vf.get("height", ""),
+                        "quality": vf.get("quality", ""),
+                    }
+        return None
     except Exception as e:
         print("WARN: Pexels video fetch failed:", repr(e))
         return None
+
 
 def prepare_pexels_video(video_url: str, out_path: str):
     """Download Pexels video file. Does not transcode; render stage will crop/resize frames."""
@@ -3298,185 +3109,41 @@ def _crop_resized(img, scale=1.0, x=0.5, y=0.5, out_w=768, out_h=432):
     return crop
 
 
-
-# ===== Warm Story Motion Engine (FREE, FAST, NO EXTRA MODEL) =====
-# This layer makes AI still images feel more alive without using Pixabay/SadTalker/video diffusion.
-# It only uses OpenCV/Numpy effects on top of the existing image: smarter Ken Burns, subtle float,
-# warm glow, tiny particles, and optional film grain. Cost: almost zero. Speed impact: small.
-ENABLE_WARM_STORY_MOTION_ENGINE = os.getenv("ENABLE_WARM_STORY_MOTION_ENGINE", "1").strip().lower() in {"1", "true", "yes", "y"}
-WARM_STORY_MOTION_INTENSITY = float(os.getenv("WARM_STORY_MOTION_INTENSITY", "1.0"))
-WARM_STORY_PARTICLE_COUNT = int(float(os.getenv("WARM_STORY_PARTICLE_COUNT", "14")))
-WARM_STORY_GLOW_STRENGTH = float(os.getenv("WARM_STORY_GLOW_STRENGTH", "0.10"))
-WARM_STORY_GRAIN_STRENGTH = float(os.getenv("WARM_STORY_GRAIN_STRENGTH", "1.8"))
-
-
-def _ease_in_out_sine(p: float) -> float:
-    p = max(0.0, min(1.0, float(p)))
-    return 0.5 - 0.5 * math.cos(math.pi * p)
-
-
-def _safe_hash_int(text: str, modulo: int = 1000003) -> int:
-    text = str(text or "")
-    h = 2166136261
-    for ch in text:
-        h ^= ord(ch)
-        h = (h * 16777619) & 0xFFFFFFFF
-    return int(h % modulo)
-
-
-def _make_particle_specs(seed: int, width: int, height: int, count: int):
-    rng = np.random.default_rng(int(seed) + 77)
-    specs = []
-    count = max(0, min(int(count), 36))
-    for _ in range(count):
-        specs.append({
-            "x": float(rng.uniform(0, max(1, width))),
-            "y": float(rng.uniform(0, max(1, height))),
-            "r": float(rng.uniform(1.0, 3.2)),
-            "speed": float(rng.uniform(4.0, 18.0)),
-            "phase": float(rng.uniform(0, math.tau)),
-            "alpha": float(rng.uniform(0.035, 0.105)),
-        })
-    return specs
-
-
-def _apply_warm_glow(frame: np.ndarray, strength: float = 0.10) -> np.ndarray:
-    """Cheap warm light bloom. Very subtle to avoid washed-out video."""
-    if strength <= 0:
-        return frame
-    strength = max(0.0, min(float(strength), 0.22))
-    blur = cv2.GaussianBlur(frame, (0, 0), sigmaX=10, sigmaY=10)
-    out = cv2.addWeighted(frame, 1.0, blur, strength, 0)
-    # warm lift: slightly more red/yellow, tiny blue reduction
-    out_f = out.astype(np.float32)
-    out_f[..., 0] *= 1.015
-    out_f[..., 1] *= 1.008
-    out_f[..., 2] *= 0.992
-    return np.clip(out_f, 0, 255).astype(np.uint8)
-
-
-def _apply_soft_particles(frame: np.ndarray, t: float, duration: float, specs, intensity: float = 1.0) -> np.ndarray:
-    """Small floating dust/light particles for storybook warmth."""
-    if not specs or intensity <= 0:
-        return frame
-    h, w = frame.shape[:2]
-    overlay = np.zeros_like(frame, dtype=np.uint8)
-    duration = max(float(duration or 1.0), 0.1)
-    for p in specs:
-        # float upward, slight horizontal wave
-        x = int((p["x"] + 8.0 * math.sin(float(t) * 0.7 + p["phase"])) % max(1, w))
-        y = int((p["y"] - p["speed"] * float(t)) % max(1, h))
-        r = max(1, int(round(p["r"] * max(0.75, intensity))))
-        # warm particle color in RGB
-        color = (255, 232, 176)
-        cv2.circle(overlay, (x, y), r, color, -1, lineType=cv2.LINE_AA)
-    alpha = max(0.0, min(0.18, 0.10 * float(intensity)))
-    return cv2.addWeighted(frame, 1.0, overlay, alpha, 0)
-
-
-def _apply_very_light_grain(frame: np.ndarray, t: float, seed: int, strength: float = 1.8) -> np.ndarray:
-    """Tiny deterministic film grain. Kept low to avoid noisy output."""
-    if strength <= 0:
-        return frame
-    h, w = frame.shape[:2]
-    # sample low-res noise and upscale for speed
-    gh, gw = max(12, h // 18), max(12, w // 18)
-    rng = np.random.default_rng(int(seed) + int(float(t) * 12.0))
-    noise = rng.normal(0, float(strength), (gh, gw, 1)).astype(np.float32)
-    noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_LINEAR)
-    if noise.ndim == 2:
-        noise = noise[..., None]
-    out = frame.astype(np.float32) + noise
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def _apply_warm_story_motion_finish(frame: np.ndarray, t: float, duration: float, style_name: str, seed: int, particle_specs) -> np.ndarray:
-    """Final visual life layer for warm story / poetic / mystic visuals."""
-    style_name = (style_name or "").lower()
-    if style_name not in {"warm_storybook", "watercolor_poetic", "mystic_light", "zen_soft"}:
-        return frame
-    intensity = max(0.0, min(1.8, WARM_STORY_MOTION_INTENSITY))
-    frame = _apply_warm_glow(frame, strength=WARM_STORY_GLOW_STRENGTH * intensity)
-    if style_name in {"warm_storybook", "watercolor_poetic", "mystic_light"}:
-        frame = _apply_soft_particles(frame, t=t, duration=duration, specs=particle_specs, intensity=intensity)
-    if style_name in {"warm_storybook", "dramatic_cinematic", "mystic_light"}:
-        frame = _apply_very_light_grain(frame, t=t, seed=seed, strength=WARM_STORY_GRAIN_STRENGTH * min(1.0, intensity))
-    return frame
-
-
 def make_motion_clip(image_path, duration, width, height, scene_profile="gentle", fps=24, video_style=None):
     base = _load_image_rgb(image_path, width, height)
     scene_profile = (scene_profile or "gentle").lower()
-    style_name = ""
-    if isinstance(video_style, dict):
-        style_name = str(video_style.get("name", "") or "").lower()
 
-    # Motion tuning. Warm Story gets richer movement because it relies on AI still images.
-    warm_motion = bool(ENABLE_WARM_STORY_MOTION_ENGINE and style_name in {"warm_storybook", "watercolor_poetic", "mystic_light", "zen_soft"})
-    intensity = max(0.0, min(1.8, WARM_STORY_MOTION_INTENSITY))
-
-    if warm_motion:
-        if scene_profile == "dramatic":
-            max_zoom = 1.085 + 0.015 * intensity
-            drift = 0.026 + 0.006 * intensity
-        elif scene_profile == "slow":
-            max_zoom = 1.045 + 0.010 * intensity
-            drift = 0.012 + 0.004 * intensity
-        elif scene_profile == "gentle":
-            max_zoom = 1.060 + 0.010 * intensity
-            drift = 0.017 + 0.004 * intensity
-        else:
-            max_zoom = 1.068 + 0.012 * intensity
-            drift = 0.020 + 0.005 * intensity
+    # Natural pacing: reduce excessive Ken Burns movement.
+    # Old values made the video feel slow/heavy and sometimes blurred.
+    if scene_profile == "dramatic":
+        max_zoom = 1.045
+        drift = 0.018
+    elif scene_profile == "slow":
+        max_zoom = 1.018
+        drift = 0.006
+    elif scene_profile == "gentle":
+        max_zoom = 1.026
+        drift = 0.008
     else:
-        # Original conservative defaults for non-warm styles.
-        if scene_profile == "dramatic":
-            max_zoom = 1.045
-            drift = 0.018
-        elif scene_profile == "slow":
-            max_zoom = 1.018
-            drift = 0.006
-        elif scene_profile == "gentle":
-            max_zoom = 1.026
-            drift = 0.008
-        else:
-            max_zoom = 1.032
-            drift = 0.010
-
-    seed = _safe_hash_int(image_path)
-    particle_specs = _make_particle_specs(seed, width, height, WARM_STORY_PARTICLE_COUNT if warm_motion else 0)
+        max_zoom = 1.032
+        drift = 0.010
 
     def make_frame(t):
         p = 0.0 if duration <= 0 else min(1.0, max(0.0, t / duration))
-        ease = _ease_in_out_sine(p)
+        ease = 0.5 - 0.5 * math.cos(math.pi * p)
 
-        # Cinematic Ken Burns: slightly curved, not linear.
         scale = 1.0 + (max_zoom - 1.0) * ease
-
-        if warm_motion:
-            # More organic floating path for storybook images.
-            x = 0.5 + drift * math.sin(2 * math.pi * (0.33 * p + 0.08)) + (drift * 0.35) * math.sin(2 * math.pi * (0.91 * p + 0.21))
-            y = 0.5 + drift * math.cos(2 * math.pi * (0.27 * p + 0.15)) + (drift * 0.22) * math.sin(2 * math.pi * (0.73 * p + 0.39))
-        else:
-            x = 0.5 + drift * math.sin(2 * math.pi * (0.35 * p + 0.10))
-            y = 0.5 + drift * math.cos(2 * math.pi * (0.28 * p + 0.18))
+        x = 0.5 + drift * math.sin(2 * math.pi * (0.35 * p + 0.10))
+        y = 0.5 + drift * math.cos(2 * math.pi * (0.28 * p + 0.18))
 
         frame = _crop_resized(base, scale=scale, x=x, y=y, out_w=width, out_h=height)
 
-        if warm_motion:
-            frame = _apply_warm_story_motion_finish(
-                frame=frame,
-                t=float(t),
-                duration=float(duration),
-                style_name=style_name,
-                seed=seed,
-                particle_specs=particle_specs,
-            )
-        elif video_style and video_style.get("name") in {"cinematic_realistic", "dramatic_cinematic"}:
+        if video_style and video_style.get("name") in {"cinematic_realistic", "dramatic_cinematic"}:
             h, w = frame.shape[:2]
             yy, xx = np.ogrid[:h, :w]
             cx, cy = w / 2.0, h / 2.0
             dist = ((xx - cx) ** 2 / (cx ** 2) + (yy - cy) ** 2 / (cy ** 2))
+            # Very light vignette only; avoid dark/blurred-looking back half.
             vignette = np.clip(1.0 - 0.006 * dist, 0.994, 1.0)
             frame = np.clip(frame.astype(np.float32) * vignette[..., None], 0, 255).astype(np.uint8)
 
@@ -3750,21 +3417,10 @@ def _get_image_max_workers(job_config=None) -> int:
 
 
 def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
-    prompt = scene["visual_prompt"]
-    negative_prompt = scene["negative_prompt"]
-
-    if is_warm_story_style(scene.get("video_style_preset", "")) and WARM_STORY_AI_REALISTIC:
-        narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-        scene_plan = scene.get("scene_plan", {}) or {}
-        prompt = enforce_pexels_like_ai_prompt(prompt, scene_plan, narration)
-        negative_prompt = enforce_pexels_like_negative_prompt(negative_prompt)
-        scene["visual_prompt"] = prompt
-        scene["negative_prompt"] = negative_prompt
-
     generate_image(
-        prompt=prompt,
+        prompt=scene["visual_prompt"],
         out_path=img_path,
-        negative_prompt=negative_prompt,
+        negative_prompt=scene["negative_prompt"],
         width=width,
         height=height,
         num_inference_steps=num_inference_steps,
@@ -3774,20 +3430,19 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         scene_id=scene["scene_id"],
     )
     maybe_apply_style_image_grade(img_path, scene.get("video_style_preset", ""))
-    scene["visual_used"] = "ai_pexels_like" if is_warm_story_style(scene.get("video_style_preset", "")) else "ai"
+    scene["visual_used"] = "ai"
     scene["visual_file"] = os.path.basename(img_path)
     return img_path
 
+
 def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
-    """Prepare one scene visual with hybrid routing.
+    """Prepare one scene visual with Pippit-style routing.
 
-    Warm Story rule:
-    - Around 60% scenes use Pexels/local stock VIDEO for real motion.
-    - Around 40% scenes use AI image, forced into photorealistic Pexels-like look.
-    - If a Pexels scene cannot find video/image, it may fallback to AI image.
-
-    Non-Warm rule:
-    - Stock/Pexels/local-stock only by default.
+    Final production rule:
+    - warm_storybook scenes are AI-image only.
+    - all other styles are stock-first and prefer real stock VIDEO for motion.
+    - if stock video is not available, use stock image + motion.
+    - if stock is missing for non-Warm styles, use a fast placeholder instead of SDXL.
     """
     visual_source = str(scene.get("visual_source", "") or "").lower()
     is_vertical = _is_vertical_frame(width, height)
@@ -3795,35 +3450,31 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     narration = scene.get("voice_text") or scene.get("source_chunk") or ""
     scene_plan = scene.get("scene_plan", {}) or {}
     video_style_preset = scene.get("video_style_preset", "") or ""
-    is_warm = is_warm_story_style(video_style_preset)
 
     image_source_mode = scene.get("image_source_mode") or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE)
     try:
         smart_source = decide_image_source(narration, scene_plan, video_style_preset, image_source_mode=image_source_mode)
     except Exception:
-        smart_source = "ai" if is_warm else "stock"
+        smart_source = "ai" if is_warm_story_style(video_style_preset) else "stock"
 
     if visual_source in {"stock", "ai"}:
         smart_source = visual_source
-
-    # Warm AI scenes: generate AI immediately with Pexels-like prompt.
-    if is_warm and smart_source == "ai":
-        return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
     if smart_source == "stock":
         stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
         scene["stock_query"] = stock_query
 
-        # 1) Prefer local stock VIDEO assets.
+        # 1) Prefer local stock VIDEO assets. This is the closest low-cost Pippit-style behavior.
         if ENABLE_STOCK_ASSETS:
             stock_video = find_stock_video_asset(stock_query, scene_plan, is_vertical=is_vertical)
             if stock_video:
                 print(f"🎞️ Using local stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: {stock_video.get('path')} | score={stock_video.get('match_score')}")
-                scene["visual_used"] = "warm_story_video_local" if is_warm else "stock_video_local"
+                scene["visual_used"] = "stock_video_local"
                 scene["visual_source"] = "stock"
                 scene["visual_video_path"] = stock_video.get("path")
                 scene["stock_asset_path"] = stock_video.get("path")
                 scene["stock_match_score"] = stock_video.get("match_score")
+                # Create a tiny placeholder image for metadata compatibility.
                 create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
@@ -3834,14 +3485,13 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             video_path = os.path.splitext(img_path)[0] + ".mp4"
             ok_video = prepare_pexels_video(pexels_video["url"], video_path)
             if ok_video:
-                print(f"🎞️ Using Pexels stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: query={pexels_video.get('query')!r} score={pexels_video.get('match_score')}")
-                scene["visual_used"] = "warm_story_video_pexels" if is_warm else "stock_video_pexels"
+                print(f"🎞️ Using Pexels stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: query={pexels_video.get('query')!r}")
+                scene["visual_used"] = "stock_video_pexels"
                 scene["visual_source"] = "stock"
                 scene["visual_video_path"] = ok_video
                 scene["stock_query_used"] = pexels_video.get("query", "")
                 scene["pexels_id"] = pexels_video.get("pexels_id", "")
                 scene["pexels_video_quality"] = pexels_video.get("quality", "")
-                scene["stock_match_score"] = pexels_video.get("match_score", "")
                 create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
@@ -3853,7 +3503,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 print(f"🖼️ Using local stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                 prepare_stock_image(stock["path"], img_path, width, height)
                 maybe_apply_style_image_grade(img_path, video_style_preset)
-                scene["visual_used"] = "warm_story_image_local" if is_warm else "stock_image_local"
+                scene["visual_used"] = "stock_image_local"
                 scene["visual_source"] = "stock"
                 scene["stock_asset_path"] = stock.get("path")
                 scene["stock_match_score"] = stock.get("match_score")
@@ -3867,7 +3517,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             ok = prepare_pexels_image(pexels["url"], img_path, width, height)
             if ok:
                 maybe_apply_style_image_grade(img_path, video_style_preset)
-                scene["visual_used"] = "warm_story_image_pexels" if is_warm else "stock_image_pexels"
+                scene["visual_used"] = "stock_image_pexels"
                 scene["visual_source"] = "stock"
                 scene["stock_query_used"] = pexels.get("query", "")
                 scene["pexels_id"] = pexels.get("pexels_id", "")
@@ -3876,8 +3526,8 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 return img_path
 
         ai_fallback_allowed = bool(scene.get("ai_fallback_allowed", False))
-        if ai_fallback_allowed and is_warm:
-            print(f"ℹ️ Warm Story Pexels scene {int(scene.get('scene_id', 0)):02d} had no suitable stock visual; falling back to Pexels-like AI image")
+        if ai_fallback_allowed and is_warm_story_style(video_style_preset):
+            print(f"ℹ️ No suitable stock/Pexels visual found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
         else:
             print(f"⚡ No stock/Pexels visual for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled for non-Warm style, using fast placeholder")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
@@ -3995,7 +3645,6 @@ def run_job(job_config, job_id):
             "stock_first_styles": sorted(list(STOCK_FIRST_STYLE_PRESETS)),
             "ai_scene_count": sum(1 for s in scene_objects if s.get("visual_source") == "ai"),
             "stock_scene_count": sum(1 for s in scene_objects if s.get("visual_source") == "stock"),
-            "warm_story_pexels_ratio": WARM_STORY_PEXELS_RATIO if is_warm_story_style(video_style_preset) else None,
         },
     })
 
