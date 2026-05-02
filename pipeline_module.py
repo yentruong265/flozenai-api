@@ -726,6 +726,10 @@ def generate_image(
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
+
+# ===== CELL 6 =====
+# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
+
 import os
 import re
 import gc
@@ -2129,11 +2133,7 @@ def build_grounded_visual_prompt(
     elif style_name == "zen_soft":
         style_terms = "calm soft visual, peaceful composition, gentle light"
     elif style_name == "warm_storybook":
-        style_terms = (
-            "warm storybook illustration, clean composition, expressive subject, "
-            "simple natural face, symmetrical eyes, soft facial features, medium shot, "
-            "gentle painterly texture, avoid extreme close-up"
-        )
+        style_terms = "warm storybook illustration, clean composition, expressive subject"
     elif style_name == "watercolor_poetic":
         style_terms = "poetic watercolor, soft brush texture, clear subject"
     else:
@@ -2142,9 +2142,8 @@ def build_grounded_visual_prompt(
     human_terms = ""
     if scene_has_human(scene_plan, narration):
         human_terms = (
-            "one clear human subject, natural symmetrical face, clean eyes, normal mouth, "
-            "correct anatomy, realistic hands, normal fingers, realistic arms and legs, "
-            "simple physically possible pose"
+            "one clear human subject, natural face, correct anatomy, realistic hands, "
+            "normal fingers, detailed eyes, realistic arms and legs"
         )
 
     pose_guard = ""
@@ -2191,16 +2190,12 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
         "wrong object", "missing required object", "unrelated scene",
         "extra person", "wrong age", "wrong clothing",
         "object floating", "object fused with body",
-        "duplicate hands", "melted objects", "distorted face", "deformed face",
-        "melted face", "mutated face", "asymmetrical face", "crossed eyes",
-        "misaligned eyes", "extra eyes", "missing eyes", "distorted mouth",
-        "bad teeth", "scary face", "uncanny smile"
+        "duplicate hands", "melted objects"
     ])
 
     if scene_has_human(scene_plan, narration):
         extras.extend([
-            "bad face", "uncanny face", "asymmetrical eyes", "misaligned eyes",
-            "crossed eyes", "distorted mouth", "melted face", "bad teeth", "bad hands",
+            "bad face", "uncanny face", "asymmetrical eyes", "bad hands",
             "fused fingers", "extra fingers", "missing fingers", "extra arms", "extra legs",
             "detached limbs", "disconnected body parts", "broken anatomy"
         ])
@@ -2492,7 +2487,6 @@ This block applies ONLY when video_style_preset == "warm_storybook". DO NOT appl
 - Each scene may cover a longer narration segment if the visual moment is coherent.
 - Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
 - Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
-- For human characters, prefer medium shot / medium-long shot with simple expressive faces; avoid extreme close-up faces because they create AI artifacts.
 """
 
     prompt = f"""
@@ -2614,8 +2608,8 @@ STOCK QUERY RULES:
 
 AI IMAGE PROMPT RULES:
 48. If visual_source="ai", simplify the visual: one clear subject, simple pose, clean object shapes, simple background.
-49. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex products, messy backgrounds, too many small objects, or overly close face shots.
-50. For humans, prefer medium shot or medium-long shot over extreme close-up; include natural symmetrical face, clean simple facial features, correct anatomy, realistic hands, normal fingers, clear eyes, physically possible body posture, and avoid deformed eyes/mouth.
+49. Avoid extreme poses, crowds, tiny fingers, unreadable text, complex products, messy backgrounds, or too many small objects.
+50. For humans, include natural face, correct anatomy, realistic hands, normal fingers, clear eyes, and physically possible body posture when relevant.
 51. For vertical 9:16, use portrait-safe framing: centered subject, safe margins, avoid cropped head/feet.
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
@@ -2648,7 +2642,7 @@ SELF-CHECK BEFORE FINAL JSON:
 72. For each scene, verify: Does visual_prompt show the same moment as narration_text?
 73. Verify every mentioned object/action/place appears in visual_prompt.
 74. Verify stock_query is useful if visual_source="stock".
-75. Provide text_overlay equal to the FULL narration_text for that scene, in the same language. Do not summarize, shorten, rewrite, or turn it into a headline.
+75. text_overlay is optional. The renderer will use narration_text as progressive subtitles, showing only the current sentence/chunk at a time. Do not rely on text_overlay for full-screen paragraphs.
 76. Provide motion_intent to help choose stock video/motion template.
 75. Verify no visual_prompt asks for text, logo, watermark, subtitles, or unreadable signs.
 76. Verify scenes are visually different and flow naturally.
@@ -2666,7 +2660,7 @@ Return JSON exactly with this schema:
       "narration_text": "spoken narration in the same language as USER REQUEST",
       "visual_source": "stock or ai",
       "stock_query": "English search query for stock/local asset, or empty string",
-      "text_overlay": "FULL narration_text for this scene, same language, not summarized",
+      "text_overlay": "optional short caption; renderer will primarily use narration_text for progressive subtitles",
       "motion_intent": "short description of desired motion, e.g. slow zoom, pan left, person walking, hands typing",
       "visual_prompt": "English SDXL prompt, concrete and style-consistent",
       "main_subject": "short specific visual subject",
@@ -2936,7 +2930,10 @@ def create_adaptive_video_plan(
             "aspect_ratio": "9:16" if is_vertical else "16:9",
             "video_style_preset": video_style_preset,
             "image_source_mode": image_source_mode,
-            "text_overlay": sanitize_tts_text(chunk, max_chars=900),
+            # Use the full scene narration for subtitles.
+            # The renderer below will show only the current sentence/chunk over time,
+            # not the full paragraph at once.
+            "text_overlay": chunk,
             "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
         })
 
@@ -3275,135 +3272,150 @@ def make_stock_video_clip(video_path, duration, width, height, scene_profile="st
     return VideoClip(frame_function=make_frame, duration=float(duration)).with_fps(int(fps))
 
 
-def _wrap_overlay_text(text: str, max_chars_per_line: int = 34, max_lines: int = None) -> str:
-    """Wrap FULL scene narration for on-video text.
+def _split_overlay_sentences(text: str) -> List[str]:
+    """Split narration into readable subtitle units.
 
-    Important:
-    - Do not summarize or truncate by default.
-    - max_lines=None means keep all lines.
-    - This is used only for visual overlay; narration itself remains unchanged.
+    We do not have word-level timestamps from TTS, so this function creates
+    sentence/chunk units and the renderer distributes them across the scene duration.
+    This prevents one large paragraph from covering the frame.
     """
     text = sanitize_tts_text(text or "", max_chars=1200)
     if not text:
-        return ""
+        return []
 
+    # Prefer sentence boundaries; also supports Vietnamese punctuation.
+    parts = re.split(r"(?<=[\.\!\?\…])\s+|\n+", text)
+    parts = [p.strip() for p in parts if p and p.strip()]
+    if not parts:
+        parts = [text]
+
+    units = []
+    for part in parts:
+        words = part.split()
+        # If a sentence is too long, split it into short subtitle chunks.
+        # Vertical video needs shorter chunks to avoid covering the image.
+        chunk_words = 9
+        if len(words) <= chunk_words + 2:
+            units.append(part)
+        else:
+            for i in range(0, len(words), chunk_words):
+                chunk = " ".join(words[i:i + chunk_words]).strip()
+                if chunk:
+                    units.append(chunk)
+    return units
+
+
+def _wrap_overlay_text(text: str, max_chars_per_line: int = 28, max_lines: int = 2) -> str:
+    """Wrap only the currently active subtitle unit, not the whole scene text."""
+    text = sanitize_tts_text(text or "", max_chars=220)
+    if not text:
+        return ""
     words = text.split()
     lines = []
     current = []
-
     for w in words:
-        candidate = " ".join(current + [w]).strip()
-        if current and len(candidate) > max_chars_per_line:
-            lines.append(" ".join(current).strip())
+        candidate = " ".join(current + [w])
+        if len(candidate) > max_chars_per_line and current:
+            lines.append(" ".join(current))
             current = [w]
         else:
             current.append(w)
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(" ".join(current))
+    return "\n".join(lines[:max_lines]).strip()
 
-    if current:
-        lines.append(" ".join(current).strip())
 
-    if max_lines is not None and max_lines > 0:
-        lines = lines[:max_lines]
+def _current_progressive_subtitle(text: str, t: float, duration: float) -> str:
+    """Return the subtitle chunk that should be visible at time t."""
+    units = _split_overlay_sentences(text)
+    if not units:
+        return ""
+    if len(units) == 1 or duration <= 0:
+        return units[0]
 
-    return "\n".join([x for x in lines if x]).strip()
+    # Allocate display time roughly by character length so longer chunks stay longer.
+    weights = [max(1, len(u)) for u in units]
+    total = float(sum(weights))
+    pos = max(0.0, min(float(t), float(duration))) / max(float(duration), 1e-6)
+    acc = 0.0
+    for unit, w in zip(units, weights):
+        acc += w / total
+        if pos <= acc:
+            return unit
+    return units[-1]
 
 
 def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_style_preset: str = ""):
-    """Draw full scene narration as clean text overlay.
+    """Draw progressive subtitles: only current sentence/chunk, no background box.
 
-    User-facing behavior:
-    - show the full text for the current scene, not a summarized caption
-    - no semi-transparent background box
-    - use text-only overlay with a thin stroke for readability
+    Behavior:
+    - Shows text gradually by sentence/chunk according to scene time.
+    - Never displays the full scene paragraph at once.
+    - No black/gray subtitle background, only white text with a thin shadow/stroke.
     """
-    is_vertical = height > width
-    max_chars = 36 if not is_vertical else 24
-    overlay_text = _wrap_overlay_text(text, max_chars_per_line=max_chars, max_lines=None)
-    if not overlay_text:
+    if not sanitize_tts_text(text or "", max_chars=20):
         return clip
 
     duration = float(getattr(clip, "duration", 0) or 0)
 
+    is_vertical = height > width
+    font_size = max(18, int(min(width, height) * (0.044 if is_vertical else 0.045)))
+    max_chars = 22 if is_vertical else 34
+    max_lines = 2
+
     try:
         from PIL import ImageDraw, ImageFont
-        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        base_font_size = max(18, int(min(width, height) * (0.038 if not is_vertical else 0.042)))
-        font = ImageFont.truetype(font_path, base_font_size)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
     except Exception:
         from PIL import ImageDraw, ImageFont
-        font_path = None
-        base_font_size = max(18, int(min(width, height) * 0.040))
         font = ImageFont.load_default()
-
-    lines = overlay_text.split("\n")
-
-    # Fit full text into a safe lower area. If text is long, reduce font size instead of truncating.
-    safe_height = int(height * (0.34 if not is_vertical else 0.42))
-    min_font_size = max(13, int(min(width, height) * 0.026))
-
-    def load_font(size):
-        try:
-            from PIL import ImageFont
-            if font_path:
-                return ImageFont.truetype(font_path, int(size))
-        except Exception:
-            pass
-        return font
-
-    def measure(draw, fnt, stroke_width=2):
-        boxes = [draw.textbbox((0, 0), line, font=fnt, stroke_width=stroke_width) for line in lines]
-        text_w = max([b[2] - b[0] for b in boxes] or [0])
-        line_h = max([b[3] - b[1] for b in boxes] or [base_font_size])
-        gap = max(3, int(getattr(fnt, "size", base_font_size) * 0.22))
-        text_h = line_h * len(lines) + gap * max(0, len(lines) - 1)
-        return text_w, line_h, gap, text_h
-
-    # Pre-measure using a tiny canvas.
-    probe = Image.new("RGBA", (max(10, width), max(10, height)), (0, 0, 0, 0))
-    probe_draw = ImageDraw.Draw(probe)
-    font_size = base_font_size
-    font = load_font(font_size)
-    text_w, line_h, gap, text_h = measure(probe_draw, font)
-
-    while (text_h > safe_height or text_w > int(width * 0.92)) and font_size > min_font_size:
-        font_size -= 2
-        font = load_font(font_size)
-        text_w, line_h, gap, text_h = measure(probe_draw, font)
-
-    stroke_width = 2 if font_size >= 18 else 1
 
     def make_frame(t):
         frame = clip.get_frame(t).astype(np.uint8)
+        current_text = _current_progressive_subtitle(text, t, duration)
+        overlay_text = _wrap_overlay_text(current_text, max_chars_per_line=max_chars, max_lines=max_lines)
+        if not overlay_text:
+            return frame
+
         img = Image.fromarray(frame).convert("RGBA")
         draw = ImageDraw.Draw(img)
 
-        # Gentle fade in/out, text only. No background box.
+        # Light fade at scene start/end only. No paragraph fade-in block.
         fade = 1.0
         if duration > 0:
-            fade = min(1.0, max(0.0, t / 0.25), max(0.0, (duration - t) / 0.25))
+            fade = min(1.0, max(0.0, t / 0.15), max(0.0, (duration - t) / 0.18))
         alpha = int(245 * fade)
-        stroke_alpha = int(210 * fade)
         if alpha <= 0:
             return frame
 
-        # Recompute for current draw context.
-        text_w, line_h, gap, text_h = measure(draw, font, stroke_width=stroke_width)
-        y = int(height * (0.72 if not is_vertical else 0.62))
-        y = min(y, height - text_h - int(height * 0.05))
-        y = max(int(height * 0.50), y)
+        lines = overlay_text.split("\n")
+        line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=2) for line in lines]
+        line_h = max([b[3] - b[1] for b in line_boxes] or [font_size])
+        gap = int(font_size * 0.20)
+        text_h = line_h * len(lines) + gap * (len(lines) - 1)
+
+        # Place subtitles low but not at the very bottom; avoid covering faces in center.
+        y = int(height * (0.78 if is_vertical else 0.82))
+        y = min(y, height - text_h - int(font_size * 0.8))
 
         yy = y
         for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=2)
             lw = bbox[2] - bbox[0]
             lx = int((width - lw) / 2)
+
+            # No background rectangle. Use thin black stroke + soft shadow for readability.
             draw.text(
-                (lx, yy),
-                line,
-                font=font,
+                (lx + 1, yy + 1), line, font=font,
+                fill=(0, 0, 0, int(120 * fade)),
+                stroke_width=2, stroke_fill=(0, 0, 0, int(120 * fade))
+            )
+            draw.text(
+                (lx, yy), line, font=font,
                 fill=(255, 255, 255, alpha),
-                stroke_width=stroke_width,
-                stroke_fill=(0, 0, 0, stroke_alpha),
+                stroke_width=2, stroke_fill=(0, 0, 0, int(210 * fade))
             )
             yy += line_h + gap
 
