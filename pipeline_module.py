@@ -1411,73 +1411,123 @@ def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> f
     return score
 
 
+def estimate_visible_people_count(scene_plan: Dict[str, Any], narration: str = "") -> int:
+    """Estimate how many visible people are in a scene.
+
+    This is intentionally conservative. It is used only for Warm Story routing:
+    scenes with 2+ people are routed to Pexels image when possible because SDXL
+    is more likely to create face/hand/limb artifacts with multiple characters.
+    """
+    joined = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+        " ".join([str(x) for x in (scene_plan.get("must_show", []) or [])]),
+    ]).lower()
+
+    # Explicit numbers / quantifiers.
+    if re.search(r"\b(2|two|couple|pair)\b", joined) or any(k in joined for k in ["hai người", "hai nhân vật", "hai đứa", "hai cậu", "hai cô", "hai ông", "hai bà"]):
+        return 2
+    if re.search(r"\b(3|three|several|many|group|crowd|family|people)\b", joined) or any(k in joined for k in ["ba người", "nhiều người", "nhóm người", "đám đông", "gia đình", "mọi người"]):
+        return 3
+
+    multi_terms = {
+        "people", "group of people", "crowd", "family", "children", "monks", "students", "villagers",
+        "nhiều người", "nhóm người", "đám đông", "gia đình", "trẻ em", "các nhà sư", "dân làng", "mọi người"
+    }
+    if _has_any_term(joined, multi_terms):
+        return 3
+
+    # If multiple role words appear, assume 2+ people.
+    role_terms = [
+        "man", "woman", "boy", "girl", "child", "old man", "old woman", "monk", "teacher", "father", "mother",
+        "đàn ông", "phụ nữ", "cậu bé", "cô gái", "đứa trẻ", "ông lão", "bà lão", "nhà sư", "thiền sư", "cha", "mẹ"
+    ]
+    hits = sum(1 for t in role_terms if t in joined)
+    if hits >= 2:
+        return 2
+
+    return 1 if scene_has_human(scene_plan, narration) else 0
+
+
 def _warm_story_pexels_image_score(scene_obj: Dict[str, Any], idx: int, total: int) -> float:
     """Score warm-story scenes that are most suitable for Pexels image insertion.
 
-    Goal: pick only scenes that are concrete, searchable, and less likely to need AI.
-    We prefer establishing shots, nature/temple/village/object shots, and simple human scenes.
-    We avoid scenes with specific spiritual/fantasy/ancient entities, abstract turning points,
-    complex hand/body actions, or unique props that Pexels is unlikely to match exactly.
+    Hard requirement from product:
+    - Warm Story should be about 60% AI image + 40% Pexels image.
+    - Warm Story must NOT use Pexels video.
+    - Scenes with 2+ people are strongly preferred for Pexels image to reduce
+      common AI artifacts in faces, hands, fingers, arms, and legs.
     """
     scene_plan = scene_obj.get("scene_plan", {}) or {}
     narration = str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or "")
+    people_count = estimate_visible_people_count(scene_plan, narration)
+
     txt = " ".join([
         narration,
         str(scene_plan.get("main_subject", "") or ""),
         str(scene_plan.get("action", "") or ""),
         str(scene_plan.get("location", "") or ""),
         str(scene_plan.get("background", "") or ""),
+        str(scene_plan.get("time_of_day", "") or ""),
         " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
         " ".join([str(x) for x in (scene_plan.get("must_show", []) or [])]),
     ]).lower()
 
     score = 0.0
 
-    # Pexels tends to work well for contextual establishing shots.
+    # Multi-person scenes should usually be Pexels image because AI often breaks faces/hands/limbs.
+    if people_count >= 2:
+        score += 7.0
+    elif people_count == 1:
+        score += 0.7
+    else:
+        score += 1.1
+
+    # Pexels works well for realistic contextual shots and simple environments.
     if _has_any_term(txt, {
         "nature", "forest", "mountain", "river", "stream", "sunrise", "sunset", "sky", "cloud", "rain",
         "temple", "pagoda", "monastery", "village", "road", "path", "garden", "field", "home", "room",
         "thiên nhiên", "rừng", "núi", "suối", "sông", "bầu trời", "mây", "mưa", "chùa", "thiền viện",
         "làng", "con đường", "lối đi", "khu vườn", "cánh đồng", "ngôi nhà", "căn phòng"
     }):
-        score += 3.0
+        score += 2.5
 
-    # Simple object / atmosphere scenes are also suitable for stock photos.
     if _has_any_term(txt, {
         "candle", "lamp", "book", "bowl", "flower", "lotus", "tea", "door", "window", "table",
         "nến", "đèn", "sách", "bát", "hoa", "hoa sen", "trà", "cửa", "cửa sổ", "bàn"
     }):
-        score += 1.4
-
-    # Simple human scenes can be okay, but not if the action is too specific.
-    if scene_has_human(scene_plan, narration):
-        score += 0.6
-    else:
         score += 1.0
 
-    # Prefer not to place Pexels on the strongest story turning points; AI usually matches better there.
-    if idx == 0:
-        score += 0.6
-    if idx == total - 1:
-        score -= 0.8
-
+    # Avoid Pexels for very exact supernatural/fantasy/ancient scenes where stock will mismatch.
     if scene_requires_ai(narration, scene_plan, scene_obj.get("video_style_preset", "")):
-        score -= 5.0
+        score -= 4.0
     if scene_is_abstract(narration, scene_plan):
-        score -= 2.0
-    if scene_has_complex_body_pose(narration, scene_plan):
-        score -= 1.6
+        score -= 1.8
     if _has_any_term(txt, {
-        "turning point", "cao trào", "bước ngoặt", "giác ngộ", "nhận ra", "huyền bí", "mystic",
-        "buddha", "phật", "thiền sư", "nhà sư", "ancient", "cổ trang", "thần", "quỷ", "dragon",
-        "magic", "fantasy", "heaven", "hell", "surreal", "phép màu", "thiêng liêng"
+        "buddha", "đức phật", "phật hiện", "thần", "quỷ", "dragon", "rồng", "magic", "phép màu",
+        "heaven", "hell", "thiên đường", "địa ngục", "surreal", "fantasy", "huyền bí", "cổ trang"
     }):
         score -= 2.5
 
-    # Strong must_show lists usually mean the scene needs exact visual matching; AI is safer.
+    # If one-person scene has very specific hand/object action, AI might still be better.
+    # For 2+ people, keep the Pexels preference despite action complexity.
+    if people_count < 2 and scene_has_complex_body_pose(narration, scene_plan):
+        score -= 1.4
+
+    # Strong must_show lists mean exact matching is needed. Keep Pexels only if scene is multi-person
+    # or otherwise naturally stock-friendly.
     must_show = scene_plan.get("must_show", []) or []
-    if isinstance(must_show, list) and len(must_show) >= 5:
-        score -= 0.7
+    if isinstance(must_show, list) and len(must_show) >= 5 and people_count < 2:
+        score -= 0.8
+
+    # Use first scene as a possible stock establishing shot; keep ending more controlled by AI.
+    if idx == 0:
+        score += 0.5
+    if idx == total - 1:
+        score -= 0.5
 
     return score
 
@@ -1487,16 +1537,17 @@ def _target_count(total: int, ratio: float) -> int:
         return 0
     return max(0, min(total, int(round(total * ratio))))
 
+
 def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Final hard routing guardrail for FlozenAI frontend styles.
 
-    UPDATED WARM STORY RULE:
-    - Warm Story / warm_storybook targets 60% AI images + 40% Pexels/local stock images.
-    - Warm Story does NOT use Pexels video in this routing layer, to keep the story visual tone consistent.
-    - The 40% Pexels-image scenes are selected carefully: only concrete, stock-friendly scenes.
-    - If a selected Pexels image scene cannot find a suitable image downstream, AI fallback is allowed.
-    - Every other style remains stock/Pexels/local-stock only by default.
+    STRICT WARM STORY RULE:
+    - Warm Story / warm_storybook must use images only: NO Pexels video.
+    - Target ratio: 60% AI images + 40% Pexels/local stock images.
+    - Scenes with 2+ visible people are prioritized for Pexels image to reduce AI face/hand/limb errors.
+    - Pexels-image scenes may fallback to AI only if no suitable image is found downstream.
+    - Non-Warm styles keep their old stock/Pexels-video-first behavior.
     """
     if not scene_objects:
         return scene_objects
@@ -1504,35 +1555,30 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     style = normalize_style_preset(video_style_preset)
     is_warm = is_warm_story_style(style)
 
-    # Tunable ratios via job_config/env, but keep safe defaults for Warm Story.
-    try:
-        warm_ai_ratio = float(job_config.get("warm_story_ai_ratio", os.getenv("WARM_STORY_AI_RATIO", "0.60")))
-    except Exception:
-        warm_ai_ratio = 0.60
-    warm_ai_ratio = max(0.50, min(warm_ai_ratio, 0.75))
-    warm_pexels_ratio = 1.0 - warm_ai_ratio
-
-    try:
-        warm_pexels_min_score = float(job_config.get("warm_story_pexels_scene_min_score", os.getenv("WARM_STORY_PEXELS_SCENE_MIN_SCORE", "1.60")))
-    except Exception:
-        warm_pexels_min_score = 1.60
-
     pexels_image_indexes = set()
     if is_warm:
         total = len(scene_objects)
-        target_pexels_count = _target_count(total, warm_pexels_ratio)
-        # For very short videos, allow at least one Pexels image if there are enough scenes.
+        # Fixed target: 40% Pexels image, therefore 60% AI image.
+        try:
+            pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.40")))
+        except Exception:
+            pexels_ratio = 0.40
+        pexels_ratio = max(0.25, min(pexels_ratio, 0.45))
+        target_pexels_count = _target_count(total, pexels_ratio)
         if total >= 3:
             target_pexels_count = max(1, target_pexels_count)
         target_pexels_count = min(total, target_pexels_count)
 
+        # Rank all scenes. Do NOT require a high pre-score here; otherwise ratio collapses.
+        # The actual Pexels candidate still has a downstream match gate and can fallback to AI.
         scored = []
         for idx, scene in enumerate(scene_objects):
             score = _warm_story_pexels_image_score(scene, idx, total)
-            if score >= warm_pexels_min_score:
-                scored.append((score, idx))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        pexels_image_indexes = {idx for _, idx in scored[:target_pexels_count]}
+            people_count = estimate_visible_people_count(scene.get("scene_plan", {}) or {}, scene.get("voice_text") or scene.get("source_chunk") or "")
+            # tuple ordering prioritizes: score, multi-person flag, then earlier establishing shots.
+            scored.append((score, 1 if people_count >= 2 else 0, -idx, idx))
+        scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        pexels_image_indexes = {idx for _, _, _, idx in scored[:target_pexels_count]}
 
     for idx, s in enumerate(scene_objects):
         scene_plan = s.get("scene_plan", {}) or {}
@@ -1540,29 +1586,35 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         is_vertical = (s.get("aspect_ratio") == "9:16")
 
         if is_warm:
+            people_count = estimate_visible_people_count(scene_plan, narration)
+            s["disable_pexels_video"] = True
+            s["prefer_stock_video"] = False
+            s["prefer_pexels_video_first"] = False
+            s["warm_story_no_video"] = True
+            s["warm_story_people_count"] = people_count
+
             if idx in pexels_image_indexes:
-                # Warm Story Pexels insertion: image only, not video.
-                s["visual_source"] = "stock"
+                # Use Pexels/local IMAGE only. Keep compatibility fields so downstream code cannot choose video.
+                s["visual_source"] = "pexels_image"
+                s["visual_asset_type"] = "image"
+                s["stock_asset_type"] = "image"
                 s["asset_preference_order"] = ["pexels_image", "local_stock_image", "ai_image_fallback"]
-                s["prefer_stock_video"] = False
-                s["prefer_pexels_video_first"] = False
-                s["disable_pexels_video"] = True
+                s["force_pexels_image_only"] = True
                 s["warm_story_stock_kind"] = "pexels_image_only"
                 s["ai_fallback_allowed"] = True
-                s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.68"))
-                s["routing_reason"] = "warm_storybook_40pct_strict_pexels_image_insert_with_ai_fallback"
+                s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.62"))
+                s["routing_reason"] = "warm_storybook_exact_40pct_pexels_image_no_video_multi_person_preferred"
             else:
-                # Main Warm Story look: AI image for strong scene matching and consistent story tone.
+                # Main Warm Story look: AI image for strong scene matching and cohesive storytelling.
                 s["visual_source"] = "ai"
+                s["visual_asset_type"] = "image"
                 s["asset_preference_order"] = ["ai_image"]
-                s["prefer_stock_video"] = False
-                s["prefer_pexels_video_first"] = False
-                s["disable_pexels_video"] = True
+                s["force_pexels_image_only"] = False
                 s["warm_story_stock_kind"] = "ai_image_primary"
                 s["ai_fallback_allowed"] = True
-                s["routing_reason"] = "warm_storybook_60pct_ai_primary_best_scene_matching"
+                s["routing_reason"] = "warm_storybook_exact_60pct_ai_image_primary"
         else:
-            # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
+            # Keep existing non-Warm behavior unchanged.
             s["visual_source"] = "stock"
             s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
             s["prefer_stock_video"] = True
@@ -1574,7 +1626,21 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         if not s.get("stock_query"):
             s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
 
+    # Diagnostics for logs / UI if needed.
+    if is_warm:
+        total = len(scene_objects)
+        routed_pexels = sum(1 for x in scene_objects if x.get("visual_source") == "pexels_image")
+        routed_ai = sum(1 for x in scene_objects if x.get("visual_source") == "ai")
+        for x in scene_objects:
+            x["warm_story_ratio_summary"] = {
+                "target": "60pct_ai_40pct_pexels_image_no_video",
+                "total_scenes": total,
+                "ai_image_scenes": routed_ai,
+                "pexels_image_scenes": routed_pexels,
+            }
+
     return scene_objects
+
 
 def create_fast_placeholder_image(out_path: str, width: int, height: int, title: str = "FlozenAI"):
     """Last-resort fast visual so a job never hangs because stock is missing and AI budget is locked."""
@@ -2182,15 +2248,21 @@ def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
     """Preferred asset order for downstream rendering.
 
     Warm Story target: 60% AI images + 40% carefully selected Pexels/local stock images.
-    Warm Story deliberately avoids Pexels video here to keep the story visual tone cohesive.
+    Warm Story deliberately avoids Pexels video. This helper returns image-only orders
+    for all warm_storybook scenes, regardless of legacy visual_source naming.
     """
     order = scene_obj.get("asset_preference_order")
     if isinstance(order, list) and order:
+        # Safety: remove video options from Warm Story even if an older planner/router inserted them.
+        if is_warm_story_style(scene_obj.get("video_style_preset", "")):
+            return [str(x) for x in order if "video" not in str(x).lower()]
         return [str(x) for x in order]
+
     if is_warm_story_style(scene_obj.get("video_style_preset", "")):
-        if scene_obj.get("visual_source") == "stock":
+        if scene_obj.get("visual_source") in {"pexels_image", "stock_image"} or scene_obj.get("force_pexels_image_only"):
             return ["pexels_image", "local_stock_image", "ai_image_fallback"]
         return ["ai_image"]
+
     return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
 
 def is_warm_story_style(video_style_preset: str) -> bool:
@@ -2363,10 +2435,18 @@ def build_grounded_visual_prompt(
 
     human_terms = ""
     if scene_has_human(scene_plan, narration):
-        human_terms = (
-            "one clear human subject, natural face, correct anatomy, realistic hands, "
-            "normal fingers, detailed eyes, realistic arms and legs"
-        )
+        people_count = estimate_visible_people_count(scene_plan, narration)
+        if people_count >= 2:
+            human_terms = (
+                "two or more clearly separated human subjects, each person fully visible, natural faces, "
+                "correct anatomy, normal hands, five fingers per hand, visible connected arms and legs, "
+                "no overlapping faces, no fused bodies, no extra people"
+            )
+        else:
+            human_terms = (
+                "one clear human subject, full body or medium shot, natural face, correct anatomy, "
+                "normal hands, five fingers per hand, detailed eyes, realistic connected arms and legs"
+            )
 
     pose_guard = ""
     if scene_has_complex_body_pose(narration, scene_plan):
@@ -2412,15 +2492,30 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
         "wrong object", "missing required object", "unrelated scene",
         "extra person", "wrong age", "wrong clothing",
         "object floating", "object fused with body",
-        "duplicate hands", "melted objects"
+        "duplicate hands", "melted objects",
+        "missing arm", "missing hand", "missing leg", "missing foot",
+        "extra hand", "extra foot", "extra limb", "deformed face",
+        "distorted face", "melted face", "cross-eye", "uneven eyes",
+        "fused bodies", "overlapping faces", "floating limbs", "disconnected limbs"
     ])
 
     if scene_has_human(scene_plan, narration):
         extras.extend([
             "bad face", "uncanny face", "asymmetrical eyes", "bad hands",
             "fused fingers", "extra fingers", "missing fingers", "extra arms", "extra legs",
-            "detached limbs", "disconnected body parts", "broken anatomy"
+            "detached limbs", "disconnected body parts", "broken anatomy",
+            "six fingers", "four fingers", "three fingers", "mangled fingers",
+            "deformed hands", "merged hands", "hands merged with clothing",
+            "missing wrist", "broken wrist", "broken elbow", "broken shoulder",
+            "deformed feet", "extra toes", "missing toes", "reversed foot",
+            "long neck", "twisted neck", "asymmetrical mouth", "deformed nose"
         ])
+        if estimate_visible_people_count(scene_plan, narration) >= 2:
+            extras.extend([
+                "fused people", "merged people", "two heads on one body",
+                "shared limbs", "overlapping bodies", "duplicate face",
+                "cloned face", "crowded composition", "unreadable faces"
+            ])
 
     if scene_has_complex_body_pose(narration, scene_plan):
         extras.extend([
@@ -3644,7 +3739,6 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         return np.array(img.convert("RGB"))
 
     return VideoClip(frame_function=make_frame, duration=duration).with_fps(int(getattr(clip, "fps", 24) or 24))
-
 # ===== CELL 7 =====
 # B7 — run_job FIXED FULL (single narration audio, no overlap, with progress, safe return)
 
