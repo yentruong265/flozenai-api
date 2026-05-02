@@ -739,6 +739,7 @@ import math
 import shutil
 import random
 import asyncio
+import requests
 import nest_asyncio
 nest_asyncio.apply()
 import numpy as np
@@ -1412,11 +1413,19 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     """
     Final hard routing guardrail for FlozenAI frontend styles.
 
-    STRICT RULES:
-    - Warm Story / warm_storybook: 100% AI visuals.
-    - Every other style: 100% stock/Pexels/local-stock visuals by default.
-    - Non-Warm styles must NOT call SDXL/AI from this routing layer.
-    - Non-Warm styles must NOT reduce scene count for cost reasons.
+    UPDATED WARM STORY RULE:
+    - Warm Story / warm_storybook is STOCK-FIRST, not AI-only.
+    - Preferred order for Warm Story:
+        1) Pexels/local stock video
+        2) Pexels/local stock image
+        3) AI image fallback only for a limited budget, normally max 30%-40% scenes
+    - Every other style remains stock/Pexels/local-stock only by default.
+
+    Notes:
+    - This function sets scene-level routing metadata.
+    - The downstream asset/render step should try stock video before stock image.
+    - ai_fallback_allowed is enabled only for selected high-priority warm-story scenes,
+      so AI images cannot accidentally dominate the whole video.
     """
     if not scene_objects:
         return scene_objects
@@ -1424,19 +1433,54 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     style = normalize_style_preset(video_style_preset)
     is_warm = is_warm_story_style(style)
 
-    for s in scene_objects:
+    # Warm Story AI fallback budget. Default 0.40 means at most 40% scenes can fall back to AI.
+    try:
+        warm_ai_ratio = float(job_config.get("warm_story_ai_fallback_max_ratio", os.getenv("WARM_STORY_AI_FALLBACK_MAX_RATIO", "0.40")))
+    except Exception:
+        warm_ai_ratio = 0.40
+    warm_ai_ratio = max(0.0, min(warm_ai_ratio, 0.40))
+
+    # We allow at least one AI fallback for warm story when there are scenes,
+    # but still keep the total capped at 40%.
+    warm_ai_budget = 0
+    ai_fallback_indexes = set()
+    if is_warm:
+        total = len(scene_objects)
+        warm_ai_budget = int(math.ceil(total * warm_ai_ratio)) if total > 0 else 0
+        warm_ai_budget = max(1 if total >= 3 and warm_ai_ratio > 0 else 0, warm_ai_budget)
+        warm_ai_budget = min(total, warm_ai_budget)
+
+        # Pick the scenes that deserve AI fallback most if stock fails.
+        scored = []
+        for idx, s in enumerate(scene_objects):
+            scored.append((_scene_priority_for_ai(s, idx, total), idx))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        ai_fallback_indexes = {idx for _, idx in scored[:warm_ai_budget]}
+
+    for idx, s in enumerate(scene_objects):
         scene_plan = s.get("scene_plan", {}) or {}
         narration = s.get("voice_text") or s.get("source_chunk") or ""
         is_vertical = (s.get("aspect_ratio") == "9:16")
 
         if is_warm:
-            s["visual_source"] = "ai"
-            s["ai_fallback_allowed"] = True
-            s["routing_reason"] = "warm_storybook_100pct_ai_preserve_full_content"
+            # STOCK-FIRST warm story: video first, image second, AI fallback last.
+            s["visual_source"] = "stock"
+            s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
+            s["prefer_stock_video"] = True
+            s["prefer_pexels_video_first"] = True
+            s["ai_fallback_allowed"] = idx in ai_fallback_indexes
+            s["ai_fallback_max_ratio"] = warm_ai_ratio
+            s["routing_reason"] = (
+                "warm_storybook_stock_first_60_70pct_pexels_video_or_image_"
+                "ai_fallback_only_when_stock_missing_capped_30_40pct"
+            )
         else:
             # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
             # Do not let scene_requires_ai(), scene_is_storytelling(), planner visual_source, or image_source_mode override this.
             s["visual_source"] = "stock"
+            s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
+            s["prefer_stock_video"] = True
+            s["prefer_pexels_video_first"] = True
             s["ai_fallback_allowed"] = False
             s["routing_reason"] = "non_warm_style_stock_only_no_ai_no_scene_reduction"
 
@@ -1444,6 +1488,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
             s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
 
     return scene_objects
+
 
 def create_fast_placeholder_image(out_path: str, width: int, height: int, title: str = "FlozenAI"):
     """Last-resort fast visual so a job never hangs because stock is missing and AI budget is locked."""
@@ -1496,15 +1541,12 @@ def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_
     """
     Final source decision is style-based, not keyword-based.
 
-    - warm_storybook: AI-only for visual consistency.
-    - all other styles: stock/Pexels/local-stock only by default.
-
-    This intentionally ignores scene_requires_ai() for non-Warm styles because that function
-    previously caused lifestyle/cinematic/promo videos to unexpectedly call SDXL and increase cost.
+    UPDATED:
+    - warm_storybook is now STOCK-FIRST, not AI-only.
+    - all styles return "stock" here.
+    - AI is only allowed later as a fallback for selected warm-story scenes when
+      no suitable Pexels/local stock video or image is found.
     """
-    style = normalize_style_preset(video_style_preset)
-    if is_warm_story_style(style):
-        return "ai"
     return "stock"
 
 
@@ -1970,6 +2012,27 @@ def prepare_pexels_video(video_url: str, out_path: str):
         except Exception:
             pass
         return None
+
+def warm_story_allows_ai_fallback(scene_obj: Dict[str, Any]) -> bool:
+    """Return True only when a warm-story scene is inside the limited AI fallback budget.
+
+    Downstream render/asset code can call this after Pexels/local stock video and image fail.
+    """
+    return bool(scene_obj.get("ai_fallback_allowed", False)) and is_warm_story_style(scene_obj.get("video_style_preset", ""))
+
+
+def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
+    """Preferred asset order for downstream rendering.
+
+    Warm Story target: 60%-70% stock/Pexels video/image, max 30%-40% AI image fallback.
+    """
+    order = scene_obj.get("asset_preference_order")
+    if isinstance(order, list) and order:
+        return [str(x) for x in order]
+    if is_warm_story_style(scene_obj.get("video_style_preset", "")):
+        return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
+    return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
+
 
 def is_warm_story_style(video_style_preset: str) -> bool:
     """Return True for Warm Story / storybook styles from frontend."""
@@ -2456,16 +2519,16 @@ def plan_video_with_ai(
 
     target_total_video_sec = _safe_int(job_config.get("target_total_video_sec") or job_config.get("target_total_sec"), 60)
     word_count = len((story_text or "").split())
-    warm_story_ai_full_mode = (locked_style == "warm_storybook")
+    warm_story_stock_first_mode = (locked_style == "warm_storybook")
 
     min_scenes = int(job_config.get("min_scenes", 3) or 3)
     max_scenes = int(job_config.get("max_scenes", 10) or 10)
     min_scenes = max(2, min(min_scenes, 10))
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
-    # Warm Story uses 100% AI visuals, so we reduce cost by asking the planner
-    # to make fewer, richer scenes based on duration/content instead of hard-capping a fixed number.
-    if warm_story_ai_full_mode:
+    # Warm Story is now stock-first, with AI image used only as a limited fallback.
+    # We still keep a balanced scene count so Pexels search/render remains fast.
+    if warm_story_stock_first_mode:
         duration_based = max(4, min(10, int(math.ceil(max(target_total_video_sec, 30) / 16.0))))
         content_based = max(4, min(10, int(math.ceil(max(word_count, 40) / 40.0))))
         smart_warm_max = max(duration_based, content_based)
@@ -2475,17 +2538,20 @@ def plan_video_with_ai(
         max_scenes = max(min_scenes, max_scenes)
 
     warm_story_instruction = ""
-    if warm_story_ai_full_mode:
+    if warm_story_stock_first_mode:
         warm_story_instruction = f"""
-WARM STORYBOOK FULL-AI MODE:
+WARM STORYBOOK STOCK-FIRST MIXED MODE:
 This block applies ONLY when video_style_preset == "warm_storybook". DO NOT apply these rules to other styles.
-- The selected style is warm_storybook, so every scene should use visual_source="ai".
+- The selected style is warm_storybook, but it is NOT full-AI mode anymore.
+- Every warm_storybook scene should set visual_source="stock" in the JSON.
+- The renderer/asset step must try Pexels stock VIDEO first, then Pexels stock PHOTO/image, and use AI image only as fallback when no suitable stock video/photo is found.
+- Target visual mix for warm_storybook: about 60%-70% Pexels/stock video or image, and at most 30%-40% AI image fallback.
 - To control cost and render time, do NOT over-split the story.
 - Create a balanced number of scenes. Do not over-split the story, but do not merge different actions, locations, or emotional turning points into one scene. Each scene should cover one clear story beat, usually 12–18 seconds.
 - HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
 - If preserving the full content requires more scenes than the target range, you may exceed the target range. Completeness is more important than scene count.
-- Each scene may cover a longer narration segment if the visual moment is coherent.
-- Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
+- stock_query is very important for warm_storybook. Make it concrete, searchable, and suitable for Pexels video/photo results.
+- visual_prompt is still required because it will be used only if the stock search fails and the scene is allowed to fall back to AI.
 - Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
 """
 
@@ -2539,7 +2605,7 @@ SCENE PLANNING RULES:
 6. Choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes as a soft target, not a hard cap.
 7. HARD RULE: Preserve 100% of the USER REQUEST content across all narration_text fields. Do not omit endings, examples, dialogue, lessons, calls to action, or any important sentence.
 8. If the script is long, create additional scenes rather than deleting content.
-9. For Warm Story full-AI mode, reduce render cost by merging adjacent narration into richer coherent story beats, but never cut the narration.
+9. For Warm Story stock-first mixed mode, reduce render cost by using strong stock_query values and balanced scene beats, but never cut the narration.
 10. Even if the input is one paragraph, create coherent scenes when the video needs visual progression.
 11. Each scene must represent a different moment, action, camera framing, or visual idea.
 12. Each scene must include narration_text. This is the spoken narration for that scene.
@@ -2614,8 +2680,8 @@ AI IMAGE PROMPT RULES:
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
 VISUAL SOURCE RULES:
-53. STRICT: If video_style_preset == "warm_storybook", every scene must set visual_source="ai".
-54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must set visual_source="stock".
+53. STRICT: If video_style_preset == "warm_storybook", every scene must set visual_source="stock". Warm Story is stock-first: Pexels video first, then Pexels photo/image, then limited AI fallback only when stock is not suitable.
+54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must also set visual_source="stock".
 55. Do NOT mark non-Warm scenes as AI, even if they are spiritual, mystical, ancient, dramatic, cinematic, or hard to find.
 56. For non-Warm styles, stock_query is the main visual instruction. Make stock_query practical, concrete, and searchable in English.
 57. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
@@ -2627,7 +2693,7 @@ VIDEO STRUCTURE RULES:
 61. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-62. For warm_storybook ONLY: use WARM STORYBOOK FULL-AI MODE. visual_source must be "ai" for every scene. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
+62. For warm_storybook ONLY: use WARM STORYBOOK STOCK-FIRST MIXED MODE. visual_source must be "stock" for every scene. Plan strong stock_query values because the renderer should try Pexels video first, then Pexels photo/image, then limited AI fallback only if stock is not suitable. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
 63. For all other styles: visual_source must be "stock" for every scene. Do NOT merge narration to reduce scene count. Keep scene segmentation natural and granular based on the current rough text chunks.
 64. For lifestyle: realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
 65. For cinematic_glow: cinematic but realistic stock photos with soft glow and polished lighting.
@@ -2903,7 +2969,8 @@ def create_adaptive_video_plan(
         )
 
         # Final style-based image routing.
-        # Warm Story is AI-only. Every other style is stock/Pexels/local-stock only.
+        # Warm Story is stock-first: Pexels video -> Pexels image -> limited AI fallback only if stock is missing.
+        # Every other style is stock/Pexels/local-stock only.
         # Do NOT let planner visual_source, scene_requires_ai(), or storytelling keywords override this.
         image_source_mode = get_image_source_mode(job_config)
         raw_visual_source = decide_image_source(
@@ -2930,6 +2997,9 @@ def create_adaptive_video_plan(
             "aspect_ratio": "9:16" if is_vertical else "16:9",
             "video_style_preset": video_style_preset,
             "image_source_mode": image_source_mode,
+            "prefer_stock_video": True,
+            "prefer_pexels_video_first": True,
+            "asset_preference_order": ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"] if is_warm_story_style(video_style_preset) else ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"],
             # Use the full scene narration for subtitles.
             # The renderer below will show only the current sentence/chunk over time,
             # not the full paragraph at once.
