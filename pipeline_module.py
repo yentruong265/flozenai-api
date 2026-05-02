@@ -1385,167 +1385,6 @@ def is_story_mixed_style(video_style_preset: str) -> bool:
 def is_stock_first_style(video_style_preset: str) -> bool:
     return str(video_style_preset or "").strip().lower() in STOCK_FIRST_STYLE_PRESETS
 
-
-
-# ===== Warm Story strict stock quality gate =====
-# These gates apply ONLY to warm_storybook. They prevent weak Pexels matches from
-# being accepted just because the Pexels API returned something. When a warm-story
-# scene is too specific for stock footage/photos, we route it to AI image generation
-# so the scene can match the narration more closely.
-WARM_STORY_MIN_STOCK_MATCHABILITY = float(os.getenv("WARM_STORY_MIN_STOCK_MATCHABILITY", "0.66"))
-WARM_STORY_MIN_PEXELS_VIDEO_MATCH = float(os.getenv("WARM_STORY_MIN_PEXELS_VIDEO_MATCH", "0.72"))
-WARM_STORY_MIN_PEXELS_IMAGE_MATCH = float(os.getenv("WARM_STORY_MIN_PEXELS_IMAGE_MATCH", "0.78"))
-
-# AI cap for warm_storybook only. This prevents the strict quality gate from
-# accidentally routing every scene to AI when a story is very specific.
-# The system still prefers quality, but it keeps a healthy Pexels/stock mix.
-WARM_STORY_TARGET_AI_RATIO = float(os.getenv("WARM_STORY_TARGET_AI_RATIO", "0.35"))
-WARM_STORY_HARD_MAX_AI_RATIO = float(os.getenv("WARM_STORY_HARD_MAX_AI_RATIO", "0.50"))
-
-_WARM_STORY_STOCK_SAFE_TERMS = {
-    "forest", "river", "mountain", "temple", "village", "road", "path", "garden", "sunset", "sunrise",
-    "sky", "cloud", "rain", "sea", "lake", "water", "tree", "flower", "candle", "light", "window",
-    "walking", "sitting", "standing", "praying", "meditation", "silhouette", "hands", "nature", "landscape",
-    "chùa", "rừng", "núi", "suối", "sông", "làng", "đường", "hoa", "nến", "ánh sáng", "thiền", "cầu nguyện",
-}
-
-_WARM_STORY_STOCK_RISK_TERMS = {
-    # Story-specific characters / hard-to-match actions / spiritual-fantasy concepts.
-    "buddha", "monk", "zen master", "ancient", "king", "queen", "prince", "princess", "deity", "dragon",
-    "magic", "heaven", "hell", "karma", "ghost", "spirit", "demon", "myth", "legend", "fantasy",
-    "carrying", "holding two", "two buckets", "shoulder pole", "giving alms", "beggar", "poor woman",
-    "đức phật", "phật", "nhà sư", "thiền sư", "chú tiểu", "cổ trang", "ngày xưa", "vị vua", "hoàng tử",
-    "công chúa", "thần", "quỷ", "ma", "huyền bí", "tâm linh", "nhân quả", "gánh", "đòn gánh", "bình nước",
-}
-
-_WARM_STORY_HARD_ACTION_TERMS = {
-    "carry", "carrying", "hold", "holding", "give", "giving", "receive", "receiving", "open", "opening",
-    "discover", "discovering", "kneel", "kneeling", "bow", "bowing", "cry", "crying", "write", "writing",
-    "cook", "cooking", "sell", "selling", "buy", "buying", "enter", "entering", "rescue", "saving",
-    "gánh", "cầm", "nắm", "trao", "nhận", "mở", "phát hiện", "quỳ", "lạy", "khóc", "viết", "nấu", "bán", "mua", "bước vào", "cứu",
-}
-
-
-def _warm_story_join_scene_text(scene_plan: Dict[str, Any], narration: str = "", stock_query: str = "") -> str:
-    parts = [str(narration or ""), str(stock_query or "")]
-    if isinstance(scene_plan, dict):
-        for key in ["main_subject", "action", "location", "background", "clothing_or_appearance", "appearance", "mood", "time_of_day"]:
-            parts.append(str(scene_plan.get(key, "") or ""))
-        for key in ["must_show", "details", "must_not_show"]:
-            value = scene_plan.get(key, []) or []
-            if isinstance(value, list):
-                parts.extend([str(x) for x in value])
-            else:
-                parts.append(str(value))
-    return " ".join(parts).lower()
-
-
-def _warm_story_list_len(scene_plan: Dict[str, Any], key: str) -> int:
-    value = scene_plan.get(key, []) if isinstance(scene_plan, dict) else []
-    return len(value) if isinstance(value, list) else (1 if str(value or "").strip() else 0)
-
-
-def warm_story_stock_matchability_score(scene_plan: Dict[str, Any], narration: str = "", stock_query: str = "") -> float:
-    """Estimate whether Pexels stock is likely to match a warm-story scene.
-
-    Pexels does not provide reliable semantic match scores. This gate therefore
-    scores the scene itself: generic nature/lifestyle/temple atmosphere can use
-    stock, while highly specific story beats should go to AI.
-    """
-    joined = _warm_story_join_scene_text(scene_plan, narration, stock_query)
-    score = 0.50
-
-    # Good stock candidates: environment, generic actions, mood, nature, exterior temple scenes.
-    safe_hits = sum(1 for term in _WARM_STORY_STOCK_SAFE_TERMS if term in joined)
-    score += min(0.24, safe_hits * 0.035)
-
-    # Risky story-specific terms usually produce poor Pexels matches.
-    risk_hits = sum(1 for term in _WARM_STORY_STOCK_RISK_TERMS if term in joined)
-    score -= min(0.38, risk_hits * 0.07)
-
-    hard_action_hits = sum(1 for term in _WARM_STORY_HARD_ACTION_TERMS if term in joined)
-    must_show_count = _warm_story_list_len(scene_plan, "must_show")
-    details_count = _warm_story_list_len(scene_plan, "details")
-
-    # If an action has required objects, Pexels must be very specific; otherwise AI is safer.
-    if hard_action_hits and must_show_count >= 2:
-        score -= 0.18
-    elif hard_action_hits:
-        score -= 0.08
-
-    # Many required objects/details means the image must be composed precisely.
-    if must_show_count >= 5:
-        score -= 0.10
-    elif must_show_count >= 3:
-        score -= 0.04
-    if details_count >= 5:
-        score -= 0.04
-
-    # Strong concrete stock query helps Pexels, but vague queries should not pass.
-    q_tokens = tokenize_for_match(stock_query)
-    if len(q_tokens) >= 7:
-        score += 0.08
-    elif len(q_tokens) <= 3:
-        score -= 0.12
-
-    # Abstract scenes should not rely on random symbolic stock unless concrete elements are present.
-    if scene_is_abstract(narration, scene_plan) and safe_hits < 2:
-        score -= 0.12
-
-    return round(max(0.0, min(1.0, score)), 3)
-
-
-def warm_story_should_use_stock_first(scene_plan: Dict[str, Any], narration: str = "", stock_query: str = "", min_score: float = None) -> bool:
-    threshold = WARM_STORY_MIN_STOCK_MATCHABILITY if min_score is None else float(min_score)
-    score = warm_story_stock_matchability_score(scene_plan, narration, stock_query)
-    return score >= threshold
-
-
-def apply_warm_story_quality_gate(scene_obj: Dict[str, Any], job_config: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Route a warm-story scene to stock only when stock is likely to match well.
-
-    If the gate fails, route directly to AI image. This is intentional: matching
-    quality is more important than forcing a 60%-70% Pexels ratio.
-    """
-    job_config = job_config or {}
-    if not is_warm_story_style(scene_obj.get("video_style_preset", "")):
-        return scene_obj
-
-    scene_plan = scene_obj.get("scene_plan", {}) or {}
-    narration = scene_obj.get("voice_text") or scene_obj.get("source_chunk") or ""
-    stock_query = scene_obj.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=(scene_obj.get("aspect_ratio") == "9:16"))
-
-    try:
-        min_score = float(job_config.get("warm_story_min_stock_matchability", os.getenv("WARM_STORY_MIN_STOCK_MATCHABILITY", str(WARM_STORY_MIN_STOCK_MATCHABILITY))))
-    except Exception:
-        min_score = WARM_STORY_MIN_STOCK_MATCHABILITY
-
-    score = warm_story_stock_matchability_score(scene_plan, narration, stock_query)
-    scene_obj["warm_story_stock_matchability_score"] = score
-    scene_obj["warm_story_min_stock_matchability"] = min_score
-    scene_obj["warm_story_quality_gate_enabled"] = True
-    scene_obj["min_pexels_video_match"] = WARM_STORY_MIN_PEXELS_VIDEO_MATCH
-    scene_obj["min_pexels_image_match"] = WARM_STORY_MIN_PEXELS_IMAGE_MATCH
-
-    if score >= min_score:
-        scene_obj["visual_source"] = "stock"
-        scene_obj["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
-        scene_obj["prefer_stock_video"] = True
-        scene_obj["prefer_pexels_video_first"] = True
-        scene_obj["ai_fallback_allowed"] = True
-        scene_obj["force_ai_if_stock_low_quality"] = True
-        scene_obj["routing_reason"] = f"warm_story_quality_gate_pass_stock_first_score_{score}"
-    else:
-        # Do not waste time on weak Pexels matches. Generate AI immediately for this story beat.
-        scene_obj["visual_source"] = "ai"
-        scene_obj["asset_preference_order"] = ["ai_image_fallback"]
-        scene_obj["prefer_stock_video"] = False
-        scene_obj["prefer_pexels_video_first"] = False
-        scene_obj["ai_fallback_allowed"] = True
-        scene_obj["force_ai_if_stock_low_quality"] = True
-        scene_obj["routing_reason"] = f"warm_story_quality_gate_fail_force_ai_score_{score}"
-
-    return scene_obj
 def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> float:
     """Score scenes that deserve AI more. Used only for mixed story/spiritual styles."""
     scene_plan = scene_obj.get("scene_plan", {}) or {}
@@ -1571,168 +1410,169 @@ def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> f
         score += 0.8
     return score
 
-def _warm_story_ai_cap_values(job_config: Dict[str, Any] = None, total_scenes: int = 0) -> Dict[str, int]:
-    """Return target and hard AI caps for warm_storybook only.
 
-    target cap is the normal desired AI amount, hard cap is the maximum allowed
-    unless the user explicitly overrides env/config. Defaults:
-    - target: 35%
-    - hard max: 50%
+def _warm_story_pexels_image_score(scene_obj: Dict[str, Any], idx: int, total: int) -> float:
+    """Score warm-story scenes that are most suitable for Pexels image insertion.
+
+    Goal: pick only scenes that are concrete, searchable, and less likely to need AI.
+    We prefer establishing shots, nature/temple/village/object shots, and simple human scenes.
+    We avoid scenes with specific spiritual/fantasy/ancient entities, abstract turning points,
+    complex hand/body actions, or unique props that Pexels is unlikely to match exactly.
     """
-    job_config = job_config or {}
-    total = max(0, int(total_scenes or 0))
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or "")
+    txt = " ".join([
+        narration,
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        str(scene_plan.get("background", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+        " ".join([str(x) for x in (scene_plan.get("must_show", []) or [])]),
+    ]).lower()
 
-    def _read_float(config_key: str, env_key: str, default_value: float) -> float:
-        try:
-            return float(job_config.get(config_key, os.getenv(env_key, str(default_value))))
-        except Exception:
-            return float(default_value)
+    score = 0.0
 
-    target_ratio = _read_float("warm_story_target_ai_ratio", "WARM_STORY_TARGET_AI_RATIO", WARM_STORY_TARGET_AI_RATIO)
-    hard_ratio = _read_float("warm_story_hard_max_ai_ratio", "WARM_STORY_HARD_MAX_AI_RATIO", WARM_STORY_HARD_MAX_AI_RATIO)
+    # Pexels tends to work well for contextual establishing shots.
+    if _has_any_term(txt, {
+        "nature", "forest", "mountain", "river", "stream", "sunrise", "sunset", "sky", "cloud", "rain",
+        "temple", "pagoda", "monastery", "village", "road", "path", "garden", "field", "home", "room",
+        "thiên nhiên", "rừng", "núi", "suối", "sông", "bầu trời", "mây", "mưa", "chùa", "thiền viện",
+        "làng", "con đường", "lối đi", "khu vườn", "cánh đồng", "ngôi nhà", "căn phòng"
+    }):
+        score += 3.0
 
-    target_ratio = max(0.0, min(target_ratio, 0.60))
-    hard_ratio = max(target_ratio, min(max(hard_ratio, 0.0), 0.70))
+    # Simple object / atmosphere scenes are also suitable for stock photos.
+    if _has_any_term(txt, {
+        "candle", "lamp", "book", "bowl", "flower", "lotus", "tea", "door", "window", "table",
+        "nến", "đèn", "sách", "bát", "hoa", "hoa sen", "trà", "cửa", "cửa sổ", "bàn"
+    }):
+        score += 1.4
 
-    target_cap = int(math.ceil(total * target_ratio)) if total else 0
-    hard_cap = int(math.ceil(total * hard_ratio)) if total else 0
+    # Simple human scenes can be okay, but not if the action is too specific.
+    if scene_has_human(scene_plan, narration):
+        score += 0.6
+    else:
+        score += 1.0
 
-    # Keep at least 1 AI slot for stories with >=3 scenes, but never force AI.
-    if total >= 3 and target_ratio > 0:
-        target_cap = max(1, target_cap)
-    if total >= 3 and hard_ratio > 0:
-        hard_cap = max(target_cap, max(1, hard_cap))
+    # Prefer not to place Pexels on the strongest story turning points; AI usually matches better there.
+    if idx == 0:
+        score += 0.6
+    if idx == total - 1:
+        score -= 0.8
 
-    return {
-        "target_ratio": target_ratio,
-        "hard_ratio": hard_ratio,
-        "target_cap": min(total, target_cap),
-        "hard_cap": min(total, hard_cap),
-    }
+    if scene_requires_ai(narration, scene_plan, scene_obj.get("video_style_preset", "")):
+        score -= 5.0
+    if scene_is_abstract(narration, scene_plan):
+        score -= 2.0
+    if scene_has_complex_body_pose(narration, scene_plan):
+        score -= 1.6
+    if _has_any_term(txt, {
+        "turning point", "cao trào", "bước ngoặt", "giác ngộ", "nhận ra", "huyền bí", "mystic",
+        "buddha", "phật", "thiền sư", "nhà sư", "ancient", "cổ trang", "thần", "quỷ", "dragon",
+        "magic", "fantasy", "heaven", "hell", "surreal", "phép màu", "thiêng liêng"
+    }):
+        score -= 2.5
 
+    # Strong must_show lists usually mean the scene needs exact visual matching; AI is safer.
+    must_show = scene_plan.get("must_show", []) or []
+    if isinstance(must_show, list) and len(must_show) >= 5:
+        score -= 0.7
 
-def _warm_story_downgrade_ai_scene_to_stock(scene_obj: Dict[str, Any], reason: str = "ai_cap_rebalance") -> Dict[str, Any]:
-    """Convert a warm-story scene back to strict stock-first mode.
-
-    This is used only when the quality gate would create too many AI scenes.
-    The scene will try Pexels/local video first, then Pexels/local image. AI fallback
-    is disabled for this rebalanced scene to avoid exceeding the cap downstream.
-    """
-    s = dict(scene_obj or {})
-    s["visual_source"] = "stock"
-    s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
-    s["prefer_stock_video"] = True
-    s["prefer_pexels_video_first"] = True
-    s["ai_fallback_allowed"] = False
-    s["force_ai_if_stock_low_quality"] = False
-    s["warm_story_ai_cap_rebalanced"] = True
-    prev = str(s.get("routing_reason", "") or "")
-    s["routing_reason"] = f"{reason}_stock_forced_after_cap" + (f"__prev_{prev}" if prev else "")
-    return s
+    return score
 
 
-def _rebalance_warm_story_ai_cap(scene_objects: List[Dict[str, Any]], job_config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-    """Prevent warm_storybook from becoming 100% AI.
-
-    After the strict quality gate, too many scenes may be routed to AI. This pass
-    keeps the most AI-worthy scenes as AI, then converts the remaining AI scenes
-    back to stock-first until the hard cap is respected.
-    """
-    if not scene_objects:
-        return scene_objects
-
-    total = len(scene_objects)
-    caps = _warm_story_ai_cap_values(job_config=job_config, total_scenes=total)
-    hard_cap = caps["hard_cap"]
-    target_cap = caps["target_cap"]
-
-    ai_indexes = [
-        idx for idx, s in enumerate(scene_objects)
-        if is_warm_story_style(s.get("video_style_preset", "")) and str(s.get("visual_source", "")).lower() == "ai"
-    ]
-
-    for s in scene_objects:
-        if is_warm_story_style(s.get("video_style_preset", "")):
-            s["warm_story_target_ai_ratio"] = caps["target_ratio"]
-            s["warm_story_hard_max_ai_ratio"] = caps["hard_ratio"]
-            s["warm_story_target_ai_cap"] = target_cap
-            s["warm_story_hard_ai_cap"] = hard_cap
-
-    if len(ai_indexes) <= hard_cap:
-        return scene_objects
-
-    # Keep the scenes most deserving of AI: low stock matchability and high AI priority.
-    scored = []
-    for idx in ai_indexes:
-        s = scene_objects[idx]
-        try:
-            match_score = float(s.get("warm_story_stock_matchability_score", 0.0))
-        except Exception:
-            match_score = 0.0
-        ai_priority = _scene_priority_for_ai(s, idx, total)
-        # Higher keep_score = more important to preserve as AI.
-        keep_score = ai_priority + (1.0 - match_score) * 4.0
-        scored.append((keep_score, idx))
-
-    scored.sort(reverse=True)
-    keep_ai = {idx for _, idx in scored[:hard_cap]}
-
-    for idx in ai_indexes:
-        if idx not in keep_ai:
-            scene_objects[idx] = _warm_story_downgrade_ai_scene_to_stock(
-                scene_objects[idx],
-                reason=f"warm_story_ai_hard_cap_{len(ai_indexes)}_to_{hard_cap}"
-            )
-
-    return scene_objects
-
+def _target_count(total: int, ratio: float) -> int:
+    if total <= 0:
+        return 0
+    return max(0, min(total, int(round(total * ratio))))
 
 def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Final routing guardrail for FlozenAI frontend styles.
+    Final hard routing guardrail for FlozenAI frontend styles.
 
-    WARM STORY QUALITY + AI CAP RULE:
-    - Applies ONLY to warm_storybook.
-    - Try Pexels/local stock only when the scene is likely to match well.
-    - If a scene is too story-specific for stock, route it to AI image.
-    - Then apply an AI cap so warm_storybook does not accidentally become 100% AI.
-      Defaults: target AI around 35%, hard max 50%.
-    - If too many scenes are AI, keep the most AI-worthy scenes and convert the
-      rest back to stock-first.
-
-    Other styles remain stock/Pexels/local-stock only by default.
+    UPDATED WARM STORY RULE:
+    - Warm Story / warm_storybook targets 60% AI images + 40% Pexels/local stock images.
+    - Warm Story does NOT use Pexels video in this routing layer, to keep the story visual tone consistent.
+    - The 40% Pexels-image scenes are selected carefully: only concrete, stock-friendly scenes.
+    - If a selected Pexels image scene cannot find a suitable image downstream, AI fallback is allowed.
+    - Every other style remains stock/Pexels/local-stock only by default.
     """
     if not scene_objects:
         return scene_objects
 
-    job_config = job_config or {}
     style = normalize_style_preset(video_style_preset)
     is_warm = is_warm_story_style(style)
+
+    # Tunable ratios via job_config/env, but keep safe defaults for Warm Story.
+    try:
+        warm_ai_ratio = float(job_config.get("warm_story_ai_ratio", os.getenv("WARM_STORY_AI_RATIO", "0.60")))
+    except Exception:
+        warm_ai_ratio = 0.60
+    warm_ai_ratio = max(0.50, min(warm_ai_ratio, 0.75))
+    warm_pexels_ratio = 1.0 - warm_ai_ratio
+
+    try:
+        warm_pexels_min_score = float(job_config.get("warm_story_pexels_scene_min_score", os.getenv("WARM_STORY_PEXELS_SCENE_MIN_SCORE", "1.60")))
+    except Exception:
+        warm_pexels_min_score = 1.60
+
+    pexels_image_indexes = set()
+    if is_warm:
+        total = len(scene_objects)
+        target_pexels_count = _target_count(total, warm_pexels_ratio)
+        # For very short videos, allow at least one Pexels image if there are enough scenes.
+        if total >= 3:
+            target_pexels_count = max(1, target_pexels_count)
+        target_pexels_count = min(total, target_pexels_count)
+
+        scored = []
+        for idx, scene in enumerate(scene_objects):
+            score = _warm_story_pexels_image_score(scene, idx, total)
+            if score >= warm_pexels_min_score:
+                scored.append((score, idx))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        pexels_image_indexes = {idx for _, idx in scored[:target_pexels_count]}
 
     for idx, s in enumerate(scene_objects):
         scene_plan = s.get("scene_plan", {}) or {}
         narration = s.get("voice_text") or s.get("source_chunk") or ""
         is_vertical = (s.get("aspect_ratio") == "9:16")
 
-        if not s.get("stock_query"):
-            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
-
         if is_warm:
-            s["video_style_preset"] = "warm_storybook"
-            s = apply_warm_story_quality_gate(s, job_config=job_config)
+            if idx in pexels_image_indexes:
+                # Warm Story Pexels insertion: image only, not video.
+                s["visual_source"] = "stock"
+                s["asset_preference_order"] = ["pexels_image", "local_stock_image", "ai_image_fallback"]
+                s["prefer_stock_video"] = False
+                s["prefer_pexels_video_first"] = False
+                s["disable_pexels_video"] = True
+                s["warm_story_stock_kind"] = "pexels_image_only"
+                s["ai_fallback_allowed"] = True
+                s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.68"))
+                s["routing_reason"] = "warm_storybook_40pct_strict_pexels_image_insert_with_ai_fallback"
+            else:
+                # Main Warm Story look: AI image for strong scene matching and consistent story tone.
+                s["visual_source"] = "ai"
+                s["asset_preference_order"] = ["ai_image"]
+                s["prefer_stock_video"] = False
+                s["prefer_pexels_video_first"] = False
+                s["disable_pexels_video"] = True
+                s["warm_story_stock_kind"] = "ai_image_primary"
+                s["ai_fallback_allowed"] = True
+                s["routing_reason"] = "warm_storybook_60pct_ai_primary_best_scene_matching"
         else:
+            # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
             s["visual_source"] = "stock"
             s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
             s["prefer_stock_video"] = True
             s["prefer_pexels_video_first"] = True
+            s["disable_pexels_video"] = False
             s["ai_fallback_allowed"] = False
-            s["warm_story_quality_gate_enabled"] = False
             s["routing_reason"] = "non_warm_style_stock_only_no_ai_no_scene_reduction"
 
-        scene_objects[idx] = s
-
-    if is_warm:
-        scene_objects = _rebalance_warm_story_ai_cap(scene_objects, job_config=job_config)
+        if not s.get("stock_query"):
+            s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
 
     return scene_objects
 
@@ -1785,14 +1625,15 @@ def scene_is_storytelling(narration: str, scene_plan: Dict[str, Any], video_styl
 
 def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_preset: str = "", image_source_mode: str = None) -> str:
     """
-    Final source decision is style-based, not keyword-based.
+    Initial style-based source decision.
 
-    UPDATED:
-    - warm_storybook is now STOCK-FIRST, not AI-only.
-    - all styles return "stock" here.
-    - AI is only allowed later as a fallback for selected warm-story scenes when
-      no suitable Pexels/local stock video or image is found.
+    Warm Story final 60% AI / 40% Pexels-image routing is applied later by
+    enforce_frontend_style_visual_budget(). Here we keep warm_storybook as AI by default
+    so that non-selected Pexels scenes still get the strongest visual matching.
     """
+    style = normalize_style_preset(video_style_preset)
+    if is_warm_story_style(style):
+        return "ai"
     return "stock"
 
 
@@ -2069,9 +1910,52 @@ def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
     return out_path
 
 
-def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
+def _score_pexels_candidate(stock_query: str, scene_plan: Dict[str, Any], candidate_text: str) -> float:
+    """Lightweight lexical match score for Pexels/local stock candidates.
+
+    Pexels does not provide true semantic similarity, so this score is intentionally conservative:
+    it rewards overlap with subject/action/location/must_show and penalizes vague candidates.
+    """
+    q_tokens = tokenize_for_match(stock_query or "")
+    candidate_tokens = tokenize_for_match(candidate_text or "")
+
+    required_text = ""
+    if isinstance(scene_plan, dict):
+        required_parts = [
+            scene_plan.get("main_subject", ""),
+            scene_plan.get("action", ""),
+            scene_plan.get("location", ""),
+            scene_plan.get("background", ""),
+            scene_plan.get("time_of_day", ""),
+        ]
+        for arr_name in ["must_show", "details"]:
+            arr = scene_plan.get(arr_name, []) or []
+            if isinstance(arr, list):
+                required_parts.extend([str(x) for x in arr])
+            elif isinstance(arr, str):
+                required_parts.append(arr)
+        required_text = " ".join([str(x) for x in required_parts if str(x).strip()])
+
+    required_tokens = tokenize_for_match(required_text) or q_tokens
+    if not required_tokens:
+        return 0.0
+
+    combined = candidate_tokens | q_tokens
+    overlap = len(required_tokens & combined)
+    base = overlap / max(1, len(required_tokens))
+
+    # Candidate text itself matters more than query echo.
+    direct = len(required_tokens & candidate_tokens) / max(1, len(required_tokens))
+    score = 0.65 * base + 0.35 * direct
+    return round(float(score), 3)
+
+
+def fetch_pexels_photo(stock_query: str, is_vertical: bool = False, scene_plan: Dict[str, Any] = None, min_match_score: float = None):
     """Fetch one suitable Pexels photo URL for stock-friendly scenes.
+
     Returns metadata dict or None. Does not raise.
+    Chooses the best candidate instead of blindly taking the first result.
+    When scene_plan/min_match_score is provided, applies a stricter match gate.
     """
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
@@ -2080,13 +1964,19 @@ def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
     if not query:
         query = "daily life"
 
+    if min_match_score is None:
+        try:
+            min_match_score = float(os.getenv("PEXELS_PHOTO_MIN_MATCH_SCORE", "0.0"))
+        except Exception:
+            min_match_score = 0.0
+
     orientation = "portrait" if is_vertical else "landscape"
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {
         "query": query,
         "orientation": orientation,
-        "per_page": max(1, min(int(PEXELS_PER_PAGE), 20)),
+        "per_page": max(6, min(int(PEXELS_PER_PAGE), 20)),
     }
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=8)
@@ -2098,18 +1988,37 @@ def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
         if not photos:
             return None
 
-        # Prefer larger, non-empty images. Use deterministic first result to reduce randomness.
-        photo = photos[0]
-        src = photo.get("src", {}) or {}
-        image_url = src.get("large2x") or src.get("large") or src.get("original")
-        if not image_url:
+        best = None
+        best_score = -1.0
+        for photo in photos:
+            src = photo.get("src", {}) or {}
+            image_url = src.get("large2x") or src.get("large") or src.get("original")
+            if not image_url:
+                continue
+            candidate_text = " ".join([
+                str(photo.get("alt", "") or ""),
+                str(photo.get("photographer", "") or ""),
+                str(photo.get("url", "") or ""),
+                query,
+            ])
+            score = _score_pexels_candidate(query, scene_plan or {}, candidate_text)
+            if score > best_score:
+                best_score = score
+                best = {
+                    "url": image_url,
+                    "query": query,
+                    "photographer": photo.get("photographer", ""),
+                    "pexels_id": photo.get("id", ""),
+                    "alt": photo.get("alt", ""),
+                    "match_score": score,
+                }
+
+        if not best:
             return None
-        return {
-            "url": image_url,
-            "query": query,
-            "photographer": photo.get("photographer", ""),
-            "pexels_id": photo.get("id", ""),
-        }
+        if float(best.get("match_score", 0.0)) < float(min_match_score):
+            print(f"WARN: Pexels photo rejected score={best.get('match_score')} min={min_match_score} query={query!r}")
+            return None
+        return best
     except Exception as e:
         print("WARN: Pexels fetch failed:", repr(e))
         return None
@@ -2259,42 +2168,30 @@ def prepare_pexels_video(video_url: str, out_path: str):
             pass
         return None
 
-def warm_story_allows_ai_fallback(scene_obj: Dict[str, Any]) -> bool:
-    """Return True when a warm-story scene may use AI.
 
-    Scenes rebalanced by the AI cap have ai_fallback_allowed=False, so they will
-    not silently turn back into AI downstream.
+def warm_story_allows_ai_fallback(scene_obj: Dict[str, Any]) -> bool:
+    """Return True when a warm-story stock image insertion may fall back to AI.
+
+    This supports the rule: use Pexels image only when it is genuinely suitable;
+    otherwise generate an AI image for the best possible scene match.
     """
-    if not is_warm_story_style(scene_obj.get("video_style_preset", "")):
-        return False
-    if bool(scene_obj.get("warm_story_ai_cap_rebalanced", False)):
-        return False
-    return bool(scene_obj.get("ai_fallback_allowed", False)) or str(scene_obj.get("visual_source", "")).lower() == "ai"
+    return bool(scene_obj.get("ai_fallback_allowed", False)) and is_warm_story_style(scene_obj.get("video_style_preset", ""))
 
 
 def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
     """Preferred asset order for downstream rendering.
 
-    Warm Story quality mode:
-    - If visual_source == ai and the scene was not rebalanced by cap, generate AI directly.
-    - If the AI cap rebalanced the scene, keep it stock-only to avoid 100% AI.
-    - Otherwise try Pexels/local video, then Pexels/local image, then AI fallback only when allowed.
+    Warm Story target: 60% AI images + 40% carefully selected Pexels/local stock images.
+    Warm Story deliberately avoids Pexels video here to keep the story visual tone cohesive.
     """
     order = scene_obj.get("asset_preference_order")
     if isinstance(order, list) and order:
         return [str(x) for x in order]
-
     if is_warm_story_style(scene_obj.get("video_style_preset", "")):
-        if bool(scene_obj.get("warm_story_ai_cap_rebalanced", False)):
-            return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
-        if str(scene_obj.get("visual_source", "")).lower() == "ai":
-            return ["ai_image_fallback"]
-        if bool(scene_obj.get("ai_fallback_allowed", False)):
-            return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
-        return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
-
+        if scene_obj.get("visual_source") == "stock":
+            return ["pexels_image", "local_stock_image", "ai_image_fallback"]
+        return ["ai_image"]
     return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
-
 
 def is_warm_story_style(video_style_preset: str) -> bool:
     """Return True for Warm Story / storybook styles from frontend."""
@@ -2781,16 +2678,16 @@ def plan_video_with_ai(
 
     target_total_video_sec = _safe_int(job_config.get("target_total_video_sec") or job_config.get("target_total_sec"), 60)
     word_count = len((story_text or "").split())
-    warm_story_stock_first_mode = (locked_style == "warm_storybook")
+    warm_story_ai_full_mode = (locked_style == "warm_storybook")
 
     min_scenes = int(job_config.get("min_scenes", 3) or 3)
     max_scenes = int(job_config.get("max_scenes", 10) or 10)
     min_scenes = max(2, min(min_scenes, 10))
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
-    # Warm Story is now stock-first, with AI image used only as a limited fallback.
-    # We still keep a balanced scene count so Pexels search/render remains fast.
-    if warm_story_stock_first_mode:
+    # Warm Story uses a hybrid image strategy, so we keep a balanced scene count
+    # and let the final router choose about 60% AI + 40% suitable Pexels images.
+    if warm_story_ai_full_mode:
         duration_based = max(4, min(10, int(math.ceil(max(target_total_video_sec, 30) / 16.0))))
         content_based = max(4, min(10, int(math.ceil(max(word_count, 40) / 40.0))))
         smart_warm_max = max(duration_based, content_based)
@@ -2800,20 +2697,17 @@ def plan_video_with_ai(
         max_scenes = max(min_scenes, max_scenes)
 
     warm_story_instruction = ""
-    if warm_story_stock_first_mode:
+    if warm_story_ai_full_mode:
         warm_story_instruction = f"""
-WARM STORYBOOK STOCK-FIRST MIXED MODE:
+WARM STORYBOOK HYBRID IMAGE MODE:
 This block applies ONLY when video_style_preset == "warm_storybook". DO NOT apply these rules to other styles.
-- The selected style is warm_storybook, but it is NOT full-AI mode anymore.
-- Every warm_storybook scene should set visual_source="stock" in the JSON.
-- The renderer/asset step must try Pexels stock VIDEO first, then Pexels stock PHOTO/image, but only accept stock when the match quality is high. Use AI image when stock is weak or too generic.
-- Target visual mix for warm_storybook: prefer 60%-70% Pexels/stock video or image ONLY when the stock result can match the scene very well. If stock is not likely to match, AI image is required even if AI exceeds 40%.
-- To control cost and render time, do NOT over-split the story.
+- The selected style is warm_storybook, so plan scenes for a hybrid image workflow: about 60% AI images and 40% highly suitable Pexels/stock images. The final router will decide exact routing.
+- To control cost and render time, do NOT over-split the story, but preserve full narration.
 - Create a balanced number of scenes. Do not over-split the story, but do not merge different actions, locations, or emotional turning points into one scene. Each scene should cover one clear story beat, usually 12–18 seconds.
 - HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
 - If preserving the full content requires more scenes than the target range, you may exceed the target range. Completeness is more important than scene count.
-- stock_query is very important for warm_storybook. Make it concrete, searchable, and suitable for Pexels video/photo results.
-- visual_prompt is still required because it will be used only if the stock search fails and the scene is allowed to fall back to AI.
+- Each scene may cover a longer narration segment if the visual moment is coherent.
+- Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
 - Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
 """
 
@@ -2867,7 +2761,7 @@ SCENE PLANNING RULES:
 6. Choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes as a soft target, not a hard cap.
 7. HARD RULE: Preserve 100% of the USER REQUEST content across all narration_text fields. Do not omit endings, examples, dialogue, lessons, calls to action, or any important sentence.
 8. If the script is long, create additional scenes rather than deleting content.
-9. For Warm Story stock-first mixed mode, reduce render cost by using strong stock_query values and balanced scene beats, but never cut the narration.
+9. For Warm Story hybrid image mode, reduce render cost by merging adjacent narration into richer coherent story beats, but never cut the narration.
 10. Even if the input is one paragraph, create coherent scenes when the video needs visual progression.
 11. Each scene must represent a different moment, action, camera framing, or visual idea.
 12. Each scene must include narration_text. This is the spoken narration for that scene.
@@ -2942,8 +2836,8 @@ AI IMAGE PROMPT RULES:
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
 VISUAL SOURCE RULES:
-53. STRICT: If video_style_preset == "warm_storybook", every scene should normally set visual_source="stock" for generic stock-friendly scenes, but story-specific scenes may set visual_source="ai" when Pexels is unlikely to match. This applies ONLY to warm_storybook.
-54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must also set visual_source="stock".
+53. STRICT: If video_style_preset == "warm_storybook", the planner may set visual_source="ai" by default. The final router will convert about 40% of suitable concrete scenes to Pexels/stock image only.
+54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must set visual_source="stock".
 55. Do NOT mark non-Warm scenes as AI, even if they are spiritual, mystical, ancient, dramatic, cinematic, or hard to find.
 56. For non-Warm styles, stock_query is the main visual instruction. Make stock_query practical, concrete, and searchable in English.
 57. Use physically possible scenes. Avoid impossible body poses, floating objects, random symbols, unrelated fantasy elements.
@@ -2955,7 +2849,7 @@ VIDEO STRUCTURE RULES:
 61. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-62. For warm_storybook ONLY: use WARM STORYBOOK QUALITY-GATED MIXED MODE. Prefer stock for generic stock-friendly scenes, but use AI for highly specific story beats, exact character/object actions, Buddhist/mythic/ancient scenes, or scenes where Pexels would likely be generic. Plan strong stock_query values for stock-friendly scenes. Preserve 100% of narration content.
+62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 60% AI images and 40% highly suitable Pexels/stock images. Do not use Pexels video for warm_storybook. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
 63. For all other styles: visual_source must be "stock" for every scene. Do NOT merge narration to reduce scene count. Keep scene segmentation natural and granular based on the current rough text chunks.
 64. For lifestyle: realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
 65. For cinematic_glow: cinematic but realistic stock photos with soft glow and polished lighting.
@@ -3231,8 +3125,7 @@ def create_adaptive_video_plan(
         )
 
         # Final style-based image routing.
-        # Warm Story is stock-first: Pexels video -> Pexels image -> limited AI fallback only if stock is missing.
-        # Every other style is stock/Pexels/local-stock only.
+        # Warm Story is finalized later as about 60% AI images + 40% suitable Pexels images. Every other style is stock/Pexels/local-stock only.
         # Do NOT let planner visual_source, scene_requires_ai(), or storytelling keywords override this.
         image_source_mode = get_image_source_mode(job_config)
         raw_visual_source = decide_image_source(
@@ -3259,9 +3152,6 @@ def create_adaptive_video_plan(
             "aspect_ratio": "9:16" if is_vertical else "16:9",
             "video_style_preset": video_style_preset,
             "image_source_mode": image_source_mode,
-            "prefer_stock_video": True,
-            "prefer_pexels_video_first": True,
-            "asset_preference_order": ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"] if is_warm_story_style(video_style_preset) else ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"],
             # Use the full scene narration for subtitles.
             # The renderer below will show only the current sentence/chunk over time,
             # not the full paragraph at once.
