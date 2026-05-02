@@ -1396,6 +1396,12 @@ WARM_STORY_MIN_STOCK_MATCHABILITY = float(os.getenv("WARM_STORY_MIN_STOCK_MATCHA
 WARM_STORY_MIN_PEXELS_VIDEO_MATCH = float(os.getenv("WARM_STORY_MIN_PEXELS_VIDEO_MATCH", "0.72"))
 WARM_STORY_MIN_PEXELS_IMAGE_MATCH = float(os.getenv("WARM_STORY_MIN_PEXELS_IMAGE_MATCH", "0.78"))
 
+# AI cap for warm_storybook only. This prevents the strict quality gate from
+# accidentally routing every scene to AI when a story is very specific.
+# The system still prefers quality, but it keeps a healthy Pexels/stock mix.
+WARM_STORY_TARGET_AI_RATIO = float(os.getenv("WARM_STORY_TARGET_AI_RATIO", "0.35"))
+WARM_STORY_HARD_MAX_AI_RATIO = float(os.getenv("WARM_STORY_HARD_MAX_AI_RATIO", "0.50"))
+
 _WARM_STORY_STOCK_SAFE_TERMS = {
     "forest", "river", "mountain", "temple", "village", "road", "path", "garden", "sunset", "sunrise",
     "sky", "cloud", "rain", "sea", "lake", "water", "tree", "flower", "candle", "light", "window",
@@ -1565,25 +1571,141 @@ def _scene_priority_for_ai(scene_obj: Dict[str, Any], idx: int, total: int) -> f
         score += 0.8
     return score
 
+def _warm_story_ai_cap_values(job_config: Dict[str, Any] = None, total_scenes: int = 0) -> Dict[str, int]:
+    """Return target and hard AI caps for warm_storybook only.
+
+    target cap is the normal desired AI amount, hard cap is the maximum allowed
+    unless the user explicitly overrides env/config. Defaults:
+    - target: 35%
+    - hard max: 50%
+    """
+    job_config = job_config or {}
+    total = max(0, int(total_scenes or 0))
+
+    def _read_float(config_key: str, env_key: str, default_value: float) -> float:
+        try:
+            return float(job_config.get(config_key, os.getenv(env_key, str(default_value))))
+        except Exception:
+            return float(default_value)
+
+    target_ratio = _read_float("warm_story_target_ai_ratio", "WARM_STORY_TARGET_AI_RATIO", WARM_STORY_TARGET_AI_RATIO)
+    hard_ratio = _read_float("warm_story_hard_max_ai_ratio", "WARM_STORY_HARD_MAX_AI_RATIO", WARM_STORY_HARD_MAX_AI_RATIO)
+
+    target_ratio = max(0.0, min(target_ratio, 0.60))
+    hard_ratio = max(target_ratio, min(max(hard_ratio, 0.0), 0.70))
+
+    target_cap = int(math.ceil(total * target_ratio)) if total else 0
+    hard_cap = int(math.ceil(total * hard_ratio)) if total else 0
+
+    # Keep at least 1 AI slot for stories with >=3 scenes, but never force AI.
+    if total >= 3 and target_ratio > 0:
+        target_cap = max(1, target_cap)
+    if total >= 3 and hard_ratio > 0:
+        hard_cap = max(target_cap, max(1, hard_cap))
+
+    return {
+        "target_ratio": target_ratio,
+        "hard_ratio": hard_ratio,
+        "target_cap": min(total, target_cap),
+        "hard_cap": min(total, hard_cap),
+    }
+
+
+def _warm_story_downgrade_ai_scene_to_stock(scene_obj: Dict[str, Any], reason: str = "ai_cap_rebalance") -> Dict[str, Any]:
+    """Convert a warm-story scene back to strict stock-first mode.
+
+    This is used only when the quality gate would create too many AI scenes.
+    The scene will try Pexels/local video first, then Pexels/local image. AI fallback
+    is disabled for this rebalanced scene to avoid exceeding the cap downstream.
+    """
+    s = dict(scene_obj or {})
+    s["visual_source"] = "stock"
+    s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
+    s["prefer_stock_video"] = True
+    s["prefer_pexels_video_first"] = True
+    s["ai_fallback_allowed"] = False
+    s["force_ai_if_stock_low_quality"] = False
+    s["warm_story_ai_cap_rebalanced"] = True
+    prev = str(s.get("routing_reason", "") or "")
+    s["routing_reason"] = f"{reason}_stock_forced_after_cap" + (f"__prev_{prev}" if prev else "")
+    return s
+
+
+def _rebalance_warm_story_ai_cap(scene_objects: List[Dict[str, Any]], job_config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    """Prevent warm_storybook from becoming 100% AI.
+
+    After the strict quality gate, too many scenes may be routed to AI. This pass
+    keeps the most AI-worthy scenes as AI, then converts the remaining AI scenes
+    back to stock-first until the hard cap is respected.
+    """
+    if not scene_objects:
+        return scene_objects
+
+    total = len(scene_objects)
+    caps = _warm_story_ai_cap_values(job_config=job_config, total_scenes=total)
+    hard_cap = caps["hard_cap"]
+    target_cap = caps["target_cap"]
+
+    ai_indexes = [
+        idx for idx, s in enumerate(scene_objects)
+        if is_warm_story_style(s.get("video_style_preset", "")) and str(s.get("visual_source", "")).lower() == "ai"
+    ]
+
+    for s in scene_objects:
+        if is_warm_story_style(s.get("video_style_preset", "")):
+            s["warm_story_target_ai_ratio"] = caps["target_ratio"]
+            s["warm_story_hard_max_ai_ratio"] = caps["hard_ratio"]
+            s["warm_story_target_ai_cap"] = target_cap
+            s["warm_story_hard_ai_cap"] = hard_cap
+
+    if len(ai_indexes) <= hard_cap:
+        return scene_objects
+
+    # Keep the scenes most deserving of AI: low stock matchability and high AI priority.
+    scored = []
+    for idx in ai_indexes:
+        s = scene_objects[idx]
+        try:
+            match_score = float(s.get("warm_story_stock_matchability_score", 0.0))
+        except Exception:
+            match_score = 0.0
+        ai_priority = _scene_priority_for_ai(s, idx, total)
+        # Higher keep_score = more important to preserve as AI.
+        keep_score = ai_priority + (1.0 - match_score) * 4.0
+        scored.append((keep_score, idx))
+
+    scored.sort(reverse=True)
+    keep_ai = {idx for _, idx in scored[:hard_cap]}
+
+    for idx in ai_indexes:
+        if idx not in keep_ai:
+            scene_objects[idx] = _warm_story_downgrade_ai_scene_to_stock(
+                scene_objects[idx],
+                reason=f"warm_story_ai_hard_cap_{len(ai_indexes)}_to_{hard_cap}"
+            )
+
+    return scene_objects
+
+
 def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], video_style_preset: str, job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Final routing guardrail for FlozenAI frontend styles.
 
-    UPDATED WARM STORY QUALITY RULE:
+    WARM STORY QUALITY + AI CAP RULE:
     - Applies ONLY to warm_storybook.
-    - Warm Story tries stock only when the scene is likely to match very well.
-    - Preferred order when the warm-story quality gate passes:
-        1) Pexels/local stock video
-        2) Pexels/local stock image
-        3) AI image fallback
-    - If a scene is too story-specific for stock, route directly to AI image.
-    - Matching quality is more important than forcing a 60%-70% Pexels ratio.
+    - Try Pexels/local stock only when the scene is likely to match well.
+    - If a scene is too story-specific for stock, route it to AI image.
+    - Then apply an AI cap so warm_storybook does not accidentally become 100% AI.
+      Defaults: target AI around 35%, hard max 50%.
+    - If too many scenes are AI, keep the most AI-worthy scenes and convert the
+      rest back to stock-first.
 
     Other styles remain stock/Pexels/local-stock only by default.
     """
     if not scene_objects:
         return scene_objects
 
+    job_config = job_config or {}
     style = normalize_style_preset(video_style_preset)
     is_warm = is_warm_story_style(style)
 
@@ -1596,12 +1718,9 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
             s["stock_query"] = build_stock_query(narration, scene_plan, is_vertical=is_vertical)
 
         if is_warm:
-            # Warm Story only: strict quality gate. If Pexels is unlikely to match,
-            # force AI for this scene so the visual can follow the exact narration.
             s["video_style_preset"] = "warm_storybook"
             s = apply_warm_story_quality_gate(s, job_config=job_config)
         else:
-            # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
             s["visual_source"] = "stock"
             s["asset_preference_order"] = ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
             s["prefer_stock_video"] = True
@@ -1611,6 +1730,9 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
             s["routing_reason"] = "non_warm_style_stock_only_no_ai_no_scene_reduction"
 
         scene_objects[idx] = s
+
+    if is_warm:
+        scene_objects = _rebalance_warm_story_ai_cap(scene_objects, job_config=job_config)
 
     return scene_objects
 
@@ -2138,10 +2260,14 @@ def prepare_pexels_video(video_url: str, out_path: str):
         return None
 
 def warm_story_allows_ai_fallback(scene_obj: Dict[str, Any]) -> bool:
-    """Return True when a warm-story scene may use AI after stock fails,
-    or when the quality gate already forced AI for the scene.
+    """Return True when a warm-story scene may use AI.
+
+    Scenes rebalanced by the AI cap have ai_fallback_allowed=False, so they will
+    not silently turn back into AI downstream.
     """
     if not is_warm_story_style(scene_obj.get("video_style_preset", "")):
+        return False
+    if bool(scene_obj.get("warm_story_ai_cap_rebalanced", False)):
         return False
     return bool(scene_obj.get("ai_fallback_allowed", False)) or str(scene_obj.get("visual_source", "")).lower() == "ai"
 
@@ -2150,16 +2276,23 @@ def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
     """Preferred asset order for downstream rendering.
 
     Warm Story quality mode:
-    - If visual_source == ai, generate AI image directly.
-    - Otherwise try Pexels/local video, then Pexels/local image, then AI fallback.
+    - If visual_source == ai and the scene was not rebalanced by cap, generate AI directly.
+    - If the AI cap rebalanced the scene, keep it stock-only to avoid 100% AI.
+    - Otherwise try Pexels/local video, then Pexels/local image, then AI fallback only when allowed.
     """
     order = scene_obj.get("asset_preference_order")
     if isinstance(order, list) and order:
         return [str(x) for x in order]
+
     if is_warm_story_style(scene_obj.get("video_style_preset", "")):
+        if bool(scene_obj.get("warm_story_ai_cap_rebalanced", False)):
+            return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
         if str(scene_obj.get("visual_source", "")).lower() == "ai":
             return ["ai_image_fallback"]
-        return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
+        if bool(scene_obj.get("ai_fallback_allowed", False)):
+            return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image", "ai_image_fallback"]
+        return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
+
     return ["pexels_video", "local_stock_video", "pexels_image", "local_stock_image"]
 
 
