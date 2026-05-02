@@ -240,6 +240,36 @@ def normalize_job_config(job_config, fallback_job_id=None):
     if width <= 0 or height <= 0:
         width, height = default_w, default_h
 
+    # ===== Short vertical video defaults =====
+    # For 9:16 short-form videos (TikTok/Reels/Shorts), default to faster pacing:
+    # - faster narration
+    # - fewer words per scene => more scenes
+    # - shorter scene duration cap
+    # These are only defaults. Frontend/job_config can still override each value.
+    short_vertical_max_sec = _clamp_int(os.getenv("SHORT_VERTICAL_MAX_SEC", 90), 90, min_value=15, max_value=300)
+    duration_mode_lower = str(duration_mode or "").strip().lower()
+    vertical_fast_keywords = {"short", "shorts", "reels", "tiktok", "fast", "compact", "nhanh", "ngắn"}
+    is_short_vertical_video = (
+        aspect_ratio == "9:16"
+        and (
+            target_total_video_sec is None
+            or int(target_total_video_sec or 0) <= short_vertical_max_sec
+            or duration_mode_lower in vertical_fast_keywords
+            or video_length_mode.lower() in vertical_fast_keywords
+        )
+    )
+
+    if is_short_vertical_video:
+        default_duration_per_scene = _clamp_float(os.getenv("SHORT_9_16_DURATION_PER_SCENE", 2.2), 2.2, min_value=0.8, max_value=8.0)
+        default_target_words_per_scene = _clamp_int(os.getenv("SHORT_9_16_TARGET_WORDS_PER_SCENE", 22), 22, min_value=8, max_value=60)
+        default_max_scene_duration = _clamp_float(os.getenv("SHORT_9_16_MAX_SCENE_DURATION", 4.0), 4.0, min_value=2.0, max_value=12.0)
+        default_speech_speed = _clamp_float(os.getenv("SHORT_9_16_SPEECH_SPEED", 1.25), 1.25, min_value=0.9, max_value=1.45)
+    else:
+        default_duration_per_scene = 3.0
+        default_target_words_per_scene = 40
+        default_max_scene_duration = 12.0
+        default_speech_speed = 1.18
+
     normalized = {
         "job_id": job_id,
         "job_type": _safe_str(job_config.get("job_type"), "text_to_video"),
@@ -253,13 +283,14 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "height": height,
         "fps": fps,
 
-        "duration_per_scene": _clamp_float(job_config.get("duration_per_scene"), 3.0, min_value=0.5, max_value=20.0),
-        "target_words_per_scene": _clamp_int(job_config.get("target_words_per_scene"), 40, min_value=8, max_value=120),
+        "duration_per_scene": _clamp_float(job_config.get("duration_per_scene"), default_duration_per_scene, min_value=0.5, max_value=20.0),
+        "target_words_per_scene": _clamp_int(job_config.get("target_words_per_scene"), default_target_words_per_scene, min_value=8, max_value=120),
         "target_total_sec": target_total_sec,
         "target_total_video_sec": target_total_video_sec,
-        "max_scene_duration": _clamp_float(job_config.get("max_scene_duration"), 12.0, min_value=2.0, max_value=30.0),
+        "max_scene_duration": _clamp_float(job_config.get("max_scene_duration"), default_max_scene_duration, min_value=2.0, max_value=30.0),
         "duration_mode": duration_mode,
         "video_length_mode": video_length_mode,
+        "is_short_vertical_video": is_short_vertical_video,
 
         # style
         "style": style,
@@ -275,7 +306,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # tts controls
         "tts_rate": _safe_str(job_config.get("tts_rate"), "+0%"),
         "tts_pitch": _safe_str(job_config.get("tts_pitch"), "+0Hz"),
-        "speech_speed": _clamp_float(job_config.get("speech_speed"), 1.18, min_value=0.7, max_value=1.45),
+        "speech_speed": _clamp_float(job_config.get("speech_speed"), default_speech_speed, min_value=0.7, max_value=1.45),
         "trim_audio_start": _clamp_float(job_config.get("trim_audio_start"), 0.03, min_value=0.0, max_value=0.5),
         "trim_audio_end": _clamp_float(job_config.get("trim_audio_end"), 0.16, min_value=0.0, max_value=0.8),
 
@@ -329,7 +360,37 @@ ENABLE_STOCK_ASSETS = os.getenv("ENABLE_STOCK_ASSETS", "1").strip().lower() in {
 ENABLE_STOCK_FETCH = os.getenv("ENABLE_STOCK_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "10"))
+PEXELS_CACHE_TTL_HOURS = float(os.getenv("PEXELS_CACHE_TTL_HOURS", "24"))
+PEXELS_MIN_MATCH_SCORE = float(os.getenv("PEXELS_MIN_MATCH_SCORE", "0.20"))
 STOCK_MIN_MATCH_SCORE = float(os.getenv("STOCK_MIN_MATCH_SCORE", "0.18"))
+
+# Pixabay is mainly used to improve Warm Story with animation/storytelling videos.
+# It is free but rate-limited; API responses must be cached for at least 24 hours.
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
+ENABLE_PIXABAY_FETCH = os.getenv("ENABLE_PIXABAY_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}
+ENABLE_PIXABAY_VIDEO_FETCH = os.getenv("ENABLE_PIXABAY_VIDEO_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}
+ENABLE_PIXABAY_IMAGE_FETCH = os.getenv("ENABLE_PIXABAY_IMAGE_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}
+PIXABAY_PER_PAGE = int(os.getenv("PIXABAY_PER_PAGE", "20"))
+PIXABAY_MIN_MATCH_SCORE = float(os.getenv("PIXABAY_MIN_MATCH_SCORE", "0.18"))
+PIXABAY_CACHE_TTL_HOURS = float(os.getenv("PIXABAY_CACHE_TTL_HOURS", "24"))
+STOCK_CACHE_DIR = os.getenv("STOCK_CACHE_DIR", os.path.join(os.getenv("JOB_ROOT", "/tmp/easyai_jobs"), "cache")).strip()
+STOCK_VIDEO_CACHE_DIR = os.getenv("STOCK_VIDEO_CACHE_DIR", os.path.join(os.getenv("JOB_ROOT", "/tmp/easyai_jobs"), "video_cache")).strip()
+STOCK_IMAGE_CACHE_DIR = os.getenv("STOCK_IMAGE_CACHE_DIR", os.path.join(os.getenv("JOB_ROOT", "/tmp/easyai_jobs"), "image_cache")).strip()
+
+# Optional persistent stock cache on Cloudflare R2.
+# Local cache is still used for fast rendering; R2 makes the cache survive RunPod restarts.
+ENABLE_R2_STOCK_CACHE = os.getenv("ENABLE_R2_STOCK_CACHE", "0").strip().lower() in {"1", "true", "yes", "y"}
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET_NAME = (os.getenv("R2_BUCKET_NAME", "") or os.getenv("R2_BUCKET", "")).strip()
+R2_STOCK_CACHE_PREFIX = os.getenv("R2_STOCK_CACHE_PREFIX", "stock-cache").strip().strip("/")
+R2_CACHE_UPLOAD_MEDIA = os.getenv("R2_CACHE_UPLOAD_MEDIA", "1").strip().lower() in {"1", "true", "yes", "y"}
+R2_CACHE_UPLOAD_METADATA = os.getenv("R2_CACHE_UPLOAD_METADATA", "1").strip().lower() in {"1", "true", "yes", "y"}
+DISABLE_LOCAL_CACHE = os.getenv("DISABLE_LOCAL_CACHE", "1").strip().lower() in {"1", "true", "yes", "y"}
+CLEAN_TMP_AFTER_JOB = os.getenv("CLEAN_TMP_AFTER_JOB", "1").strip().lower() in {"1", "true", "yes", "y"}
+_R2_CLIENT = None
+
 
 # Smart image routing mode:
 # smart = best default; stock_first = fastest; ai_first = best for storytelling
@@ -343,6 +404,281 @@ DEFAULT_NEGATIVE_PROMPT = (
     "oversaturated, flat lighting, plastic skin, unrealistic skin, uncanny face, "
     "cartoon, anime, illustration, painting, storybook, 2d, vector art"
 )
+
+
+
+# ===== R2 persistent stock cache helpers =====
+def _r2_stock_cache_ready() -> bool:
+    return bool(
+        ENABLE_R2_STOCK_CACHE
+        and R2_ACCOUNT_ID
+        and R2_ACCESS_KEY_ID
+        and R2_SECRET_ACCESS_KEY
+        and R2_BUCKET_NAME
+    )
+
+
+def _get_r2_client():
+    """Lazy-create an S3-compatible Cloudflare R2 client."""
+    global _R2_CLIENT
+    if _R2_CLIENT is not None:
+        return _R2_CLIENT
+    if not _r2_stock_cache_ready():
+        return None
+    try:
+        import boto3
+        _R2_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+        return _R2_CLIENT
+    except Exception as e:
+        print("WARN: could not initialize R2 client:", repr(e))
+        _R2_CLIENT = None
+        return None
+
+
+def _r2_key(*parts) -> str:
+    clean = []
+    if R2_STOCK_CACHE_PREFIX:
+        clean.append(R2_STOCK_CACHE_PREFIX)
+    for part in parts:
+        p = str(part or "").strip().strip("/")
+        if p:
+            clean.append(p)
+    return "/".join(clean)
+
+
+def _guess_content_type(path: str) -> str:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in {".json"}:
+        return "application/json; charset=utf-8"
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if ext in {".png"}:
+        return "image/png"
+    if ext in {".webp"}:
+        return "image/webp"
+    if ext in {".mp4"}:
+        return "video/mp4"
+    if ext in {".mov"}:
+        return "video/quicktime"
+    return "application/octet-stream"
+
+
+def _r2_download_file(key: str, local_path: str) -> str:
+    client = _get_r2_client()
+    if client is None or not key or not local_path:
+        return None
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        client.download_file(R2_BUCKET_NAME, key, local_path)
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return local_path
+    except Exception as e:
+        print("INFO: R2 cache miss/download skipped:", key, repr(e))
+    return None
+
+
+def _r2_upload_file(local_path: str, key: str, content_type: str = None) -> bool:
+    client = _get_r2_client()
+    if client is None or not key or not local_path or not os.path.exists(local_path):
+        return False
+    try:
+        extra_args = {"ContentType": content_type or _guess_content_type(local_path)}
+        client.upload_file(local_path, R2_BUCKET_NAME, key, ExtraArgs=extra_args)
+        return True
+    except Exception as e:
+        print("WARN: R2 upload failed:", key, repr(e))
+        return False
+
+
+def _r2_download_json(key: str):
+    client = _get_r2_client()
+    if client is None or not key:
+        return None
+    try:
+        obj = client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        raw = obj["Body"].read().decode("utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        print("INFO: R2 json cache miss/download skipped:", key, repr(e))
+        return None
+
+
+def _r2_upload_json(data: dict, key: str) -> bool:
+    client = _get_r2_client()
+    if client is None or not key or not isinstance(data, dict):
+        return False
+    try:
+        raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=raw,
+            ContentType="application/json; charset=utf-8",
+        )
+        return True
+    except Exception as e:
+        print("WARN: R2 json upload failed:", key, repr(e))
+        return False
+
+
+def _stock_api_cache_r2_key() -> str:
+    return _r2_key("metadata", "stock_api_cache.json")
+
+
+def _stock_video_r2_key(filename: str) -> str:
+    return _r2_key("video", os.path.basename(filename))
+
+
+def _stock_image_r2_key(filename: str) -> str:
+    return _r2_key("image", os.path.basename(filename))
+
+
+# ===== Stock API cache helpers =====
+# Cache saves API responses by source/query/orientation so repeated scenes do not call APIs again.
+# Pixabay requires caching for at least 24 hours; this also makes rendering faster and more stable.
+_STOCK_API_CACHE = None
+
+
+def _ensure_stock_cache_dirs():
+    for d in [STOCK_CACHE_DIR, STOCK_VIDEO_CACHE_DIR, STOCK_IMAGE_CACHE_DIR]:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            print("WARN: could not create stock cache dir:", d, repr(e))
+
+
+def _stock_cache_file():
+    _ensure_stock_cache_dirs()
+    return os.path.join(STOCK_CACHE_DIR, "stock_api_cache.json")
+
+
+def _load_stock_api_cache():
+    global _STOCK_API_CACHE
+    if isinstance(_STOCK_API_CACHE, dict):
+        return _STOCK_API_CACHE
+
+    path = _stock_cache_file()
+
+    # Serverless/R2-first mode: restore metadata from R2, not from local long-term cache.
+    if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_METADATA:
+        data = _r2_download_json(_stock_api_cache_r2_key())
+        if isinstance(data, dict):
+            _STOCK_API_CACHE = data
+            if not DISABLE_LOCAL_CACHE:
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print("WARN: could not write restored local stock API cache:", repr(e))
+            return _STOCK_API_CACHE
+
+    # Optional local fallback only when explicitly enabled.
+    if not DISABLE_LOCAL_CACHE:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    _STOCK_API_CACHE = data
+                    return _STOCK_API_CACHE
+        except Exception as e:
+            print("WARN: could not load local stock API cache:", repr(e))
+
+    _STOCK_API_CACHE = {}
+    return _STOCK_API_CACHE
+
+
+def _save_stock_api_cache():
+    cache = _load_stock_api_cache()
+
+    # In serverless/R2-first mode, do not persist API cache to RunPod local disk.
+    if not DISABLE_LOCAL_CACHE:
+        path = _stock_cache_file()
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            print("WARN: could not save local stock API cache:", repr(e))
+
+    # Persist metadata cache to R2 so new/restarted RunPod workers reuse it.
+    if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_METADATA:
+        _r2_upload_json(cache, _stock_api_cache_r2_key())
+
+
+def _cache_key(source: str, kind: str, query: str, is_vertical: bool = False):
+    q = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    orient = "vertical" if is_vertical else "landscape"
+    return f"{source}:{kind}:{orient}:{q}"
+
+
+def _cache_get(source: str, kind: str, query: str, is_vertical: bool = False, ttl_hours: float = 24.0):
+    cache = _load_stock_api_cache()
+    key = _cache_key(source, kind, query, is_vertical)
+    item = cache.get(key)
+    if not isinstance(item, dict):
+        return None
+    try:
+        created = float(item.get("created_ts", 0) or 0)
+        ttl = max(1.0, float(ttl_hours or 24.0)) * 3600.0
+        if time.time() - created > ttl:
+            return None
+        return item.get("value")
+    except Exception:
+        return None
+
+
+def _cache_set(source: str, kind: str, query: str, is_vertical: bool, value, ttl_hours: float = 24.0):
+    cache = _load_stock_api_cache()
+    key = _cache_key(source, kind, query, is_vertical)
+    cache[key] = {
+        "created_ts": time.time(),
+        "ttl_hours": float(ttl_hours or 24.0),
+        "value": value,
+    }
+    _save_stock_api_cache()
+    return value
+
+
+def _slugify_for_cache(text: str, max_len: int = 90):
+    s = re.sub(r"[^0-9a-zA-Z]+", "_", str(text or "").lower()).strip("_")
+    if not s:
+        s = "asset"
+    return s[:max_len]
+
+
+def _download_url_to_file(url: str, out_path: str, timeout: int = 45):
+    if not url:
+        return None
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+        return out_path
+    try:
+        with requests.get(url, timeout=timeout, stream=True) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 512):
+                    if chunk:
+                        f.write(chunk)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+            return out_path
+    except Exception as e:
+        print("WARN: download failed:", repr(e), "url=", url)
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+    return None
 
 
 def free_memory():
@@ -1426,9 +1762,12 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         is_vertical = (s.get("aspect_ratio") == "9:16")
 
         if is_warm:
-            s["visual_source"] = "ai"
+            # Warm Story is now hybrid to reduce AI-image cost and improve liveliness:
+            # local animation/story video -> Pixabay animation video -> Pixabay illustration/image -> AI image fallback.
+            s["visual_source"] = "warm_story_hybrid"
             s["ai_fallback_allowed"] = True
-            s["routing_reason"] = "warm_storybook_100pct_ai_preserve_full_content"
+            s["routing_reason"] = "warm_storybook_pixabay_animation_then_ai_fallback"
+            s["pixabay_query"] = s.get("pixabay_query") or build_warm_story_pixabay_query(narration, scene_plan, is_vertical=is_vertical)
         else:
             # Hard lock: all non-Warm styles use stock/Pexels/local-stock only.
             # Do not let scene_requires_ai(), scene_is_storytelling(), planner visual_source, or image_source_mode override this.
@@ -1501,7 +1840,7 @@ def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_
     """
     style = normalize_style_preset(video_style_preset)
     if is_warm_story_style(style):
-        return "ai"
+        return "warm_story_hybrid"
     return "stock"
 
 
@@ -1616,78 +1955,256 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
     return _has_any_term(joined, _STOCK_FRIENDLY_WORDS) or not scene_is_abstract(narration, scene_plan)
 
 
+
+
+# ===== Production scene matching helpers (optimized) =====
+# These helpers improve stock matching without replacing the full pipeline.
+# Pexels remains API-first (fresh search first, then save cache); Pixabay remains cache-first.
+
+_STOCK_STOPWORDS = {
+    "the", "and", "for", "with", "from", "into", "onto", "this", "that", "these", "those",
+    "video", "scene", "image", "photo", "stock", "realistic", "cinematic", "landscape", "vertical",
+    "horizontal", "portrait", "high", "quality", "beautiful", "professional", "natural", "soft",
+    "một", "những", "người", "trong", "ngoài", "của", "với", "cho", "được", "không", "rằng", "này", "kia",
+}
+
+_VI_EN_PHRASE_MAP = {
+    # people / roles
+    "đức phật": "buddha spiritual teacher human monk",
+    "phật": "buddha monk spiritual teacher",
+    "nhà sư": "monk",
+    "thiền sư": "zen master monk",
+    "chú tiểu": "young monk novice monk",
+    "ông lão": "old man",
+    "bà lão": "old woman",
+    "người đàn ông": "man",
+    "người phụ nữ": "woman",
+    "cậu bé": "boy child",
+    "cô gái": "girl young woman",
+    "đứa trẻ": "child",
+    # actions
+    "thức dậy": "waking up morning bed",
+    "ngủ dậy": "waking up morning bed",
+    "đi bộ": "walking",
+    "bước đi": "walking steps",
+    "chạy bộ": "running jogging",
+    "ngồi suy nghĩ": "sitting thinking",
+    "suy nghĩ": "thinking serious face",
+    "mỉm cười": "smiling face gentle smile",
+    "khóc": "crying tears sad",
+    "cười": "laughing smiling",
+    "cầm": "holding",
+    "gánh nước": "carrying water buckets shoulder pole",
+    "nói chuyện": "talking conversation",
+    "lắng nghe": "listening conversation",
+    "cầu nguyện": "praying",
+    "thiền": "meditation meditating",
+    "đọc sách": "reading book",
+    "làm việc": "working office",
+    "uống cà phê": "drinking coffee",
+    # objects / places
+    "đồng hồ": "alarm clock",
+    "điện thoại": "smartphone mobile phone",
+    "bình nước": "water bucket water jar",
+    "con suối": "stream river nature",
+    "ngôi chùa": "temple pagoda monastery",
+    "chùa": "temple pagoda monastery",
+    "khu rừng": "forest",
+    "rừng": "forest",
+    "làng": "village",
+    "ngọn núi": "mountain",
+    "buổi sáng": "morning sunlight",
+    "bình minh": "sunrise morning",
+    "ban đêm": "night",
+    "hoàng hôn": "sunset",
+}
+
+_ACTION_BOOSTS = [
+    (["wake", "waking", "thức dậy", "ngủ dậy"], "waking up in bed morning sunlight alarm clock bedside"),
+    (["alarm", "clock", "đồng hồ"], "alarm clock on bedside table morning"),
+    (["walk", "walking", "đi bộ", "bước đi"], "walking movement full body outdoor"),
+    (["run", "running", "chạy"], "running movement outdoor"),
+    (["think", "thinking", "suy nghĩ"], "person thinking serious face sitting"),
+    (["talk", "conversation", "nói chuyện", "trò chuyện"], "two people talking conversation"),
+    (["listen", "listening", "lắng nghe"], "person listening conversation"),
+    (["smile", "smiling", "mỉm cười"], "gentle smiling face"),
+    (["cry", "crying", "khóc"], "crying tears emotional face"),
+    (["meditat", "thiền"], "meditation calm peaceful"),
+    (["pray", "praying", "cầu nguyện"], "praying hands spiritual"),
+    (["carry", "holding", "cầm", "gánh"], "person holding carrying object"),
+]
+
+_GENERIC_BAD_TERMS = {
+    "background", "abstract", "texture", "wallpaper", "pattern", "empty", "generic", "blur", "bokeh",
+    "logo", "icon", "symbol", "template", "green screen", "mockup"
+}
+
+_WARM_STORY_STYLE_TERMS = {
+    "animation", "cartoon", "illustration", "story", "storytelling", "fairy", "children", "fantasy",
+    "2d", "animated", "storybook", "tale", "village", "monk", "temple"
+}
+
+def _translate_vi_phrases_for_stock(text: str) -> str:
+    s = str(text or "").lower()
+    additions = []
+    for vi, en in _VI_EN_PHRASE_MAP.items():
+        if vi in s:
+            additions.append(en)
+    return (str(text or "") + " " + " ".join(additions)).strip()
+
+
+def _clean_stock_text(text: str) -> str:
+    text = _translate_vi_phrases_for_stock(text)
+    text = re.sub(r"[^0-9a-zA-Z\s\-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _tokens_for_stock(text: str):
+    cleaned = _clean_stock_text(text)
+    toks = []
+    for w in cleaned.split():
+        if len(w) < 3:
+            continue
+        if w in _STOCK_STOPWORDS:
+            continue
+        toks.append(w)
+    return toks
+
+
+def _field_text(scene_plan: Dict[str, Any], name: str, max_words: int = 8) -> str:
+    value = scene_plan.get(name, "") if isinstance(scene_plan, dict) else ""
+    if isinstance(value, list):
+        value = " ".join([str(x) for x in value[:5]])
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
+    if not value:
+        return ""
+    return " ".join(value.split()[:max_words])
+
+
+def _extract_object_terms(scene_plan: Dict[str, Any], narration: str = "", limit: int = 5) -> List[str]:
+    objects = []
+    if isinstance(scene_plan, dict):
+        for key in ["must_show", "details", "objects", "props", "visual_objects", "key_objects"]:
+            arr = scene_plan.get(key, [])
+            if isinstance(arr, str):
+                arr = [arr]
+            if isinstance(arr, list):
+                for x in arr:
+                    x = re.sub(r"\s+", " ", str(x or "")).strip(" ,.;:")
+                    if x and len(x.split()) <= 6:
+                        objects.append(x)
+    # derive a few common objects from narration even if planner omitted them
+    joined = str(narration or "").lower()
+    for vi, en in _VI_EN_PHRASE_MAP.items():
+        if vi in joined and en not in objects:
+            # only object-ish phrases are useful here; keep short
+            if any(k in en for k in ["clock", "phone", "bucket", "stream", "temple", "forest", "village", "book", "coffee"]):
+                objects.append(en)
+    # de-duplicate while preserving order
+    seen, out = set(), []
+    for obj in objects:
+        k = _clean_stock_text(obj)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(obj)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _boost_query_by_action(query: str, narration: str = "") -> str:
+    joined = (str(query or "") + " " + str(narration or "")).lower()
+    boosts = []
+    for keys, phrase in _ACTION_BOOSTS:
+        if any(k in joined for k in keys):
+            boosts.append(phrase)
+    return (str(query or "") + " " + " ".join(boosts)).strip()
+
+
+def _dedupe_words(text: str, max_words: int = 24) -> str:
+    toks = _tokens_for_stock(text)
+    out, seen = [], set()
+    for t in toks:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+        if len(out) >= max_words:
+            break
+    return " ".join(out)
+
+
+def _stock_query_variants(query: str, is_vertical: bool = False, warm_story: bool = False) -> List[str]:
+    """Return multiple query variants from strict to broad. First item is primary."""
+    base = _dedupe_words(query, max_words=24)
+    variants = []
+    if warm_story:
+        variants.append(_dedupe_words(base + " cartoon animation storytelling", max_words=24))
+        variants.append(_dedupe_words(base + " illustration storybook animation", max_words=22))
+    else:
+        variants.append(base)
+        variants.append(_dedupe_words(base + " realistic stock footage", max_words=22))
+    # broader fallback: remove last 1/3 tokens
+    toks = base.split()
+    if len(toks) > 8:
+        variants.append(" ".join(toks[: max(6, int(len(toks) * 0.65))]))
+    variants.append(_dedupe_words(("cartoon animation storytelling" if warm_story else "realistic daily life people"), max_words=10))
+    suffix = "vertical" if is_vertical else "landscape"
+    clean = []
+    seen = set()
+    for v in variants:
+        v = _dedupe_words(v + " " + suffix, max_words=24)
+        if v and v not in seen:
+            clean.append(v)
+            seen.add(v)
+    return clean
+
+
+# _score_stock_result is defined above in Production scene matching helpers.
+
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    """Build a practical Pippit-style stock search query.
+    """Build a stronger stock query for Pexels/local stock.
 
-    Principle:
-    - Do NOT hard-code specific stories.
-    - Prefer the AI planner's structured visual fields.
-    - Query must be short, concrete, English-friendly, and useful for Pexels/local stock.
+    It uses planner fields but also enriches Vietnamese concepts into English,
+    adds action/object/context, and avoids generic abstract words.
     """
-    def _field(name, max_words=8):
-        value = scene_plan.get(name, "") if isinstance(scene_plan, dict) else ""
-        if isinstance(value, list):
-            value = " ".join([str(x) for x in value[:4]])
-        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
-        if not value:
-            return ""
-        words = value.split()
-        return " ".join(words[:max_words])
+    subject = _field_text(scene_plan, "main_subject", 7)
+    action = _field_text(scene_plan, "action", 8)
+    location = _field_text(scene_plan, "location", 7)
+    background = _field_text(scene_plan, "background", 6)
+    time_of_day = _field_text(scene_plan, "time_of_day", 3)
+    mood = _field_text(scene_plan, "mood", 4)
+    visual_entity_type = _field_text(scene_plan, "visual_entity_type", 3)
 
-    subject = _field("main_subject", 7)
-    action = _field("action", 8)
-    location = _field("location", 7)
-    background = _field("background", 6)
-    time_of_day = _field("time_of_day", 3)
-    mood = _field("mood", 4)
+    objects = _extract_object_terms(scene_plan, narration, limit=4)
 
-    must_show = scene_plan.get("must_show", []) if isinstance(scene_plan, dict) else []
-    details = scene_plan.get("details", []) if isinstance(scene_plan, dict) else []
-
-    object_terms = []
-    for arr in [must_show, details]:
-        if isinstance(arr, list):
-            for x in arr[:5]:
-                x = re.sub(r"\s+", " ", str(x or "")).strip(" ,.;:")
-                if x and len(x.split()) <= 5:
-                    object_terms.append(x)
-
-    # Keep only a few concrete elements so Pexels search stays effective.
-    object_text = " ".join(object_terms[:3])
-
-    # Fallback to narration only if planner fields are weak.
     narration_short = ""
-    if not any([subject, action, location, object_text]):
-        narration_short = shorten_prompt_for_sdxl(narration or "daily life", max_chars=90, max_words=14)
+    if not any([subject, action, location, background, objects]):
+        narration_short = shorten_prompt_for_sdxl(narration or "daily life", max_chars=100, max_words=16)
 
-    query_parts = [
+    raw = " ".join([
         subject,
         action,
-        object_text,
+        " ".join(objects),
         location or background,
         time_of_day,
         mood,
+        visual_entity_type,
         narration_short,
-    ]
+    ])
+    raw = _boost_query_by_action(raw, narration)
 
-    query = " ".join([str(p).strip() for p in query_parts if str(p).strip()])
-    query = re.sub(r"[^0-9a-zA-Z\s\-]", " ", query)
-    query = re.sub(r"\s+", " ", query).strip().lower()
-
-    # Remove common abstract words that usually hurt stock search.
+    # Remove abstract words that hurt stock search.
     abstract_stop = {
         "meaning", "lesson", "wisdom", "karma", "hope", "fear", "success", "failure",
-        "happiness", "suffering", "impermanence", "truth", "destiny", "fate"
+        "happiness", "suffering", "impermanence", "truth", "destiny", "fate", "story", "video"
     }
-    words = [w for w in query.split() if w not in abstract_stop]
-    query = " ".join(words)
-
+    tokens = [w for w in _tokens_for_stock(raw) if w not in abstract_stop]
+    query = " ".join(tokens)
     if not query:
-        query = "realistic daily life"
-
-    # Orientation hint helps local metadata and sometimes Pexels results.
+        query = "realistic daily life people"
     query = query + (" vertical" if is_vertical else " landscape")
-    return shorten_prompt_for_sdxl(query, max_chars=150, max_words=24)
+    return shorten_prompt_for_sdxl(query, max_chars=170, max_words=26)
 
 
 def _load_stock_metadata():
@@ -1779,13 +2296,15 @@ def prepare_stock_image(src_path: str, out_path: str, width: int, height: int):
 
 
 def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
-    """Fetch one suitable Pexels photo URL for stock-friendly scenes.
-    Returns metadata dict or None. Does not raise.
+    """Pexels image flow: API-first for freshness, save cache, fallback to R2 cache only if API fails.
+
+    This matches FlozenAI's current requirement: Pexels should remain fresh/direct,
+    but successful selections are persisted to R2 metadata cache.
     """
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
 
-    query = shorten_prompt_for_sdxl(stock_query or "daily life", max_chars=120, max_words=18)
+    query = shorten_prompt_for_sdxl(stock_query or "daily life", max_chars=150, max_words=24)
     if not query:
         query = "daily life"
 
@@ -1795,52 +2314,112 @@ def fetch_pexels_photo(stock_query: str, is_vertical: bool = False):
     params = {
         "query": query,
         "orientation": orientation,
-        "per_page": max(1, min(int(PEXELS_PER_PAGE), 20)),
+        "per_page": max(3, min(int(PEXELS_PER_PAGE), 30)),
     }
+
+    api_failed = False
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=8)
         if resp.status_code != 200:
-            print(f"WARN: Pexels API status={resp.status_code} query={query!r}")
+            print(f"WARN: Pexels IMAGE API status={resp.status_code} query={query!r}")
+            api_failed = True
+        else:
+            data = resp.json()
+            photos = data.get("photos", []) or []
+            best = None
+            best_score = -1.0
+            for rank, photo in enumerate(photos):
+                src = photo.get("src", {}) or {}
+                image_url = src.get("large2x") or src.get("large") or src.get("original")
+                if not image_url:
+                    continue
+                title = " ".join([
+                    str(photo.get("alt", "") or ""),
+                    str(photo.get("photographer", "") or ""),
+                    str(photo.get("url", "") or ""),
+                ])
+                w = int(photo.get("width", 0) or 0)
+                h = int(photo.get("height", 0) or 0)
+                score = _score_stock_result(query, tags=title, title=title, url=image_url, rank=rank, is_vertical=is_vertical, width=w, height=h)
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        "url": image_url,
+                        "query": query,
+                        "photographer": photo.get("photographer", ""),
+                        "pexels_id": photo.get("id", ""),
+                        "page_url": photo.get("url", ""),
+                        "width": w,
+                        "height": h,
+                        "source": "pexels",
+                        "match_score": round(max(0.0, best_score), 3),
+                    }
+            if best and best.get("match_score", 0) >= PEXELS_MIN_MATCH_SCORE:
+                return _cache_set("pexels", "image", query, is_vertical, best, ttl_hours=PEXELS_CACHE_TTL_HOURS)
+            if photos:
+                print(f"INFO: Pexels image rejected by match score query={query!r} best={best_score:.3f} threshold={PEXELS_MIN_MATCH_SCORE}")
+            _cache_set("pexels", "image", query, is_vertical, None, ttl_hours=PEXELS_CACHE_TTL_HOURS)
             return None
-        data = resp.json()
-        photos = data.get("photos", []) or []
-        if not photos:
-            return None
-
-        # Prefer larger, non-empty images. Use deterministic first result to reduce randomness.
-        photo = photos[0]
-        src = photo.get("src", {}) or {}
-        image_url = src.get("large2x") or src.get("large") or src.get("original")
-        if not image_url:
-            return None
-        return {
-            "url": image_url,
-            "query": query,
-            "photographer": photo.get("photographer", ""),
-            "pexels_id": photo.get("id", ""),
-        }
     except Exception as e:
-        print("WARN: Pexels fetch failed:", repr(e))
-        return None
+        print("WARN: Pexels image API failed, trying R2 metadata cache fallback:", repr(e))
+        api_failed = True
+
+    if api_failed:
+        cached = _cache_get("pexels", "image", query, is_vertical, ttl_hours=PEXELS_CACHE_TTL_HOURS)
+        return cached
+    return None
 
 
-def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int):
-    """Download and crop a Pexels image to target frame."""
+def prepare_pexels_image(image_url: str, out_path: str, width: int, height: int, cache_query: str = ""):
+    """R2-first Pexels image preparation and fit to target frame.
+
+    R2 is the persistent cache. RunPod local files are only temporary working files for this job.
+    """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    r2_key = None
+    tmp_path = out_path + ".pexels.tmp.jpg"
+
+    if cache_query:
+        slug = _slugify_for_cache(cache_query)
+        r2_key = _stock_image_r2_key(f"pexels_{slug}.jpg")
+        if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+            cached = _r2_download_file(r2_key, tmp_path)
+            if cached:
+                result = prepare_stock_image(cached, out_path, width, height)
+                try:
+                    if CLEAN_TMP_AFTER_JOB and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return result
+
     try:
-        r = requests.get(image_url, timeout=15)
-        r.raise_for_status()
-        tmp_path = out_path + ".download"
-        with open(tmp_path, "wb") as f:
-            f.write(r.content)
-        prepare_stock_image(tmp_path, out_path, width, height)
+        with requests.get(image_url, timeout=20, stream=True) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 1024:
+            return None
+
+        if r2_key and ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+            _r2_upload_file(tmp_path, r2_key, content_type="image/jpeg")
+
+        result = prepare_stock_image(tmp_path, out_path, width, height)
         try:
-            os.remove(tmp_path)
+            if CLEAN_TMP_AFTER_JOB and os.path.exists(tmp_path):
+                os.remove(tmp_path)
         except Exception:
             pass
-        return out_path
+        return result
     except Exception as e:
         print("WARN: Pexels image download failed:", repr(e))
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
         return None
 
 
@@ -1891,72 +2470,120 @@ def find_stock_video_asset(stock_query: str, scene_plan: Dict[str, Any], is_vert
 
 
 def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
-    """Fetch one suitable Pexels video URL. Returns metadata dict or None."""
+    """Pexels video flow: API-first + save R2 metadata/media cache.
+
+    API-first keeps Lifestyle/Cinematic/Promo fresh and diverse.
+    If API fails, the function falls back to R2 metadata cache.
+    """
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
 
-    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=110, max_words=16)
+    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=150, max_words=24)
+    if not query:
+        query = "realistic daily life"
+
     orientation = "portrait" if is_vertical else "landscape"
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {
         "query": query,
         "orientation": orientation,
-        "per_page": max(1, min(int(PEXELS_PER_PAGE), 12)),
+        "per_page": max(3, min(int(PEXELS_PER_PAGE), 30)),
     }
+
+    api_failed = False
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=10)
         if resp.status_code != 200:
             print(f"WARN: Pexels VIDEO API status={resp.status_code} query={query!r}")
-            return None
-        data = resp.json()
-        videos = data.get("videos", []) or []
-        if not videos:
-            return None
-
-        # Deterministic: pick the first result with a downloadable mp4 file.
-        for video in videos:
-            files = video.get("video_files", []) or []
-            if not files:
-                continue
-            # Prefer HD-ish but not huge. Avoid original 4K files for speed/cost.
-            files = sorted(
-                files,
-                key=lambda f: (
-                    0 if (f.get("file_type") == "video/mp4") else 1,
+            api_failed = True
+        else:
+            data = resp.json()
+            videos = data.get("videos", []) or []
+            best = None
+            best_score = -1.0
+            for rank, video in enumerate(videos):
+                files = video.get("video_files", []) or []
+                if not files:
+                    continue
+                page_url = str(video.get("url", "") or "")
+                user_name = str(video.get("user", {}).get("name", "") if isinstance(video.get("user"), dict) else "")
+                title = " ".join([page_url, user_name])
+                duration = float(video.get("duration", 0) or 0)
+                for vf in sorted(files, key=lambda f: (
+                    0 if str(f.get("file_type", "")).lower() == "video/mp4" else 1,
                     abs(int(f.get("width") or 0) - (720 if is_vertical else 1280)),
                     int(f.get("width") or 9999) * int(f.get("height") or 9999),
-                )
-            )
-            for vf in files:
-                link = vf.get("link")
-                if link and str(vf.get("file_type", "")).lower() in {"video/mp4", ""}:
-                    return {
+                )):
+                    link = vf.get("link")
+                    if not link or str(vf.get("file_type", "")).lower() not in {"video/mp4", ""}:
+                        continue
+                    w = int(vf.get("width") or 0)
+                    h = int(vf.get("height") or 0)
+                    score = _score_stock_result(query, tags=title, title=title, url=page_url, rank=rank, is_vertical=is_vertical, width=w, height=h)
+                    # Prefer clips long enough for scene, avoid ultra-short tiny clips.
+                    if duration and duration >= 3:
+                        score += 0.04
+                    if duration and duration > 25:
+                        score -= 0.03
+                    cand = {
                         "url": link,
                         "query": query,
                         "pexels_id": video.get("id", ""),
                         "duration": video.get("duration", ""),
-                        "width": vf.get("width", ""),
-                        "height": vf.get("height", ""),
+                        "width": w,
+                        "height": h,
                         "quality": vf.get("quality", ""),
+                        "page_url": page_url,
+                        "source": "pexels",
+                        "match_score": round(max(0.0, score), 3),
                     }
-        return None
+                    if score > best_score:
+                        best_score = score
+                        best = cand
+                    break
+            if best and best.get("match_score", 0) >= PEXELS_MIN_MATCH_SCORE:
+                return _cache_set("pexels", "video", query, is_vertical, best, ttl_hours=PEXELS_CACHE_TTL_HOURS)
+            if videos:
+                print(f"INFO: Pexels video rejected by match score query={query!r} best={best_score:.3f} threshold={PEXELS_MIN_MATCH_SCORE}")
+            _cache_set("pexels", "video", query, is_vertical, None, ttl_hours=PEXELS_CACHE_TTL_HOURS)
+            return None
     except Exception as e:
-        print("WARN: Pexels video fetch failed:", repr(e))
-        return None
+        print("WARN: Pexels video API failed, trying R2 metadata cache fallback:", repr(e))
+        api_failed = True
+
+    if api_failed:
+        cached = _cache_get("pexels", "video", query, is_vertical, ttl_hours=PEXELS_CACHE_TTL_HOURS)
+        return cached
+    return None
 
 
-def prepare_pexels_video(video_url: str, out_path: str):
-    """Download Pexels video file. Does not transcode; render stage will crop/resize frames."""
+def prepare_pexels_video(video_url: str, out_path: str, cache_query: str = ""):
+    """R2-first Pexels video preparation.
+
+    R2 is the persistent cache. RunPod local files are only temporary working files for MoviePy/FFmpeg.
+    """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    r2_key = None
+    if cache_query:
+        slug = _slugify_for_cache(cache_query)
+        r2_key = _stock_video_r2_key(f"pexels_{slug}.mp4")
+        if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+            cached = _r2_download_file(r2_key, out_path)
+            if cached:
+                return out_path
+
     try:
-        with requests.get(video_url, timeout=30, stream=True) as r:
+        with requests.get(video_url, timeout=35, stream=True) as r:
             r.raise_for_status()
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 512):
                     if chunk:
                         f.write(chunk)
         if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+            if r2_key and ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+                _r2_upload_file(out_path, r2_key, content_type="video/mp4")
             return out_path
         return None
     except Exception as e:
@@ -1967,6 +2594,258 @@ def prepare_pexels_video(video_url: str, out_path: str):
         except Exception:
             pass
         return None
+
+
+def build_warm_story_pixabay_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
+    """Build Pixabay-friendly query for Warm Story animation/storytelling assets.
+
+    It intentionally searches animation/storytelling first, while still grounding
+    subject/action/object/location so the result does not become too generic.
+    """
+    subject = _field_text(scene_plan, "main_subject", 5)
+    action = _field_text(scene_plan, "action", 6)
+    location = _field_text(scene_plan, "location", 5) or _field_text(scene_plan, "background", 5)
+    mood = _field_text(scene_plan, "mood", 3)
+    objects = _extract_object_terms(scene_plan, narration, limit=3)
+
+    raw = " ".join([subject, action, " ".join(objects), location, mood])
+    raw = _boost_query_by_action(raw, narration)
+    query = _dedupe_words(raw + " cartoon animation storytelling storybook", max_words=22)
+
+    if not query:
+        query = "cartoon animation storytelling"
+    query = query + (" vertical" if is_vertical else " landscape")
+    return shorten_prompt_for_sdxl(query, max_chars=150, max_words=24)
+
+
+def _score_stock_result(query: str, tags: str = "", title: str = "") -> float:
+    q_tokens = tokenize_for_match(query)
+    t_tokens = tokenize_for_match(" ".join([str(tags or ""), str(title or "")]))
+    if not q_tokens or not t_tokens:
+        return 0.0
+    return round(len(q_tokens & t_tokens) / max(4, len(q_tokens)), 3)
+
+
+def fetch_pixabay_video(stock_query: str, is_vertical: bool = False, warm_story: bool = False):
+    """Pixabay video flow: cache-first to respect Pixabay caching expectations.
+
+    For Warm Story, tries animation/story query variants before falling back to broader terms.
+    """
+    if not (ENABLE_PIXABAY_FETCH and ENABLE_PIXABAY_VIDEO_FETCH and PIXABAY_API_KEY):
+        return None
+
+    base_query = shorten_prompt_for_sdxl(stock_query or "cartoon animation storytelling", max_chars=150, max_words=24)
+    variants = _stock_query_variants(base_query, is_vertical=is_vertical, warm_story=warm_story)
+
+    # Cache-first: use the first valid cached result across variants.
+    for query in variants:
+        cached = _cache_get("pixabay", "video", query, is_vertical, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+        if cached is not None:
+            return cached
+
+    for query in variants:
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": query,
+            "per_page": max(3, min(int(PIXABAY_PER_PAGE), 50)),
+            "safesearch": "true",
+        }
+        if warm_story:
+            params["video_type"] = "animation"
+        try:
+            resp = requests.get("https://pixabay.com/api/videos/", params=params, timeout=12)
+            if resp.status_code != 200:
+                print(f"WARN: Pixabay VIDEO API status={resp.status_code} query={query!r} body={resp.text[:160]!r}")
+                _cache_set("pixabay", "video", query, is_vertical, None, ttl_hours=1)
+                continue
+            data = resp.json()
+            hits = data.get("hits", []) or []
+            if not hits:
+                _cache_set("pixabay", "video", query, is_vertical, None, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+                continue
+
+            best = None
+            best_score = -1.0
+            for rank, item in enumerate(hits):
+                videos = item.get("videos", {}) or {}
+                vf = videos.get("medium") or videos.get("small") or videos.get("large") or {}
+                url = vf.get("url")
+                if not url:
+                    continue
+                w = int(vf.get("width", 0) or 0)
+                h = int(vf.get("height", 0) or 0)
+                if is_vertical and w and h and h <= w:
+                    continue
+                if (not is_vertical) and w and h and w < h:
+                    continue
+                tags = item.get("tags", "") or ""
+                score = _score_stock_result(query, tags=tags, title="", url=item.get("pageURL", ""), rank=rank, is_vertical=is_vertical, width=w, height=h, warm_story=warm_story)
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        "url": url,
+                        "width": w,
+                        "height": h,
+                        "duration": item.get("duration", ""),
+                        "tags": tags,
+                        "pixabay_id": item.get("id", ""),
+                        "page_url": item.get("pageURL", ""),
+                        "user": item.get("user", ""),
+                        "query": query,
+                        "source": "pixabay",
+                        "match_score": round(max(0.0, best_score), 3),
+                    }
+            if best and best.get("match_score", 0) >= PIXABAY_MIN_MATCH_SCORE:
+                return _cache_set("pixabay", "video", query, is_vertical, best, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+            _cache_set("pixabay", "video", query, is_vertical, None, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+        except Exception as e:
+            print("WARN: Pixabay video fetch failed:", repr(e))
+            continue
+    return None
+
+
+def fetch_pixabay_image(stock_query: str, is_vertical: bool = False, warm_story: bool = False):
+    """Pixabay image/illustration flow: cache-first with stronger story/illustration scoring."""
+    if not (ENABLE_PIXABAY_FETCH and ENABLE_PIXABAY_IMAGE_FETCH and PIXABAY_API_KEY):
+        return None
+
+    base_query = shorten_prompt_for_sdxl(stock_query or "cartoon illustration storytelling", max_chars=150, max_words=24)
+    variants = _stock_query_variants(base_query, is_vertical=is_vertical, warm_story=warm_story)
+
+    for query in variants:
+        cached = _cache_get("pixabay", "image", query, is_vertical, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+        if cached is not None:
+            return cached
+
+    for query in variants:
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": query,
+            "per_page": max(3, min(int(PIXABAY_PER_PAGE), 50)),
+            "safesearch": "true",
+            "orientation": "vertical" if is_vertical else "horizontal",
+        }
+        if warm_story:
+            params["image_type"] = "illustration"
+        try:
+            resp = requests.get("https://pixabay.com/api/", params=params, timeout=12)
+            if resp.status_code != 200:
+                print(f"WARN: Pixabay IMAGE API status={resp.status_code} query={query!r} body={resp.text[:160]!r}")
+                _cache_set("pixabay", "image", query, is_vertical, None, ttl_hours=1)
+                continue
+            data = resp.json()
+            hits = data.get("hits", []) or []
+            if not hits:
+                _cache_set("pixabay", "image", query, is_vertical, None, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+                continue
+
+            best = None
+            best_score = -1.0
+            for rank, item in enumerate(hits):
+                url = item.get("largeImageURL") or item.get("webformatURL") or item.get("previewURL")
+                if not url:
+                    continue
+                tags = item.get("tags", "") or ""
+                w = int(item.get("imageWidth", 0) or 0)
+                h = int(item.get("imageHeight", 0) or 0)
+                score = _score_stock_result(query, tags=tags, title="", url=item.get("pageURL", ""), rank=rank, is_vertical=is_vertical, width=w, height=h, warm_story=warm_story)
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        "url": url,
+                        "width": w,
+                        "height": h,
+                        "tags": tags,
+                        "pixabay_id": item.get("id", ""),
+                        "page_url": item.get("pageURL", ""),
+                        "user": item.get("user", ""),
+                        "query": query,
+                        "source": "pixabay",
+                        "match_score": round(max(0.0, best_score), 3),
+                    }
+            if best and best.get("match_score", 0) >= PIXABAY_MIN_MATCH_SCORE:
+                return _cache_set("pixabay", "image", query, is_vertical, best, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+            _cache_set("pixabay", "image", query, is_vertical, None, ttl_hours=PIXABAY_CACHE_TTL_HOURS)
+        except Exception as e:
+            print("WARN: Pixabay image fetch failed:", repr(e))
+            continue
+    return None
+
+
+def prepare_pixabay_video(video_url: str, out_path: str, cache_query: str = ""):
+    """R2-first Pixabay video preparation.
+
+    R2 is the persistent cache. RunPod local files are only temporary working files for MoviePy/FFmpeg.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    r2_key = None
+    if cache_query:
+        slug = _slugify_for_cache(cache_query)
+        r2_key = _stock_video_r2_key(f"pixabay_{slug}.mp4")
+
+        # 1) R2 persistent cache hit -> download directly to this job working file.
+        if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+            cached = _r2_download_file(r2_key, out_path)
+            if cached:
+                return out_path
+
+    # 2) Pixabay remote source fallback -> download to working file.
+    downloaded = _download_url_to_file(video_url, out_path, timeout=45)
+
+    # 3) Upload media to R2 for future jobs.
+    if downloaded and r2_key and ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+        _r2_upload_file(downloaded, r2_key, content_type="video/mp4")
+
+    return downloaded
+
+
+def prepare_pixabay_image(image_url: str, out_path: str, width: int, height: int, cache_query: str = ""):
+    """R2-first Pixabay image preparation and fit to target frame.
+
+    R2 is the persistent cache. RunPod local files are only temporary working files for this job.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    r2_key = None
+    tmp_path = out_path + ".pixabay.tmp.jpg"
+
+    if cache_query:
+        slug = _slugify_for_cache(cache_query)
+        r2_key = _stock_image_r2_key(f"pixabay_{slug}.jpg")
+
+        # 1) R2 persistent cache hit -> download to temporary working file.
+        if ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+            cached = _r2_download_file(r2_key, tmp_path)
+            if cached:
+                result = prepare_stock_image(cached, out_path, width, height)
+                try:
+                    if CLEAN_TMP_AFTER_JOB and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return result
+
+    # 2) Pixabay remote source fallback -> download to temporary working file.
+    cached = _download_url_to_file(image_url, tmp_path, timeout=30)
+    if not cached:
+        return None
+
+    # 3) Upload original media to R2 for future jobs.
+    if r2_key and ENABLE_R2_STOCK_CACHE and R2_CACHE_UPLOAD_MEDIA:
+        _r2_upload_file(cached, r2_key, content_type="image/jpeg")
+
+    result = prepare_stock_image(cached, out_path, width, height)
+
+    # 4) Remove temporary download; keep only current scene output needed by renderer.
+    try:
+        if CLEAN_TMP_AFTER_JOB and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    return result
+
 
 def is_warm_story_style(video_style_preset: str) -> bool:
     """Return True for Warm Story / storybook styles from frontend."""
@@ -3439,7 +4318,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     """Prepare one scene visual with Pippit-style routing.
 
     Final production rule:
-    - warm_storybook scenes are AI-image only.
+    - warm_storybook scenes use local animation/Pixabay animation/Pixabay illustration first, then AI image fallback.
     - all other styles are stock-first and prefer real stock VIDEO for motion.
     - if stock video is not available, use stock image + motion.
     - if stock is missing for non-Warm styles, use a fast placeholder instead of SDXL.
@@ -3450,6 +4329,68 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     narration = scene.get("voice_text") or scene.get("source_chunk") or ""
     scene_plan = scene.get("scene_plan", {}) or {}
     video_style_preset = scene.get("video_style_preset", "") or ""
+
+    # Warm Story special route: use free animation/story assets first, then AI image fallback.
+    # This makes Warm Story more lively and reduces SDXL calls.
+    if is_warm_story_style(video_style_preset):
+        pixabay_query = scene.get("pixabay_query") or build_warm_story_pixabay_query(narration, scene_plan, is_vertical=is_vertical)
+        stock_query = scene.get("stock_query") or pixabay_query
+        scene["pixabay_query"] = pixabay_query
+        scene["stock_query"] = stock_query
+
+        # 1) Local animation/story videos downloaded from Mixkit/Pixabay/manual library.
+        if ENABLE_STOCK_ASSETS:
+            stock_video = find_stock_video_asset(pixabay_query, scene_plan, is_vertical=is_vertical)
+            if stock_video:
+                print(f"🎞️ Warm Story using local animation/story VIDEO for scene {int(scene.get('scene_id', 0)):02d}: {stock_video.get('path')} | score={stock_video.get('match_score')}")
+                scene["visual_used"] = "warm_story_video_local"
+                scene["visual_source"] = "stock"
+                scene["visual_video_path"] = stock_video.get("path")
+                scene["stock_asset_path"] = stock_video.get("path")
+                scene["stock_match_score"] = stock_video.get("match_score")
+                create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 2) Pixabay animation video, cached by query.
+        pixabay_video = fetch_pixabay_video(pixabay_query, is_vertical=is_vertical, warm_story=True)
+        if pixabay_video:
+            video_path = os.path.splitext(img_path)[0] + "_pixabay.mp4"
+            ok_video = prepare_pixabay_video(pixabay_video.get("url"), video_path, cache_query=pixabay_query)
+            if ok_video:
+                print(f"🎞️ Warm Story using Pixabay animation VIDEO for scene {int(scene.get('scene_id', 0)):02d}: query={pixabay_video.get('query')!r} score={pixabay_video.get('match_score')}")
+                scene["visual_used"] = "warm_story_video_pixabay"
+                scene["visual_source"] = "stock"
+                scene["visual_video_path"] = ok_video
+                scene["stock_query_used"] = pixabay_video.get("query", "")
+                scene["pixabay_id"] = pixabay_video.get("pixabay_id", "")
+                scene["pixabay_tags"] = pixabay_video.get("tags", "")
+                scene["pixabay_page_url"] = pixabay_video.get("page_url", "")
+                scene["stock_match_score"] = pixabay_video.get("match_score", "")
+                create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 3) Pixabay illustration/image, cached by query.
+        pixabay_image = fetch_pixabay_image(pixabay_query, is_vertical=is_vertical, warm_story=True)
+        if pixabay_image:
+            ok_img = prepare_pixabay_image(pixabay_image.get("url"), img_path, width, height, cache_query=pixabay_query)
+            if ok_img:
+                print(f"🖼️ Warm Story using Pixabay illustration IMAGE for scene {int(scene.get('scene_id', 0)):02d}: query={pixabay_image.get('query')!r} score={pixabay_image.get('match_score')}")
+                maybe_apply_style_image_grade(img_path, video_style_preset)
+                scene["visual_used"] = "warm_story_image_pixabay"
+                scene["visual_source"] = "stock"
+                scene["stock_query_used"] = pixabay_image.get("query", "")
+                scene["pixabay_id"] = pixabay_image.get("pixabay_id", "")
+                scene["pixabay_tags"] = pixabay_image.get("tags", "")
+                scene["pixabay_page_url"] = pixabay_image.get("page_url", "")
+                scene["stock_match_score"] = pixabay_image.get("match_score", "")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+
+        # 4) Final fallback: AI image, preserving your previous Warm Story behavior.
+        print(f"ℹ️ Warm Story no suitable local/Pixabay asset for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
+        return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
     image_source_mode = scene.get("image_source_mode") or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE)
     try:
@@ -3483,7 +4424,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         pexels_video = fetch_pexels_video(stock_query, is_vertical=is_vertical)
         if pexels_video:
             video_path = os.path.splitext(img_path)[0] + ".mp4"
-            ok_video = prepare_pexels_video(pexels_video["url"], video_path)
+            ok_video = prepare_pexels_video(pexels_video["url"], video_path, cache_query=pexels_video.get("query", stock_query))
             if ok_video:
                 print(f"🎞️ Using Pexels stock VIDEO for scene {int(scene.get('scene_id', 0)):02d}: query={pexels_video.get('query')!r}")
                 scene["visual_used"] = "stock_video_pexels"
@@ -3514,7 +4455,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         pexels = fetch_pexels_photo(stock_query, is_vertical=is_vertical)
         if pexels:
             print(f"📸 Using Pexels stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r}")
-            ok = prepare_pexels_image(pexels["url"], img_path, width, height)
+            ok = prepare_pexels_image(pexels["url"], img_path, width, height, cache_query=pexels.get("query", stock_query))
             if ok:
                 maybe_apply_style_image_grade(img_path, video_style_preset)
                 scene["visual_used"] = "stock_image_pexels"
@@ -4055,4 +4996,12 @@ def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_call
         }
 
     finally:
+        # Serverless cleanup: do not keep persistent cache on RunPod local disk.
+        if CLEAN_TMP_AFTER_JOB and DISABLE_LOCAL_CACHE:
+            for _d in [STOCK_CACHE_DIR, STOCK_VIDEO_CACHE_DIR, STOCK_IMAGE_CACHE_DIR]:
+                try:
+                    if _d and os.path.isdir(_d):
+                        shutil.rmtree(_d, ignore_errors=True)
+                except Exception as _e:
+                    print("WARN: could not cleanup temporary stock cache dir:", _d, repr(_e))
         _PROGRESS_CALLBACK = old_callback
