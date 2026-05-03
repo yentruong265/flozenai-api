@@ -725,6 +725,10 @@ def generate_image(
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
+
+# ===== CELL 6 =====
+# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
+
 import os
 import re
 import gc
@@ -3794,7 +3798,6 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         return np.array(img.convert("RGB"))
 
     return VideoClip(frame_function=make_frame, duration=duration).with_fps(int(getattr(clip, "fps", 24) or 24))
-
 # ===== CELL 7 =====
 # B7 — run_job FIXED FULL (single narration audio, no overlap, with progress, safe return)
 
@@ -3875,7 +3878,9 @@ def allocate_scene_durations_from_narration(scene_objects, total_audio_duration,
 
     weights = []
     for s in scene_objects:
-        txt = str(s.get("voice_text", "") or s.get("source_chunk", "") or "").strip()
+        # Use voice_text only as the single source for narration timing.
+        # Do not fallback to source_chunk here, because source_chunk may duplicate voice_text.
+        txt = str(s.get("voice_text", "") or "").strip()
         w = max(1, len(txt.split()))
         weights.append(w)
 
@@ -4307,29 +4312,30 @@ def run_job(job_config, job_id):
     })
 
     # ------------------------------------------------------------------
-    # SINGLE FULL NARRATION AUDIO MODE
+    # SINGLE FULL NARRATION AUDIO MODE — SCENE-SAFE VERSION
     # ------------------------------------------------------------------
-    # Old behavior generated one TTS file per scene. That made narration
-    # speed inconsistent because OpenAI/Edge TTS may speak each segment with
-    # a different rhythm. New behavior generates one full narration track,
-    # then allocates scene durations from that single audio duration.
-    
-    full_narration_text = sanitize_tts_text(adaptive_plan.get("full_narration_text", ""), max_chars=4000)
+    # Important rule:
+    # - voice_text is the ONLY source for narration audio, duration allocation, and subtitles.
+    # - Do NOT use adaptive_plan["full_narration_text"] here, because it may be
+    #   planner-merged or duplicated compared with scene voice_text.
+    # - Do NOT fallback to source_chunk for TTS/duration, because B6 can store the
+    #   same content in both voice_text and source_chunk.
+
+    scene_voice_texts = []
+    for scene in scene_objects:
+        txt = sanitize_tts_text(scene.get("voice_text") or "", max_chars=900)
+        if txt:
+            scene_voice_texts.append(txt)
+
+    full_narration_text = sanitize_tts_text(" ".join(scene_voice_texts), max_chars=4000)
+
     if not full_narration_text:
-        full_narration_text = sanitize_tts_text(
-            " ".join([
-                str(s.get("voice_text") or s.get("source_chunk") or "")
-                for s in scene_objects
-                if str(s.get("voice_text") or s.get("source_chunk") or "").strip()
-            ]),
-            max_chars=4000,
-        )
-            
-    if not full_narration_text:
+        # Last-resort fallback only. This should rarely run if B6 produced scene voice_text correctly.
         full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
     full_audio_raw_path = os.path.join(AUDIO_DIR, "full_narration_raw.mp3")
     tts_started_at = time.time()
+
     tts_meta = run_async_safely(save_tts(
         text=full_narration_text,
         out_path=full_audio_raw_path,
@@ -4348,6 +4354,7 @@ def run_job(job_config, job_id):
 
     full_audio_clip = AudioFileClip(full_audio_path)
     total_audio_duration = float(full_audio_clip.duration or 0)
+
     if total_audio_duration <= 0:
         try:
             full_audio_clip.close()
@@ -4355,18 +4362,22 @@ def run_job(job_config, job_id):
             pass
         raise RuntimeError(f"Full narration audio duration is zero: {full_audio_path}")
 
-    # Allocate scene durations according to the amount of narration text per scene.
-    # The sum is forced to match the full audio duration, so the final video stays synced.
+    # Allocate scene durations using the SAME source as full_narration_text:
+    # scene["voice_text"] only. This keeps audio, visual duration, and subtitle aligned.
     scene_weights = []
     scene_text_log = []
+
     for idx, scene in enumerate(scene_objects, start=1):
-        voice_text = sanitize_tts_text(scene.get("voice_text") or scene.get("source_chunk") or "", max_chars=900)
-        if not voice_text:
-            voice_text = sanitize_tts_text(story_text, max_chars=900)
+        voice_text = sanitize_tts_text(scene.get("voice_text") or "", max_chars=900)
+
+        # If a scene is missing voice_text, keep a minimal weight so it still gets a short visual slot.
+        # Do not inject story_text here, otherwise the full story can be repeated into one scene.
         word_count = max(1, len(voice_text.split()))
         char_count = max(1, len(voice_text))
-        # Blend word and character counts so Vietnamese/English allocation is more stable.
+
+        # Blend word and character counts so Vietnamese/English duration allocation is stable.
         weight = max(1.0, (word_count * 1.0) + (char_count / 28.0))
+
         scene_weights.append(weight)
         scene_text_log.append({
             "scene_id": int(scene.get("scene_id", idx)),
@@ -4624,4 +4635,3 @@ def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_call
 
     finally:
         _PROGRESS_CALLBACK = old_callback
-        
