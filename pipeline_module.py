@@ -725,9 +725,6 @@ def generate_image(
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
-# ===== CELL 6 =====
-# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
-
 import os
 import re
 import gc
@@ -3307,7 +3304,7 @@ def create_adaptive_video_plan(
             # Use the full scene narration for subtitles.
             # The renderer below will show only the current sentence/chunk over time,
             # not the full paragraph at once.
-            "text_overlay": chunk,
+            "text_overlay": "",
             "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
         })
 
@@ -4316,6 +4313,7 @@ def run_job(job_config, job_id):
     # speed inconsistent because OpenAI/Edge TTS may speak each segment with
     # a different rhythm. New behavior generates one full narration track,
     # then allocates scene durations from that single audio duration.
+    
     full_narration_text = sanitize_tts_text(adaptive_plan.get("full_narration_text", ""), max_chars=4000)
     if not full_narration_text:
         full_narration_text = sanitize_tts_text(
@@ -4326,6 +4324,7 @@ def run_job(job_config, job_id):
             ]),
             max_chars=4000,
         )
+            
     if not full_narration_text:
         full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
@@ -4475,7 +4474,7 @@ def run_job(job_config, job_id):
 
         # Lightweight Pippit-like caption layer. Can be disabled by setting enable_text_overlay=False.
         if _safe_bool(job_config.get("enable_text_overlay"), True):
-            overlay_text = str(scene.get("text_overlay") or scene.get("hook_text") or scene.get("voice_text") or "")
+            overlay_text = str(scene.get("voice_text") or "")
             vclip = add_pippit_text_overlay(vclip, overlay_text, width, height, video_style_preset)
 
         if idx < total_scenes:
