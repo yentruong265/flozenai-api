@@ -299,8 +299,9 @@ def normalize_job_config(job_config, fallback_job_id=None):
 
     return normalized
 
+
 # ===== CELL 5 =====
-# B5 — SDXL image generation (PRO+, aspect-ratio-aware, anti-crop for 9:16, safer human anatomy)
+# B5 — SDXL image generation (PRO+, aspect-ratio-aware, anti-crop for 9:16)
 
 import os
 import re
@@ -312,11 +313,16 @@ import requests
 from PIL import Image
 
 SDXL_MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0").strip()
-IMAGE_ACCELERATION = "none"
+IMAGE_ACCELERATION = "none"  # SDXL Base only. Ignore Lightning env for stability.
 _IMAGE_PIPE = None
 _IMAGE_PIPE_LOCK = threading.Lock()
 _IMAGE_ACCELERATION_APPLIED = "none"
 
+# Optional stock image mode.
+# Priority order for each scene:
+#   1) local stock assets, if you have STOCK_ASSET_DIR
+#   2) Pexels API, if PEXELS_API_KEY is set
+#   3) SDXL AI fallback only for Warm Story; non-Warm styles use placeholder if stock is missing
 STOCK_ASSET_DIR = os.getenv("STOCK_ASSET_DIR", os.path.join(os.getenv("JOB_ROOT", "/tmp/easyai_jobs"), "stock_assets")).strip()
 STOCK_METADATA_FILE = os.getenv("STOCK_METADATA_FILE", os.path.join(STOCK_ASSET_DIR, "stock_metadata.json")).strip()
 ENABLE_STOCK_ASSETS = os.getenv("ENABLE_STOCK_ASSETS", "1").strip().lower() in {"1", "true", "yes", "y"}
@@ -325,22 +331,22 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 PEXELS_PER_PAGE = int(os.getenv("PEXELS_PER_PAGE", "10"))
 STOCK_MIN_MATCH_SCORE = float(os.getenv("STOCK_MIN_MATCH_SCORE", "0.18"))
 
+# Smart image routing mode:
+# smart = best default; stock_first = fastest; ai_first = best for storytelling
 IMAGE_SOURCE_MODE = os.getenv("IMAGE_SOURCE_MODE", "smart").strip().lower()
 
 DEFAULT_NEGATIVE_PROMPT = (
-    "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
+        "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
     "bad anatomy, deformed body, distorted body, malformed body, broken body, "
     "bad face, deformed face, distorted face, asymmetrical face, ugly face, uncanny face, "
-    "melted face, malformed face, broken facial features, duplicate face, cloned face, "
-    "bad eyes, deformed eyes, asymmetrical eyes, crossed eyes, uneven eyes, blurry eyes, extra eyes, missing eyes, "
-    "bad nose, deformed nose, missing nose, distorted nose, unnatural nose, "
-    "bad mouth, deformed mouth, missing mouth, distorted lips, asymmetrical mouth, broken teeth, "
+    "bad eyes, deformed eyes, asymmetrical eyes, crossed eyes, extra eyes, missing eyes, "
+    "bad nose, deformed nose, missing nose, distorted nose, "
+    "bad mouth, deformed mouth, missing mouth, distorted lips, broken teeth, "
     "bad hands, deformed hands, malformed hands, fused fingers, extra fingers, missing fingers, "
     "bad arms, deformed arms, extra arms, missing arms, broken arms, "
     "bad legs, deformed legs, extra legs, missing legs, broken legs, "
     "bad feet, deformed feet, extra feet, missing feet, "
     "extra limbs, missing limbs, duplicate subject, cloned face, "
-    "twisted limbs, impossible pose, disconnected legs, floating foot, reversed knee, broken ankle, "
     "cropped, cut off, out of frame, watermark, text, logo, subtitles, "
     "oversaturated, flat lighting, plastic skin, unrealistic skin, "
     "cartoon, anime, illustration, painting, storybook, 2d, vector art"
@@ -358,6 +364,7 @@ def free_memory():
 
 
 def shorten_prompt_for_sdxl(prompt: str, max_chars: int = 380, max_words: int = None) -> str:
+    """Compact SDXL prompt by both characters and words to avoid CLIP truncation."""
     prompt = " ".join((prompt or "").strip().split())
     if not prompt:
         return "clear coherent scene"
@@ -412,10 +419,17 @@ def _cleanup_existing_pipe():
 
 
 def _safe_image_size(width: int, height: int):
-    width = max(256, int(width))
-    height = max(256, int(height))
-    width = width - (width % 8)
-    height = height - (height % 8)
+    width = int(width)
+    height = int(height)
+
+    width = max(256, width)
+    height = max(256, height)
+
+    if width % 8 != 0:
+        width = width - (width % 8)
+    if height % 8 != 0:
+        height = height - (height % 8)
+
     return width, height
 
 
@@ -424,7 +438,7 @@ def _is_vertical_frame(width: int, height: int) -> bool:
 
 
 def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> str:
-    prompt = shorten_prompt_for_sdxl(prompt, max_chars=300, max_words=68)
+    prompt = shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
 
     if _is_vertical_frame(width, height):
         prompt = ", ".join([
@@ -447,7 +461,7 @@ def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> st
             "balanced left-right spacing",
         ])
 
-    return shorten_prompt_for_sdxl(prompt, max_chars=320, max_words=72)
+    return shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
 
 
 def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, height: int) -> str:
@@ -456,12 +470,20 @@ def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, 
     if _is_vertical_frame(width, height):
         negative_prompt = ", ".join([
             negative_prompt,
-            "cropped head, cut off body, cut off feet, top cropped, bottom cropped, "
-            "subject too close, zoomed in, extreme close-up, bad portrait framing, "
-            "off-center subject, subject filling entire frame"
+            "cropped head",
+            "cut off body",
+            "cut off feet",
+            "top cropped",
+            "bottom cropped",
+            "subject too close",
+            "zoomed in",
+            "extreme close-up",
+            "bad portrait framing",
+            "off-center subject",
+            "subject filling entire frame",
         ])
 
-    return shorten_prompt_for_sdxl(negative_prompt, max_chars=320, max_words=75)
+    return shorten_prompt_for_sdxl(negative_prompt, max_chars=260, max_words=55)
 
 
 def _is_turbo_model() -> bool:
@@ -477,6 +499,11 @@ def _is_lightning_active() -> bool:
 
 
 def _get_guidance_scale(width: int, height: int, guidance_scale: float) -> float:
+    """
+    Stable SDXL Base guidance.
+    Lower than the old 7.2+ setting for speed/control balance,
+    but high enough to avoid the loose/glitchy look from Lightning/Turbo.
+    """
     g = float(guidance_scale)
     if _is_turbo_model():
         return max(0.0, min(g, 1.0))
@@ -489,6 +516,11 @@ def _get_guidance_scale(width: int, height: int, guidance_scale: float) -> float
 
 
 def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
+    """
+    Stable dynamic steps.
+    - Landscape: 16-18 is the speed/quality sweet spot on RTX 4090.
+    - Vertical: add a little quality to reduce crop/anatomy issues, but do not force 30.
+    """
     s = int(steps)
     if _is_turbo_model():
         return min(max(s, 4), 16)
@@ -496,9 +528,7 @@ def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
         s = max(s, 18)
     else:
         s = max(s, 16)
-
-    # Safer cap to reduce scheduler/index instability.
-    return min(s, 22)
+    return min(s, 24)
 
 
 def load_image_pipe(force_reload: bool = False):
@@ -529,10 +559,15 @@ def load_image_pipe(force_reload: bool = False):
         _IMAGE_ACCELERATION_APPLIED = "none"
 
         try:
-            # Safer than use_karras_sigmas=True for avoiding rare index/timestep bugs.
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                use_karras_sigmas=True,
+            )
         except Exception:
-            pass
+            try:
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+            except Exception:
+                pass
 
         try:
             pipe.set_progress_bar_config(disable=True)
@@ -554,12 +589,14 @@ def load_image_pipe(force_reload: bool = False):
         except Exception:
             pass
 
-        pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
+        else:
+            pipe = pipe.to("cpu")
 
         _IMAGE_PIPE = pipe
         print(f"✅ SDXL ready | acceleration={_IMAGE_ACCELERATION_APPLIED}")
         return _IMAGE_PIPE
-
 
 def save_image_safely(image: Image.Image, out_path: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -584,51 +621,38 @@ def generate_image(
 ):
     width, height = _safe_image_size(width, height)
 
+    # aspect-aware prompt / negative prompt
     prompt = _enhance_prompt_for_aspect_ratio(prompt, width, height)
     negative_prompt = _enhance_negative_prompt_for_aspect_ratio(negative_prompt, width, height)
 
     num_inference_steps = _get_num_inference_steps(width, height, num_inference_steps)
     guidance_scale = _get_guidance_scale(width, height, guidance_scale)
 
+    # Slightly improve quality for human/face scenes, where AI artifacts are most visible.
     human_prompt = _has_any_term(prompt, _PERSON_WORDS) if "_PERSON_WORDS" in globals() else False
+    if human_prompt and not _is_turbo_model():
+        num_inference_steps = min(num_inference_steps + 2, 24)
+        guidance_scale = min(max(guidance_scale, 6.2), 7.2)
+
+    # Extra safety if AI still has to render a risky human/object scene.
+    # This does not guarantee perfect output, but reduces the worst AI artifacts.
     complex_pose_prompt = _has_any_term(prompt, _COMPLEX_BODY_POSE_WORDS) if "_COMPLEX_BODY_POSE_WORDS" in globals() else False
-
-    # Build positive anatomy prompt ONCE, then shorten ONCE.
-    if not _is_turbo_model():
-        anatomy_boost = ""
-        if human_prompt:
-            anatomy_boost += (
-                ", realistic human anatomy, natural face, symmetrical eyes, clear nose, natural mouth, "
-                "normal hands, five fingers per hand, natural arms, natural legs"
-            )
-            num_inference_steps = min(num_inference_steps + 2, 22)
-            guidance_scale = min(max(guidance_scale, 6.2), 7.2)
-
-        if complex_pose_prompt:
-            anatomy_boost += (
-                ", simple natural pose, natural body alignment, anatomically correct limbs, realistic joints"
-            )
-            negative_prompt = (
-                negative_prompt
-                + ", twisted limbs, impossible pose, disconnected legs, floating foot, reversed knee, broken ankle, "
-                "extra fingers, missing fingers, malformed hands, deformed face, asymmetrical eyes"
-            )
-            num_inference_steps = min(num_inference_steps + 2, 22)
-            guidance_scale = min(max(guidance_scale, 6.3), 7.2)
-
-        if anatomy_boost:
-            prompt = shorten_prompt_for_sdxl(
-                prompt + anatomy_boost,
-                max_chars=300,
-                max_words=70,
-            )
-            negative_prompt = shorten_prompt_for_sdxl(
-                negative_prompt,
-                max_chars=340,
-                max_words=78,
-            )
+    if complex_pose_prompt and not _is_turbo_model():
+        prompt = shorten_prompt_for_sdxl(
+            prompt + ", simple athletic pose, natural body alignment, anatomically correct limbs, realistic joints,anatomically correct human body, natural face, symmetrical eyes, clear nose, natural mouth, normal hands, five fingers per hand, natural arms, natural legs",
+            max_chars=260,
+            max_words=58,
+        )
+        negative_prompt = shorten_prompt_for_sdxl(
+            negative_prompt + ", twisted limbs, impossible pose, disconnected legs, floating foot, reversed knee, broken ankle",
+            max_chars=300,
+            max_words=65,
+        )
+        num_inference_steps = min(num_inference_steps + 2, 24)
+        guidance_scale = min(max(guidance_scale, 6.3), 7.2)
 
     retries = max(1, int(retries))
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     last_err = None
@@ -648,33 +672,30 @@ def generate_image(
             run_guidance_scale = guidance_scale
             run_steps = num_inference_steps
 
+            # Retry strategy cho 9:16:
+            # lần retry sau, ép model "lùi camera" mạnh hơn một chút
             if is_vertical and attempt >= 2:
                 run_prompt = shorten_prompt_for_sdxl(
                     run_prompt + ", camera pulled back more, full body clearly visible, extra space above and below subject",
-                    max_chars=300,
-                    max_words=70,
+                    max_chars=240
                 )
                 run_negative_prompt = shorten_prompt_for_sdxl(
                     run_negative_prompt + ", face too close, torso cropped, feet cropped, oversized subject",
-                    max_chars=340,
-                    max_words=78,
+                    max_chars=260
                 )
-                run_guidance_scale = min(run_guidance_scale + 0.2, 7.2)
-                run_steps = min(run_steps + 1, 22)
-
-            if attempt >= 2:
-                run_steps = max(14, min(run_steps - 1, 20))
+                run_guidance_scale = min(run_guidance_scale + 0.3, 12.0)
+                run_steps = min(run_steps + 2, 80)
 
             if scene_id is not None:
                 print(
                     f"🎨 Generating scene {int(scene_id):02d} | "
                     f"attempt {attempt} | size={width}x{height} | "
-                    f"{'vertical' if is_vertical else 'landscape'} | steps={run_steps}"
+                    f"{'vertical' if is_vertical else 'landscape'}"
                 )
             else:
                 print(
                     f"🎨 Generating image | attempt {attempt} | size={width}x{height} | "
-                    f"{'vertical' if is_vertical else 'landscape'} | steps={run_steps}"
+                    f"{'vertical' if is_vertical else 'landscape'}"
                 )
 
             with torch.inference_mode():
@@ -704,11 +725,11 @@ def generate_image(
         except Exception as e:
             last_err = e
             print("⚠️ generate_image retry because:", repr(e))
-            _cleanup_existing_pipe()
+            free_memory()
             time.sleep(1.0)
 
     raise RuntimeError(f"generate_image failed: {repr(last_err)}")
-
+    
 
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
@@ -757,15 +778,12 @@ STYLE_PRESETS = {
     "warm_storybook": {
         "name": "warm_storybook",
         "prompt_style": (
-            "photorealistic cinematic documentary still, realistic human proportions, "
-            "real human face, natural skin texture, realistic eyes, realistic nose and mouth, "
-            "natural lighting, realistic environment, emotional storytelling moment, "
-            "35mm film still, shallow depth of field, high detail"
+            "storybook illustration, warm tones, soft light, painterly texture, "
+            "expressive composition, emotional storytelling, beautiful framing"
         ),
         "negative_style": (
-            "cartoon, chibi, anime, manga, illustration, drawing, painting, storybook, 2d, vector art, "
-            "toy-like character, doll face, childish mascot, flat color, cel shading, fake face, "
-            "oversimplified eyes, tiny mouth, exaggerated head, deformed face, bad anatomy"
+            "photorealistic, realistic photography, live action, harsh flash, ugly composition, "
+            "low detail, flat background"
         ),
         "motion_mode": "gentle",
         "duration_profile": "standard",
@@ -1467,7 +1485,7 @@ def _warm_story_pexels_image_score(scene_obj: Dict[str, Any], idx: int, total: i
     """Score warm-story scenes that are most suitable for Pexels image insertion.
 
     Product rule:
-    - Warm Story target: 50% AI image + 50% Pexels image.
+    - Warm Story target: 60% AI image + 40% Pexels image.
     - Warm Story must never use Pexels video.
     - Scenes with 2+ visible people must be prioritized for Pexels image because AI is more likely to break faces, hands, fingers, arms, and legs.
     """
@@ -1549,7 +1567,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
 
     STRICT WARM STORY RULE:
     - Warm Story / warm_storybook uses IMAGE ONLY: no Pexels video, no local stock video.
-    - Target route ratio: 50% AI images + 50% Pexels/local stock images.
+    - Target route ratio: 60% AI images + 40% Pexels/local stock images.
     - Scenes with 2+ visible people are selected for Pexels image FIRST.
     - Non-Warm styles keep their existing stock/video behavior.
     - Non-Warm styles must NOT call SDXL/AI from this routing layer.
@@ -1566,14 +1584,14 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     if is_warm:
         total = len(scene_objects)
         try:
-            pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.50")))
+            pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.40")))
         except Exception:
-            pexels_ratio = 0.50
-        # Keep it close to the requested 50%, but allow small rounding for short videos.
-        pexels_ratio = 0.50
+            pexels_ratio = 0.40
+        # Keep it close to the requested 40%, but allow small rounding for short videos.
+        pexels_ratio = 0.40
         target_pexels_count = _target_count(total, pexels_ratio)
 
-        # 1) Select all 2+ people scenes first, up to the 50% target.
+        # 1) Select all 2+ people scenes first, up to the 40% target.
         multi_people = []
         others = []
         for idx, scene in enumerate(scene_objects):
@@ -1624,7 +1642,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 # - no Pexels video
                 # - no local stock video
                 # - no AI fallback
-                # This preserves the requested final ratio: top 50% scenes are Pexels image.
+                # This preserves the requested final ratio: top 40% scenes are Pexels image.
                 s["visual_source"] = "pexels_image"
                 s["visual_asset_type"] = "image"
                 s["stock_asset_type"] = "image"
@@ -1671,7 +1689,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         routed_ai = sum(1 for x in scene_objects if x.get("visual_source") == "ai")
         for x in scene_objects:
             x["warm_story_ratio_summary"] = {
-                "target": "50pct_ai_50pct_pexels_image_no_video",
+                "target": "60pct_ai_40pct_pexels_image_no_video",
                 "total_scenes": total,
                 "target_pexels_image_scenes": target_pexels_count,
                 "ai_image_scenes": routed_ai,
@@ -1731,7 +1749,7 @@ def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_
     """
     Initial style-based source decision.
 
-    Warm Story final 50% AI / 50% Pexels-image routing is applied later by
+    Warm Story final 60% AI / 40% Pexels-image routing is applied later by
     enforce_frontend_style_visual_budget(). Here we keep warm_storybook as AI by default
     so that non-selected Pexels scenes still get the strongest visual matching.
     """
@@ -2287,9 +2305,9 @@ def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
     """Preferred asset order for downstream rendering.
 
     Warm Story rule is image-only and ratio-locked:
-    - Top 50% selected warm scenes: Pexels image -> local stock image ONLY.
-      No AI fallback here, otherwise the 50% Pexels ratio can collapse to 0%.
-    - Remaining 50% warm scenes: AI image only.
+    - Top 40% selected warm scenes: Pexels image -> local stock image ONLY.
+      No AI fallback here, otherwise the 40% Pexels ratio can collapse to 0%.
+    - Remaining ~60% warm scenes: AI image only.
     - Video options are removed even if legacy code inserted them earlier.
     """
     is_warm = is_warm_story_style(scene_obj.get("video_style_preset", ""))
@@ -2523,210 +2541,6 @@ def build_grounded_visual_prompt(
     ])
     return shorten_prompt_for_sdxl(prompt, max_chars=260, max_words=58)
 
-
-
-
-def _story_text_has_any(text: str, terms) -> bool:
-    t = str(text or "").lower()
-    return any(str(term).lower() in t for term in terms)
-
-
-def build_consistent_character_profile(story_text: str, scene_source: List[Dict[str, Any]], video_style_preset: str = "") -> str:
-    """Create one compact recurring-character description for Warm Story AI image scenes.
-
-    IMPORTANT:
-    - Do NOT hard-code a monk/novice monk as the default character.
-    - Infer the recurring character from story_text and scene_plan.
-    - If the story is about a monk, the profile can become a monk; if the story is about
-      an old man, a girl, a mother, an animal, etc., it must follow that story.
-    - Prompt-only consistency: no extra model/cost.
-    """
-    style = normalize_style_preset(video_style_preset)
-    if not is_warm_story_style(style):
-        return ""
-
-    def _clean_piece(value: str, max_words: int = 12) -> str:
-        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
-        if not value:
-            return ""
-        return " ".join(value.split()[:max_words])
-
-    def _translate_role_from_story(text: str) -> str:
-        """Map only when the story itself clearly says that role.
-        This is not a fixed default; it is a conditional translation for SDXL.
-        """
-        t = str(text or "").lower()
-        role_rules = [
-            (["chú tiểu", "tiểu tăng", "novice monk", "young monk"],
-             "a realistic young Buddhist novice monk, shaved head, orange Buddhist robe"),
-            (["nhà sư", "thiền sư", "tỳ kheo", "monk", "zen master"],
-             "a realistic Buddhist monk, shaved head, saffron robe"),
-            (["ông lão", "cụ già", "old man", "elderly man"],
-             "a realistic elderly man, kind wrinkled face, simple traditional clothing"),
-            (["bà lão", "cụ bà", "old woman", "elderly woman"],
-             "a realistic elderly woman, kind wrinkled face, simple traditional clothing"),
-            (["cậu bé", "bé trai", "boy", "young boy"],
-             "a realistic young boy, natural face, simple clothing"),
-            (["cô bé", "bé gái", "cô gái", "girl", "young girl"],
-             "a realistic young girl, natural face, simple clothing"),
-            (["người mẹ", "bà mẹ", "mother"],
-             "a realistic mother, natural face, simple everyday clothing"),
-            (["người cha", "father"],
-             "a realistic father, natural face, simple everyday clothing"),
-            (["vị vua", "nhà vua", "king"],
-             "a realistic king, mature face, historically appropriate royal clothing"),
-            (["công chúa", "princess"],
-             "a realistic princess, natural face, historically appropriate clothing"),
-        ]
-        for terms, desc in role_rules:
-            if _story_text_has_any(t, terms):
-                return desc
-        return ""
-
-    all_text_parts = [str(story_text or "")]
-    subject_candidates = []
-    appearance_candidates = []
-    clothing_candidates = []
-
-    for item in scene_source or []:
-        sp = item.get("scene_plan", {}) or {}
-        chunk = str(item.get("chunk", "") or item.get("voice_text", "") or item.get("source_chunk", "") or "")
-        all_text_parts.append(chunk)
-
-        subject = _clean_piece(sp.get("main_subject", ""), 14)
-        appearance = _clean_piece(sp.get("appearance", "") or sp.get("clothing_or_appearance", ""), 14)
-        clothing = _clean_piece(sp.get("clothing_or_appearance", ""), 12)
-
-        if subject:
-            subject_candidates.append(subject)
-            all_text_parts.append(subject)
-        if appearance:
-            appearance_candidates.append(appearance)
-            all_text_parts.append(appearance)
-        if clothing:
-            clothing_candidates.append(clothing)
-            all_text_parts.append(clothing)
-
-    all_text = " ".join(all_text_parts)
-
-    # Prefer planner subject if available, because it is specific to this video.
-    main_subject = ""
-    for cand in subject_candidates:
-        c = cand.lower()
-        # Avoid using generic objects/settings as character identity.
-        if not any(x in c for x in ["bình", "jar", "road", "temple", "chùa", "river", "mountain", "forest", "room", "house", "object"]):
-            main_subject = cand
-            break
-
-    role_desc = _translate_role_from_story(all_text)
-
-    if role_desc:
-        base = role_desc
-    elif main_subject:
-        base = f"a realistic recurring main character: {main_subject}"
-    else:
-        # If there is no clear recurring character, do not force one.
-        return ""
-
-    appearance = ""
-    if appearance_candidates:
-        appearance = appearance_candidates[0]
-    elif clothing_candidates:
-        appearance = clothing_candidates[0]
-
-    if appearance and appearance.lower() not in base.lower():
-        base = f"{base}, {appearance}"
-
-    profile = (
-        base
-        + ", consistent identity across all AI-generated scenes, same face shape, same age, "
-          "same hairstyle, same clothing colors, realistic human proportions, natural skin texture"
-    )
-    return shorten_prompt_for_sdxl(profile, max_chars=250, max_words=48)
-
-def build_story_moment_context(narration: str, scene_plan: Dict[str, Any]) -> str:
-    """Add action + emotion + cause/effect so AI images show the story moment, not just nouns."""
-    sp = scene_plan or {}
-    text = str(narration or "").lower()
-    action = _clean_prompt_piece(sp.get("action", ""), 12)
-    expression = _clean_prompt_piece(sp.get("expression", "") or sp.get("emotion", ""), 10)
-    mood = _clean_prompt_piece(sp.get("mood", ""), 8)
-    location = _clean_prompt_piece(sp.get("location", ""), 10)
-
-    cues = []
-    if action:
-        cues.append(f"visible action: {action}")
-    if expression:
-        cues.append(f"clear emotion: {expression}")
-    elif mood:
-        cues.append(f"clear emotion: {mood}")
-
-    if location:
-        cues.append(f"specific setting: {location}")
-
-    # Emotion/action repair from narration. This fixes scenes like: correct monk + jar,
-    # but missing sadness / cracked-jar context.
-    if _story_text_has_any(text, ["buồn", "sad", "đau lòng", "tủi", "thất vọng", "lo lắng", "xấu hổ"]):
-        cues.append("sad facial expression, lowered shoulders, quiet emotional body language")
-    if _story_text_has_any(text, ["vui", "hạnh phúc", "mỉm cười", "smile", "happy"]):
-        cues.append("gentle smile, warm hopeful facial expression")
-    if _story_text_has_any(text, ["nứt", "crack", "cracked", "rạn"]):
-        cues.append("cracked object clearly visible, visible crack line, character looking at the cracked object")
-    if _story_text_has_any(text, ["vỡ", "broken", "bể"]):
-        cues.append("broken object clearly visible, character reacting to the broken object")
-    if _story_text_has_any(text, ["gánh", "carry", "carrying"]):
-        cues.append("character physically carrying the object, hands and object clearly visible")
-    if _story_text_has_any(text, ["nhìn", "look", "looking", "thấy"]):
-        cues.append("character gaze direction clearly shows what they are looking at")
-
-    must_show = sp.get("must_show", []) or []
-    if isinstance(must_show, list) and must_show:
-        cues.append("must visibly show: " + ", ".join([str(x) for x in must_show[:5] if str(x).strip()]))
-
-    cues.append("single narrative moment, show the cause of the emotion, not a generic object portrait")
-    return shorten_prompt_for_sdxl(", ".join([c for c in cues if c]), max_chars=250, max_words=46)
-
-
-def enhance_story_visual_prompt_and_character_consistency(
-    visual_prompt: str,
-    narration: str,
-    scene_plan: Dict[str, Any],
-    video_style_preset: str,
-    main_character_profile: str = "",
-    is_vertical: bool = False,
-) -> str:
-    """Final B6 prompt enhancement before image generation.
-
-    Fixes two common Warm Story issues:
-    1) correct nouns but wrong situation/context;
-    2) same character changing appearance between AI scenes.
-    """
-    style = normalize_style_preset(video_style_preset)
-    if not is_warm_story_style(style):
-        return visual_prompt
-
-    moment_context = build_story_moment_context(narration, scene_plan)
-    human_guard = ""
-    if scene_has_human(scene_plan, narration):
-        human_guard = (
-            "clean readable face, symmetrical eyes, natural nose and mouth, normal hands, "
-            "five fingers per hand, arms and legs connected, no distorted facial features"
-        )
-
-    composition = "medium shot, face readable, important object and character in same frame"
-    if is_vertical:
-        composition = "portrait medium shot, face readable, important object and character in same frame, no cropped head or feet"
-
-    # Put character + story moment at the beginning because later B5 compacting preserves early tokens best.
-    parts = [
-        main_character_profile,
-        moment_context,
-        composition,
-        human_guard,
-        visual_prompt,
-    ]
-    prompt = ", ".join([p for p in parts if str(p or "").strip()])
-    return shorten_prompt_for_sdxl(prompt, max_chars=340, max_words=76)
 
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
     """Add scene-specific negatives without making the negative prompt too long."""
@@ -3030,7 +2844,7 @@ def plan_video_with_ai(
     max_scenes = max(min_scenes, min(max_scenes, 12))
 
     # Warm Story uses a hybrid image strategy, so we keep a balanced scene count
-    # and let the final router choose 50% AI + 50% suitable Pexels images.
+    # and let the final router choose about 60% AI + 40% suitable Pexels images.
     if warm_story_ai_full_mode:
         duration_based = max(4, min(10, int(math.ceil(max(target_total_video_sec, 30) / 16.0))))
         content_based = max(4, min(10, int(math.ceil(max(word_count, 40) / 40.0))))
@@ -3045,7 +2859,7 @@ def plan_video_with_ai(
         warm_story_instruction = f"""
 WARM STORYBOOK HYBRID IMAGE MODE:
 This block applies ONLY when video_style_preset == "warm_storybook". DO NOT apply these rules to other styles.
-- The selected style is warm_storybook, so plan scenes for a hybrid image workflow:  50% AI images and 50% highly suitable Pexels/stock images. The final router will decide exact routing.
+- The selected style is warm_storybook, so plan scenes for a hybrid image workflow: about 60% AI images and 40% highly suitable Pexels/stock images. The final router will decide exact routing.
 - To control cost and render time, do NOT over-split the story, but preserve full narration.
 - Create a balanced number of scenes. Do not over-split the story, but do not merge different actions, locations, or emotional turning points into one scene. Each scene should cover one clear story beat, usually 12–18 seconds.
 - HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
@@ -3180,7 +2994,7 @@ AI IMAGE PROMPT RULES:
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
 VISUAL SOURCE RULES:
-53. STRICT: If video_style_preset == "warm_storybook", the final router will enforce image-only routing: 50% AI images and 50% Pexels/local stock images. It must not use Pexels video for warm_storybook.
+53. STRICT: If video_style_preset == "warm_storybook", the final router will enforce image-only routing: about 60% AI images and about 40% Pexels/local stock images. It must not use Pexels video for warm_storybook.
 54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must set visual_source="stock".
 55. Do NOT mark non-Warm scenes as AI, even if they are spiritual, mystical, ancient, dramatic, cinematic, or hard to find.
 56. For non-Warm styles, stock_query is the main visual instruction. Make stock_query practical, concrete, and searchable in English.
@@ -3193,7 +3007,7 @@ VIDEO STRUCTURE RULES:
 61. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target 50% AI images and 50% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
+62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 60% AI images and 40% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
 63. For all other styles: visual_source must be "stock" for every scene. Do NOT merge narration to reduce scene count. Keep scene segmentation natural and granular based on the current rough text chunks.
 64. For lifestyle: realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
 65. For cinematic_glow: cinematic but realistic stock photos with soft glow and polished lighting.
@@ -3207,8 +3021,6 @@ SELF-CHECK BEFORE FINAL JSON:
 71. Verify the concatenation of all narration_text fields preserves the full USER REQUEST content and does not remove any important sentence or ending.
 72. For each scene, verify: Does visual_prompt show the same moment as narration_text?
 73. Verify every mentioned object/action/place appears in visual_prompt.
-74A. For emotional scenes, visual_prompt MUST show the emotion and the reason for that emotion in the same frame, e.g. character looking sadly at the cracked/broken object, not just a portrait or object shot.
-74B. For recurring characters, keep the same age, clothing, hairstyle, face shape, and color palette across scenes.
 74. Verify stock_query is useful if visual_source="stock".
 75. text_overlay is optional. The renderer will use narration_text as progressive subtitles, showing only the current sentence/chunk at a time. Do not rely on text_overlay for full-screen paragraphs.
 76. Provide motion_intent to help choose stock video/motion template.
@@ -3434,12 +3246,6 @@ def create_adaptive_video_plan(
     if not full_narration_text:
         full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
-    main_character_profile = build_consistent_character_profile(
-        story_text=story_text,
-        scene_source=scene_source,
-        video_style_preset=video_style_preset,
-    )
-
     scene_objects = []
     for i, item in enumerate(scene_source, 1):
         chunk = str(item.get("chunk", "") or "").strip()
@@ -3469,15 +3275,6 @@ def create_adaptive_video_plan(
                 is_vertical=is_vertical
             )
 
-        visual_prompt = enhance_story_visual_prompt_and_character_consistency(
-            visual_prompt=visual_prompt,
-            narration=chunk,
-            scene_plan=scene_plan,
-            video_style_preset=video_style_preset,
-            main_character_profile=main_character_profile,
-            is_vertical=is_vertical,
-        )
-
         scene_negative_prompt = build_scene_negative_prompt(
             global_negative_prompt=global_negative_prompt,
             scene_plan=scene_plan,
@@ -3486,7 +3283,7 @@ def create_adaptive_video_plan(
         )
 
         # Final style-based image routing.
-        # Warm Story is finalized later as 50% AI images + 50% suitable Pexels images. Every other style is stock/Pexels/local-stock only.
+        # Warm Story is finalized later as about 60% AI images + 40% suitable Pexels images. Every other style is stock/Pexels/local-stock only.
         # Do NOT let planner visual_source, scene_requires_ai(), or storytelling keywords override this.
         image_source_mode = get_image_source_mode(job_config)
         raw_visual_source = decide_image_source(
@@ -3518,7 +3315,6 @@ def create_adaptive_video_plan(
             # not the full paragraph at once.
             "text_overlay": chunk,
             "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
-            "main_character_profile": main_character_profile,
         })
 
     # Final style-aware routing guardrail. This is the hard rule requested from frontend dropdown.
@@ -3536,7 +3332,6 @@ def create_adaptive_video_plan(
         "selected_voice": selected_voice,
         "scene_objects": scene_objects,
         "full_narration_text": full_narration_text,
-        "main_character_profile": main_character_profile,
         "is_vertical": is_vertical,
     }
 
@@ -4305,9 +4100,9 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
 
     Warm Story requirements implemented here, not only in B6 metadata:
     - Warm Story uses IMAGE ONLY.
-    - Top 50% routed scenes are Pexels/local stock IMAGE ONLY.
+    - Top 40% routed scenes are Pexels/local stock IMAGE ONLY.
       They do NOT fall back to AI, so the ratio does not collapse.
-    - Remaining 50% routed scenes are AI IMAGE ONLY.
+    - Remaining 60% routed scenes are AI IMAGE ONLY.
     - Warm Story never uses Pexels video or local stock video.
 
     Non-Warm styles keep the old stock-video-first behavior.
@@ -4332,7 +4127,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         scene["allow_video_assets"] = False
         scene["force_image_only"] = True
 
-        # 50% selected scenes: Pexels/local stock IMAGE only.
+        # 40% selected scenes: Pexels/local stock IMAGE only.
         # No AI fallback here. This is the key fix that preserves the requested ratio.
         if visual_source in {"pexels_image", "stock_image"} or scene.get("force_pexels_image_only"):
             min_match = float(scene.get("stock_min_match_score", os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.0")) or 0.0)
@@ -4358,7 +4153,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                     scene["visual_file"] = os.path.basename(img_path)
                     return img_path
 
-            # 2) Local stock image as image-only backup for the 50% stock bucket.
+            # 2) Local stock image as image-only backup for the 40% stock bucket.
             # Still no AI fallback, because user explicitly wants these top scenes assigned to Pexels/stock image.
             if ENABLE_STOCK_ASSETS:
                 stock = find_stock_asset(stock_query, scene_plan, is_vertical=is_vertical)
@@ -4373,9 +4168,9 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                     scene["visual_file"] = os.path.basename(img_path)
                     return img_path
 
-            # Last-resort placeholder keeps the 50% bucket from becoming AI if Pexels/local stock is unavailable.
+            # Last-resort placeholder keeps the 40% bucket from becoming AI if Pexels/local stock is unavailable.
             # In normal production, this should be rare if PEXELS_API_KEY is configured.
-            print(f"⚠️ Warm Story locked Pexels-image scene {int(scene.get('scene_id', 0)):02d} found no image; using placeholder instead of AI to preserve 50/50 route")
+            print(f"⚠️ Warm Story locked Pexels-image scene {int(scene.get('scene_id', 0)):02d} found no image; using placeholder instead of AI to preserve 60/40 route")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
             maybe_apply_style_image_grade(img_path, video_style_preset)
             scene["visual_used"] = "placeholder_pexels_locked_missing"
@@ -4383,7 +4178,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
             scene["visual_file"] = os.path.basename(img_path)
             return img_path
 
-        # 50% remaining warm-story scenes: AI image only.
+        # 60% remaining warm-story scenes: AI image only.
         scene["visual_source"] = "ai"
         return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
