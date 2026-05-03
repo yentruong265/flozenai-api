@@ -331,9 +331,10 @@ DEFAULT_NEGATIVE_PROMPT = (
     "blurry, low quality, worst quality, low detail, noisy, jpeg artifacts, "
     "bad anatomy, deformed body, distorted body, malformed body, broken body, "
     "bad face, deformed face, distorted face, asymmetrical face, ugly face, uncanny face, "
-    "bad eyes, deformed eyes, asymmetrical eyes, crossed eyes, extra eyes, missing eyes, "
-    "bad nose, deformed nose, missing nose, distorted nose, "
-    "bad mouth, deformed mouth, missing mouth, distorted lips, broken teeth, "
+    "melted face, malformed face, broken facial features, duplicate face, cloned face, "
+    "bad eyes, deformed eyes, asymmetrical eyes, crossed eyes, uneven eyes, blurry eyes, extra eyes, missing eyes, "
+    "bad nose, deformed nose, missing nose, distorted nose, unnatural nose, "
+    "bad mouth, deformed mouth, missing mouth, distorted lips, asymmetrical mouth, broken teeth, "
     "bad hands, deformed hands, malformed hands, fused fingers, extra fingers, missing fingers, "
     "bad arms, deformed arms, extra arms, missing arms, broken arms, "
     "bad legs, deformed legs, extra legs, missing legs, broken legs, "
@@ -423,7 +424,7 @@ def _is_vertical_frame(width: int, height: int) -> bool:
 
 
 def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> str:
-    prompt = shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
+    prompt = shorten_prompt_for_sdxl(prompt, max_chars=300, max_words=68)
 
     if _is_vertical_frame(width, height):
         prompt = ", ".join([
@@ -446,7 +447,7 @@ def _enhance_prompt_for_aspect_ratio(prompt: str, width: int, height: int) -> st
             "balanced left-right spacing",
         ])
 
-    return shorten_prompt_for_sdxl(prompt, max_chars=240, max_words=48)
+    return shorten_prompt_for_sdxl(prompt, max_chars=320, max_words=72)
 
 
 def _enhance_negative_prompt_for_aspect_ratio(negative_prompt: str, width: int, height: int) -> str:
@@ -2520,6 +2521,162 @@ def build_grounded_visual_prompt(
     return shorten_prompt_for_sdxl(prompt, max_chars=260, max_words=58)
 
 
+
+
+def _story_text_has_any(text: str, terms) -> bool:
+    t = str(text or "").lower()
+    return any(str(term).lower() in t for term in terms)
+
+
+def build_consistent_character_profile(story_text: str, scene_source: List[Dict[str, Any]], video_style_preset: str = "") -> str:
+    """Create one compact recurring-character description for Warm Story AI image scenes.
+
+    This is intentionally prompt-based only, so it does not add new models or cost.
+    It helps SDXL keep the main character visually consistent across scenes.
+    """
+    style = normalize_style_preset(video_style_preset)
+    if not is_warm_story_style(style):
+        return ""
+
+    all_text_parts = [str(story_text or "")]
+    first_subject = ""
+    first_appearance = ""
+    first_clothing = ""
+
+    for item in scene_source or []:
+        sp = item.get("scene_plan", {}) or {}
+        chunk = str(item.get("chunk", "") or "")
+        all_text_parts.append(chunk)
+        all_text_parts.append(str(sp.get("main_subject", "") or ""))
+        all_text_parts.append(str(sp.get("clothing_or_appearance", "") or sp.get("appearance", "") or ""))
+        if not first_subject and str(sp.get("main_subject", "") or "").strip():
+            first_subject = str(sp.get("main_subject", "") or "").strip()
+        if not first_appearance and str(sp.get("appearance", "") or "").strip():
+            first_appearance = str(sp.get("appearance", "") or "").strip()
+        if not first_clothing and str(sp.get("clothing_or_appearance", "") or "").strip():
+            first_clothing = str(sp.get("clothing_or_appearance", "") or "").strip()
+
+    all_text = " ".join(all_text_parts).lower()
+
+    # Common Vietnamese / Buddhist story characters. These are only identity anchors,
+    # not story-specific prompts.
+    if _story_text_has_any(all_text, ["chú tiểu", "tiểu tăng", "novice monk", "young monk"]):
+        base = (
+            "same recurring young Asian novice monk, shaved head, small gentle round face, calm dark eyes, "
+            "simple orange Buddhist robe, humble childlike appearance"
+        )
+    elif _story_text_has_any(all_text, ["nhà sư", "thiền sư", "tỳ kheo", "monk", "zen master"]):
+        base = (
+            "same recurring Asian Buddhist monk, shaved head, calm oval face, gentle dark eyes, "
+            "simple saffron robe, serene posture"
+        )
+    elif _story_text_has_any(all_text, ["ông lão", "cụ già", "old man", "elderly man"]):
+        base = "same recurring elderly Asian man, kind wrinkled face, gentle eyes, simple traditional clothing"
+    elif _story_text_has_any(all_text, ["bà lão", "old woman", "elderly woman"]):
+        base = "same recurring elderly Asian woman, kind wrinkled face, gentle eyes, simple traditional clothing"
+    elif _story_text_has_any(all_text, ["cậu bé", "bé trai", "boy", "young boy"]):
+        base = "same recurring young Asian boy, gentle face, dark eyes, simple clothing"
+    elif _story_text_has_any(all_text, ["cô gái", "bé gái", "girl", "young girl"]):
+        base = "same recurring young Asian girl, gentle face, dark eyes, simple clothing"
+    elif first_subject:
+        appearance = ", ".join([x for x in [first_appearance, first_clothing] if x])
+        base = f"same recurring main character: {first_subject}"
+        if appearance:
+            base += f", {appearance}"
+    else:
+        return ""
+
+    profile = (
+        base
+        + ", consistent identity across all scenes, same face shape, same age, same hairstyle, same clothing colors"
+    )
+    return shorten_prompt_for_sdxl(profile, max_chars=230, max_words=42)
+
+
+def build_story_moment_context(narration: str, scene_plan: Dict[str, Any]) -> str:
+    """Add action + emotion + cause/effect so AI images show the story moment, not just nouns."""
+    sp = scene_plan or {}
+    text = str(narration or "").lower()
+    action = _clean_prompt_piece(sp.get("action", ""), 12)
+    expression = _clean_prompt_piece(sp.get("expression", "") or sp.get("emotion", ""), 10)
+    mood = _clean_prompt_piece(sp.get("mood", ""), 8)
+    location = _clean_prompt_piece(sp.get("location", ""), 10)
+
+    cues = []
+    if action:
+        cues.append(f"visible action: {action}")
+    if expression:
+        cues.append(f"clear emotion: {expression}")
+    elif mood:
+        cues.append(f"clear emotion: {mood}")
+
+    if location:
+        cues.append(f"specific setting: {location}")
+
+    # Emotion/action repair from narration. This fixes scenes like: correct monk + jar,
+    # but missing sadness / cracked-jar context.
+    if _story_text_has_any(text, ["buồn", "sad", "đau lòng", "tủi", "thất vọng", "lo lắng", "xấu hổ"]):
+        cues.append("sad facial expression, lowered shoulders, quiet emotional body language")
+    if _story_text_has_any(text, ["vui", "hạnh phúc", "mỉm cười", "smile", "happy"]):
+        cues.append("gentle smile, warm hopeful facial expression")
+    if _story_text_has_any(text, ["nứt", "crack", "cracked", "rạn"]):
+        cues.append("cracked object clearly visible, visible crack line, character looking at the cracked object")
+    if _story_text_has_any(text, ["vỡ", "broken", "bể"]):
+        cues.append("broken object clearly visible, character reacting to the broken object")
+    if _story_text_has_any(text, ["gánh", "carry", "carrying"]):
+        cues.append("character physically carrying the object, hands and object clearly visible")
+    if _story_text_has_any(text, ["nhìn", "look", "looking", "thấy"]):
+        cues.append("character gaze direction clearly shows what they are looking at")
+
+    must_show = sp.get("must_show", []) or []
+    if isinstance(must_show, list) and must_show:
+        cues.append("must visibly show: " + ", ".join([str(x) for x in must_show[:5] if str(x).strip()]))
+
+    cues.append("single narrative moment, show the cause of the emotion, not a generic object portrait")
+    return shorten_prompt_for_sdxl(", ".join([c for c in cues if c]), max_chars=250, max_words=46)
+
+
+def enhance_story_visual_prompt_and_character_consistency(
+    visual_prompt: str,
+    narration: str,
+    scene_plan: Dict[str, Any],
+    video_style_preset: str,
+    main_character_profile: str = "",
+    is_vertical: bool = False,
+) -> str:
+    """Final B6 prompt enhancement before image generation.
+
+    Fixes two common Warm Story issues:
+    1) correct nouns but wrong situation/context;
+    2) same character changing appearance between AI scenes.
+    """
+    style = normalize_style_preset(video_style_preset)
+    if not is_warm_story_style(style):
+        return visual_prompt
+
+    moment_context = build_story_moment_context(narration, scene_plan)
+    human_guard = ""
+    if scene_has_human(scene_plan, narration):
+        human_guard = (
+            "clean readable face, symmetrical eyes, natural nose and mouth, normal hands, "
+            "five fingers per hand, arms and legs connected, no distorted facial features"
+        )
+
+    composition = "medium shot, face readable, important object and character in same frame"
+    if is_vertical:
+        composition = "portrait medium shot, face readable, important object and character in same frame, no cropped head or feet"
+
+    # Put character + story moment at the beginning because later B5 compacting preserves early tokens best.
+    parts = [
+        main_character_profile,
+        moment_context,
+        composition,
+        human_guard,
+        visual_prompt,
+    ]
+    prompt = ", ".join([p for p in parts if str(p or "").strip()])
+    return shorten_prompt_for_sdxl(prompt, max_chars=340, max_words=76)
+
 def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[str, Any], narration: str, is_vertical: bool = False) -> str:
     """Add scene-specific negatives without making the negative prompt too long."""
     extras = []
@@ -2999,6 +3156,8 @@ SELF-CHECK BEFORE FINAL JSON:
 71. Verify the concatenation of all narration_text fields preserves the full USER REQUEST content and does not remove any important sentence or ending.
 72. For each scene, verify: Does visual_prompt show the same moment as narration_text?
 73. Verify every mentioned object/action/place appears in visual_prompt.
+74A. For emotional scenes, visual_prompt MUST show the emotion and the reason for that emotion in the same frame, e.g. character looking sadly at the cracked/broken object, not just a portrait or object shot.
+74B. For recurring characters, keep the same age, clothing, hairstyle, face shape, and color palette across scenes.
 74. Verify stock_query is useful if visual_source="stock".
 75. text_overlay is optional. The renderer will use narration_text as progressive subtitles, showing only the current sentence/chunk at a time. Do not rely on text_overlay for full-screen paragraphs.
 76. Provide motion_intent to help choose stock video/motion template.
@@ -3224,6 +3383,12 @@ def create_adaptive_video_plan(
     if not full_narration_text:
         full_narration_text = sanitize_tts_text(story_text, max_chars=4000)
 
+    main_character_profile = build_consistent_character_profile(
+        story_text=story_text,
+        scene_source=scene_source,
+        video_style_preset=video_style_preset,
+    )
+
     scene_objects = []
     for i, item in enumerate(scene_source, 1):
         chunk = str(item.get("chunk", "") or "").strip()
@@ -3252,6 +3417,15 @@ def create_adaptive_video_plan(
                 style_locked=style_locked,
                 is_vertical=is_vertical
             )
+
+        visual_prompt = enhance_story_visual_prompt_and_character_consistency(
+            visual_prompt=visual_prompt,
+            narration=chunk,
+            scene_plan=scene_plan,
+            video_style_preset=video_style_preset,
+            main_character_profile=main_character_profile,
+            is_vertical=is_vertical,
+        )
 
         scene_negative_prompt = build_scene_negative_prompt(
             global_negative_prompt=global_negative_prompt,
@@ -3293,6 +3467,7 @@ def create_adaptive_video_plan(
             # not the full paragraph at once.
             "text_overlay": chunk,
             "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
+            "main_character_profile": main_character_profile,
         })
 
     # Final style-aware routing guardrail. This is the hard rule requested from frontend dropdown.
@@ -3310,6 +3485,7 @@ def create_adaptive_video_plan(
         "selected_voice": selected_voice,
         "scene_objects": scene_objects,
         "full_narration_text": full_narration_text,
+        "main_character_profile": main_character_profile,
         "is_vertical": is_vertical,
     }
 
