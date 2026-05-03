@@ -724,6 +724,8 @@ def generate_image(
 
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
+# ===== CELL 6 =====
+# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
 import os
 import re
@@ -2858,12 +2860,12 @@ WARM STORYBOOK HYBRID IMAGE MODE:
 This block applies ONLY when video_style_preset == "warm_storybook". DO NOT apply these rules to other styles.
 - The selected style is warm_storybook, so plan scenes for a hybrid image workflow: about 60% AI images and 40% highly suitable Pexels/stock images. The final router will decide exact routing.
 - To control cost and render time, do NOT over-split the story, but preserve full narration.
-- Create a balanced number of scenes. Do not over-split the story, but do not merge different actions, locations, or emotional turning points into one scene. Each scene should cover one clear story beat, usually 12–18 seconds.
+- Create one scene per clear story beat. Do not merge different actions, locations, characters, objects, emotional turns, or narration chunks into one scene. Each scene should usually cover about 6–12 seconds for a 1-minute warm story.
 - HARD RULE: Do NOT omit, summarize away, delete, or drop any part of USER REQUEST. Full narration content must be preserved across scenes.
 - If preserving the full content requires more scenes than the target range, you may exceed the target range. Completeness is more important than scene count.
-- Each scene may cover a longer narration segment if the visual moment is coherent.
-- Prefer one strong cinematic image per meaningful story beat: opening, character/context, conflict, turning point, insight, ending.
-- Do not create separate scenes for tiny sentence fragments unless the visual changes clearly.
+- A scene may only combine adjacent narration when both sentences show the same subject, same action, and same location.
+- Prefer multiple clear visual beats: opening, character/context, action/problem, reaction, turning point, insight, ending.
+- Do not create tiny fragments, but do create a new scene whenever the visible action, place, character relationship, or emotion changes.
 """
 
     prompt = f"""
@@ -2916,7 +2918,7 @@ SCENE PLANNING RULES:
 6. Choose the scene count naturally based on the content and target length. Treat {min_scenes} to {max_scenes} scenes as a soft target, not a hard cap.
 7. HARD RULE: Preserve 100% of the USER REQUEST content across all narration_text fields. Do not omit endings, examples, dialogue, lessons, calls to action, or any important sentence.
 8. If the script is long, create additional scenes rather than deleting content.
-9. For Warm Story hybrid image mode, reduce render cost by merging adjacent narration into richer coherent story beats, but never cut the narration.
+9. For Warm Story hybrid image mode, DO NOT merge multiple rough chunks into one scene just to reduce cost. Keep one clear story beat per scene, and preserve the full narration.
 10. Even if the input is one paragraph, create coherent scenes when the video needs visual progression.
 11. Each scene must represent a different moment, action, camera framing, or visual idea.
 12. Each scene must include narration_text. This is the spoken narration for that scene.
@@ -3004,7 +3006,7 @@ VIDEO STRUCTURE RULES:
 61. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 60% AI images and 40% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
+62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 60% AI images and 40% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. Do NOT merge adjacent rough chunks unless they are extremely short and show the exact same visual moment. Preserve 100% of the original narration content.
 63. For all other styles: visual_source must be "stock" for every scene. Do NOT merge narration to reduce scene count. Keep scene segmentation natural and granular based on the current rough text chunks.
 64. For lifestyle: realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
 65. For cinematic_glow: cinematic but realistic stock photos with soft glow and polished lighting.
@@ -3090,10 +3092,15 @@ Return JSON exactly with this schema:
     else:
         data["video_style_preset"] = normalize_style_preset(data.get("video_style_preset", ""))
 
-    # Production guardrail: keep all planner scenes to avoid cutting user content.
+    # Production guardrail: keep planner scenes only when they are not overly compressed.
     scenes = clean_ai_scene_list(data, min_scenes=min_scenes, max_scenes=max_scenes)
-    if len(scenes) < 2:
-        raise ValueError(f"AI planner returned too few scenes: {len(scenes)}")
+    min_returned_scenes = 2
+    if warm_story_stock_first_mode:
+        rough_count = max(1, len(scene_chunks or []))
+        min_returned_scenes = max(3, int(math.ceil(rough_count * 0.80)))
+        min_returned_scenes = min(min_returned_scenes, max_scenes)
+    if len(scenes) < min_returned_scenes:
+        raise ValueError(f"AI planner returned too few scenes: {len(scenes)} < {min_returned_scenes}")
 
     data["scenes"] = scenes
     return data
@@ -3130,14 +3137,19 @@ def create_adaptive_video_plan(
     )
     portal_style = normalize_style_preset(portal_style_raw) if portal_style_raw else ""
 
-    # Warm Story is AI-image heavy; make fallback chunks more efficient without hard-capping scene count.
-    # The AI planner still decides the final scene count, but rough chunks become less fragmented.
+    # Warm Story: do NOT let rough chunks become too long.
+    # The previous 48-85 words/scene caused 1-minute stories to collapse into ~2 scenes.
+    # We now use 22-30 words/scene so the planner sees enough natural story beats,
+    # while still avoiding tiny sentence fragments.
     if portal_style == "warm_storybook":
-        target_sec = _safe_int(job_config.get("target_total_video_sec") or job_config.get("target_total_sec"), 60)
-        adaptive_words = max(target_words_per_scene, min(85, max(48, int(max(target_sec, 30) / 2.2))))
-        initial_chunks = chunk_story(story_text, target_words=adaptive_words)
+        try:
+            warm_words_per_scene = int(job_config.get("warm_story_words_per_scene", os.getenv("WARM_STORY_WORDS_PER_SCENE", "26")))
+        except Exception:
+            warm_words_per_scene = 26
+        warm_words_per_scene = max(22, min(warm_words_per_scene, 30))
+        initial_chunks = chunk_story(story_text, target_words=warm_words_per_scene)
         if not initial_chunks:
-            initial_chunks = force_scene_chunks_by_words(story_text, min_scenes=3, max_scenes=8)
+            initial_chunks = force_scene_chunks_by_words(story_text, min_scenes=4, max_scenes=10)
 
     style_locked = is_style_locked(job_config)
     is_vertical = is_vertical_aspect(job_config)
@@ -3210,9 +3222,17 @@ def create_adaptive_video_plan(
     plan_scenes = clean_ai_scene_list(ai_plan or {}, min_scenes=min_scenes, max_scenes=max_scenes)
 
     # Critical fix:
-    # If AI planner returns multiple scenes, those scenes become the source of truth.
-    # Otherwise fallback creates multiple chunks from the story text.
-    if used_ai and len(plan_scenes) >= 2:
+    # If AI planner returns enough granular scenes, those scenes become the source of truth.
+    # For warm_storybook, reject overly-compressed AI plans that merge too much narration
+    # compared with the rough chunks. This prevents a 1-minute story from becoming only 2 scenes.
+    min_ai_plan_scenes = 2
+    if video_style_preset == "warm_storybook":
+        rough_count = max(1, len(initial_chunks))
+        # Require the AI plan to keep at least ~80% of rough story beats, with a minimum of 3.
+        min_ai_plan_scenes = max(3, int(math.ceil(rough_count * 0.80)))
+        min_ai_plan_scenes = min(min_ai_plan_scenes, max_scenes)
+
+    if used_ai and len(plan_scenes) >= min_ai_plan_scenes:
         scene_source = []
         for idx, scene in enumerate(plan_scenes, 1):
             fallback = initial_chunks[min(idx - 1, len(initial_chunks) - 1)] if initial_chunks else story_text
