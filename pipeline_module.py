@@ -722,12 +722,6 @@ def generate_image(
 
     raise RuntimeError(f"generate_image failed: {repr(last_err)}")
 
-
-# ===== CELL 6 =====
-# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
-
-
-
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
@@ -889,7 +883,7 @@ STYLE_PRESETS = {
 BASE_NEGATIVE_PROMPT = (
     "blurry, low quality, bad anatomy, deformed face, asymmetrical face, ugly eyes, "
     "bad hands, fused fingers, extra fingers, missing fingers, extra limbs, missing limbs, "
-    "duplicate subject, cloned face, cropped, cut off, out of frame, text, watermark, logo, subtitles, "
+    "duplicate subject, cloned face, missing hand, missing foot, missing arm, missing leg, fused body, deformed hands, deformed face, cropped, cut off, out of frame, text, watermark, logo, subtitles, "
     "oversaturated, messy composition, distorted body, broken perspective, uncanny face, plastic skin"
 )
 
@@ -1641,17 +1635,24 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
             s["forbidden_asset_types"] = ["video", "pexels_video", "local_stock_video"]
 
             if idx in pexels_image_indexes:
-                # Pexels/local image only. No video option appears anywhere in the preference list.
+                # Pexels/local IMAGE route. This route is intentionally locked:
+                # - no Pexels video
+                # - no local stock video
+                # - no AI fallback
+                # This preserves the requested final ratio: top 40% scenes are Pexels image.
                 s["visual_source"] = "pexels_image"
                 s["visual_asset_type"] = "image"
                 s["stock_asset_type"] = "image"
-                s["asset_preference_order"] = ["pexels_image", "local_stock_image", "ai_image_fallback"]
+                s["asset_preference_order"] = ["pexels_image", "local_stock_image"]
                 s["force_pexels_image_only"] = True
                 s["force_image_only"] = True
-                s["warm_story_stock_kind"] = "pexels_image_only"
-                s["ai_fallback_allowed"] = True
-                s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.62"))
-                s["routing_reason"] = "warm_storybook_40pct_pexels_image_no_video_multi_person_priority"
+                s["force_no_ai_fallback"] = True
+                s["warm_story_stock_kind"] = "pexels_image_only_locked_40pct"
+                s["ai_fallback_allowed"] = False
+                # Pexels-selected scenes must still get a Pexels image. Keep the gate soft;
+                # scene choice already happened through _warm_story_pexels_image_score().
+                s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.0"))
+                s["routing_reason"] = "warm_storybook_locked_40pct_pexels_image_no_video_no_ai_fallback_multi_person_priority"
             else:
                 # AI image only. This is the 60% majority route.
                 s["visual_source"] = "ai"
@@ -2300,9 +2301,10 @@ def warm_story_allows_ai_fallback(scene_obj: Dict[str, Any]) -> bool:
 def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
     """Preferred asset order for downstream rendering.
 
-    Warm Story rule is image-only:
-    - Pexels-selected warm scenes: Pexels image -> local stock image -> AI fallback.
-    - AI-selected warm scenes: AI image only.
+    Warm Story rule is image-only and ratio-locked:
+    - Top 40% selected warm scenes: Pexels image -> local stock image ONLY.
+      No AI fallback here, otherwise the 40% Pexels ratio can collapse to 0%.
+    - Remaining ~60% warm scenes: AI image only.
     - Video options are removed even if legacy code inserted them earlier.
     """
     is_warm = is_warm_story_style(scene_obj.get("video_style_preset", ""))
@@ -2310,7 +2312,7 @@ def get_scene_asset_preference_order(scene_obj: Dict[str, Any]) -> List[str]:
 
     if is_warm:
         if scene_obj.get("visual_source") in {"pexels_image", "stock_image"} or scene_obj.get("force_pexels_image_only"):
-            base = ["pexels_image", "local_stock_image", "ai_image_fallback"]
+            base = ["pexels_image", "local_stock_image"]
         else:
             base = ["ai_image"]
         return [x for x in base if "video" not in str(x).lower()]
@@ -2555,9 +2557,13 @@ def build_scene_negative_prompt(global_negative_prompt: str, scene_plan: Dict[st
 
     if scene_has_human(scene_plan, narration):
         extras.extend([
-            "bad face", "uncanny face", "asymmetrical eyes", "bad hands",
-            "fused fingers", "extra fingers", "missing fingers", "extra arms", "extra legs",
-            "detached limbs", "disconnected body parts", "broken anatomy",
+            "bad face", "deformed face", "distorted face", "uncanny face", "asymmetrical face",
+            "asymmetrical eyes", "cross eyes", "bad eyes", "bad mouth", "bad teeth",
+            "bad hands", "deformed hands", "mutated hands", "fused fingers", "extra fingers",
+            "missing fingers", "six fingers", "four fingers", "missing hand", "missing arm",
+            "missing leg", "missing foot", "extra arms", "extra legs", "extra limb", "duplicate limb",
+            "detached limbs", "disconnected body parts", "fused body", "broken anatomy",
+            "long neck", "twisted torso", "malformed body", "bad proportions",
             "six fingers", "four fingers", "three fingers", "mangled fingers",
             "deformed hands", "merged hands", "hands merged with clothing",
             "missing wrist", "broken wrist", "broken elbow", "broken shoulder",
@@ -3793,6 +3799,7 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         return np.array(img.convert("RGB"))
 
     return VideoClip(frame_function=make_frame, duration=duration).with_fps(int(getattr(clip, "fps", 24) or 24))
+
 # ===== CELL 7 =====
 # B7 — run_job FIXED FULL (single narration audio, no overlap, with progress, safe return)
 
@@ -3932,13 +3939,16 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
 
 
 def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
-    """Prepare one scene visual with Pippit-style routing.
+    """Prepare one scene visual with strict warm-story routing.
 
-    Final production rule:
-    - warm_storybook scenes are AI-image only.
-    - all other styles are stock-first and prefer real stock VIDEO for motion.
-    - if stock video is not available, use stock image + motion.
-    - if stock is missing for non-Warm styles, use a fast placeholder instead of SDXL.
+    Warm Story requirements implemented here, not only in B6 metadata:
+    - Warm Story uses IMAGE ONLY.
+    - Top ~40% routed scenes are Pexels/local stock IMAGE ONLY.
+      They do NOT fall back to AI, so the ratio does not collapse.
+    - Remaining ~60% routed scenes are AI IMAGE ONLY.
+    - Warm Story never uses Pexels video or local stock video.
+
+    Non-Warm styles keep the old stock-video-first behavior.
     """
     visual_source = str(scene.get("visual_source", "") or "").lower()
     is_vertical = _is_vertical_frame(width, height)
@@ -3946,21 +3956,89 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
     narration = scene.get("voice_text") or scene.get("source_chunk") or ""
     scene_plan = scene.get("scene_plan", {}) or {}
     video_style_preset = scene.get("video_style_preset", "") or ""
+    is_warm = is_warm_story_style(video_style_preset)
 
+    stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
+    scene["stock_query"] = stock_query
+
+    # ------------------------------------------------------------------
+    # STRICT WARM STORY IMAGE-ONLY ROUTING
+    # ------------------------------------------------------------------
+    if is_warm:
+        scene["disable_pexels_video"] = True
+        scene["disable_stock_video"] = True
+        scene["allow_video_assets"] = False
+        scene["force_image_only"] = True
+
+        # 40% selected scenes: Pexels/local stock IMAGE only.
+        # No AI fallback here. This is the key fix that preserves the requested ratio.
+        if visual_source in {"pexels_image", "stock_image"} or scene.get("force_pexels_image_only"):
+            min_match = float(scene.get("stock_min_match_score", os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.0")) or 0.0)
+
+            # 1) Prefer Pexels image. Do not call Pexels video.
+            pexels = fetch_pexels_photo(
+                stock_query,
+                is_vertical=is_vertical,
+                scene_plan=scene_plan,
+                min_match_score=min_match,
+            )
+            if pexels:
+                print(f"📸 Warm Story locked Pexels IMAGE for scene {int(scene.get('scene_id', 0)):02d}: query={pexels.get('query')!r} score={pexels.get('match_score')}")
+                ok = prepare_pexels_image(pexels["url"], img_path, width, height)
+                if ok:
+                    maybe_apply_style_image_grade(img_path, video_style_preset)
+                    scene["visual_used"] = "stock_image_pexels_locked_40pct"
+                    scene["visual_source"] = "pexels_image"
+                    scene["stock_query_used"] = pexels.get("query", "")
+                    scene["pexels_id"] = pexels.get("pexels_id", "")
+                    scene["pexels_photographer"] = pexels.get("photographer", "")
+                    scene["pexels_match_score"] = pexels.get("match_score", "")
+                    scene["visual_file"] = os.path.basename(img_path)
+                    return img_path
+
+            # 2) Local stock image as image-only backup for the 40% stock bucket.
+            # Still no AI fallback, because user explicitly wants these top scenes assigned to Pexels/stock image.
+            if ENABLE_STOCK_ASSETS:
+                stock = find_stock_asset(stock_query, scene_plan, is_vertical=is_vertical)
+                if stock:
+                    print(f"🖼️ Warm Story locked local stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
+                    prepare_stock_image(stock["path"], img_path, width, height)
+                    maybe_apply_style_image_grade(img_path, video_style_preset)
+                    scene["visual_used"] = "stock_image_local_locked_40pct"
+                    scene["visual_source"] = "pexels_image"
+                    scene["stock_asset_path"] = stock.get("path")
+                    scene["stock_match_score"] = stock.get("match_score")
+                    scene["visual_file"] = os.path.basename(img_path)
+                    return img_path
+
+            # Last-resort placeholder keeps the 40% bucket from becoming AI if Pexels/local stock is unavailable.
+            # In normal production, this should be rare if PEXELS_API_KEY is configured.
+            print(f"⚠️ Warm Story locked Pexels-image scene {int(scene.get('scene_id', 0)):02d} found no image; using placeholder instead of AI to preserve 60/40 route")
+            create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+            maybe_apply_style_image_grade(img_path, video_style_preset)
+            scene["visual_used"] = "placeholder_pexels_locked_missing"
+            scene["visual_source"] = "pexels_image"
+            scene["visual_file"] = os.path.basename(img_path)
+            return img_path
+
+        # 60% remaining warm-story scenes: AI image only.
+        scene["visual_source"] = "ai"
+        return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
+
+    # ------------------------------------------------------------------
+    # NON-WARM EXISTING STOCK-FIRST ROUTING
+    # ------------------------------------------------------------------
     image_source_mode = scene.get("image_source_mode") or os.getenv("IMAGE_SOURCE_MODE", IMAGE_SOURCE_MODE)
     try:
         smart_source = decide_image_source(narration, scene_plan, video_style_preset, image_source_mode=image_source_mode)
     except Exception:
-        smart_source = "ai" if is_warm_story_style(video_style_preset) else "stock"
+        smart_source = "stock"
 
     if visual_source in {"stock", "ai"}:
         smart_source = visual_source
 
     if smart_source == "stock":
-        stock_query = scene.get("stock_query") or build_stock_query(narration, scene_plan, is_vertical=is_vertical) or scene.get("visual_prompt") or narration
-        scene["stock_query"] = stock_query
-
-        # 1) Prefer local stock VIDEO assets. This is the closest low-cost Pippit-style behavior.
+        # 1) Prefer local stock VIDEO assets for non-Warm styles.
         if ENABLE_STOCK_ASSETS:
             stock_video = find_stock_video_asset(stock_query, scene_plan, is_vertical=is_vertical)
             if stock_video:
@@ -3970,12 +4048,11 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 scene["visual_video_path"] = stock_video.get("path")
                 scene["stock_asset_path"] = stock_video.get("path")
                 scene["stock_match_score"] = stock_video.get("match_score")
-                # Create a tiny placeholder image for metadata compatibility.
                 create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
 
-        # 2) Try Pexels stock VIDEO before still image.
+        # 2) Try Pexels stock VIDEO before still image for non-Warm styles.
         pexels_video = fetch_pexels_video(stock_query, is_vertical=is_vertical)
         if pexels_video:
             video_path = os.path.splitext(img_path)[0] + ".mp4"
@@ -4021,17 +4098,13 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
 
-        ai_fallback_allowed = bool(scene.get("ai_fallback_allowed", False))
-        if ai_fallback_allowed and is_warm_story_style(video_style_preset):
-            print(f"ℹ️ No suitable stock/Pexels visual found for scene {int(scene.get('scene_id', 0)):02d}; falling back to AI image")
-        else:
-            print(f"⚡ No stock/Pexels visual for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled for non-Warm style, using fast placeholder")
-            create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
-            maybe_apply_style_image_grade(img_path, video_style_preset)
-            scene["visual_used"] = "placeholder_stock_missing"
-            scene["visual_source"] = "stock"
-            scene["visual_file"] = os.path.basename(img_path)
-            return img_path
+        print(f"⚡ No stock/Pexels visual for scene {int(scene.get('scene_id', 0)):02d}; AI fallback disabled for non-Warm style, using fast placeholder")
+        create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
+        maybe_apply_style_image_grade(img_path, video_style_preset)
+        scene["visual_used"] = "placeholder_stock_missing"
+        scene["visual_source"] = "stock"
+        scene["visual_file"] = os.path.basename(img_path)
+        return img_path
 
     return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
 
@@ -4367,6 +4440,8 @@ def run_job(job_config, job_id):
 
         # Pippit-style: use real stock video when available; otherwise animate still image.
         stock_video_path = scene.get("visual_video_path", "")
+        if is_warm_story_style(video_style_preset):
+            stock_video_path = ""
         if stock_video_path and os.path.exists(str(stock_video_path)):
             vclip = make_stock_video_clip(
                 video_path=stock_video_path,
