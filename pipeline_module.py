@@ -722,8 +722,6 @@ def generate_image(
 
     raise RuntimeError(f"generate_image failed: {repr(last_err)}")
 
-# ===== CELL 6 =====
-# B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
 
 # ===== CELL 6 =====
 # B6 — Planner + TTS + motion engine (FINAL reviewed, aspect-ratio-aware, single-voice, ready for full narration)
@@ -3307,7 +3305,7 @@ def create_adaptive_video_plan(
             # Use the full scene narration for subtitles.
             # The renderer below will show only the current sentence/chunk over time,
             # not the full paragraph at once.
-            "text_overlay": "",
+            "text_overlay": chunk,
             "motion_intent": str(raw_scene_plan.get("motion_intent", "") or raw_scene_plan.get("motion_prompt", "") or "").strip(),
         })
 
@@ -3798,6 +3796,159 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
 
     return VideoClip(frame_function=make_frame, duration=duration).with_fps(int(getattr(clip, "fps", 24) or 24))
 
+
+
+
+# ===== AUTO DEDUPE HELPERS — prevent repeated narration/text segments =====
+def _dedupe_normalize_text(text: str) -> str:
+    """Normalize text for duplicate detection without changing the original wording."""
+    text = sanitize_tts_text(text or "", max_chars=2000).lower()
+    text = re.sub(r"[\"“”'‘’`]+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[\.,!?;:…]+$", "", text).strip()
+    return text
+
+
+def _word_tokens_for_overlap(text: str) -> List[str]:
+    text = _dedupe_normalize_text(text)
+    return [w for w in re.split(r"\s+", text) if w]
+
+
+def _remove_prefix_overlap(prev_text: str, cur_text: str, min_words: int = 6, max_words: int = 40) -> str:
+    """If current scene begins by repeating the end of previous scene, remove the repeated prefix."""
+    cur_original = sanitize_tts_text(cur_text or "", max_chars=1200)
+    if not prev_text or not cur_original:
+        return cur_original
+
+    prev_words = _word_tokens_for_overlap(prev_text)
+    cur_words = _word_tokens_for_overlap(cur_original)
+    if len(prev_words) < min_words or len(cur_words) < min_words:
+        return cur_original
+
+    max_k = min(max_words, len(prev_words), len(cur_words))
+    best_k = 0
+    for k in range(max_k, min_words - 1, -1):
+        if prev_words[-k:] == cur_words[:k]:
+            best_k = k
+            break
+
+    if best_k <= 0:
+        return cur_original
+
+    # Remove approximately best_k words from the ORIGINAL current text, preserving punctuation after that point.
+    original_words = cur_original.split()
+    trimmed = " ".join(original_words[best_k:]).strip()
+    return trimmed or ""
+
+
+def _dedupe_repeated_sentences(text: str, max_chars: int = 4000) -> str:
+    """Remove accidental repeated adjacent/recent sentences before TTS."""
+    text = sanitize_tts_text(text or "", max_chars=max_chars)
+    if not text:
+        return ""
+
+    parts = re.split(r"(?<=[\.\!\?…])\s+", text)
+    cleaned = []
+    recent_keys = []
+
+    for part in parts:
+        part = sanitize_tts_text(part, max_chars=1200)
+        if not part:
+            continue
+        key = _dedupe_normalize_text(part)
+        if not key:
+            continue
+
+        # Exact adjacent duplicate or repeated sentence within the last 3 sentences.
+        if cleaned and key == _dedupe_normalize_text(cleaned[-1]):
+            continue
+        if key in recent_keys[-3:]:
+            continue
+
+        # Boundary overlap: current sentence starts with words repeated from previous sentence.
+        if cleaned:
+            trimmed = _remove_prefix_overlap(cleaned[-1], part, min_words=6, max_words=25)
+            if trimmed and _dedupe_normalize_text(trimmed) != key:
+                part = trimmed
+                key = _dedupe_normalize_text(part)
+                if not key:
+                    continue
+
+        cleaned.append(part)
+        recent_keys.append(key)
+
+    return sanitize_tts_text(" ".join(cleaned), max_chars=max_chars)
+
+
+def _fix_scene_text_repetition(scene_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fix duplicated scene narration automatically.
+
+    - Removes repeated adjacent scene text.
+    - Trims overlap where a scene starts by repeating the previous scene ending.
+    - Reassigns scene_id so downstream image/audio/video arrays stay aligned.
+    """
+    fixed = []
+    seen_recent = []
+    prev_text = ""
+
+    for scene in scene_objects or []:
+        s = dict(scene)
+        raw_text = sanitize_tts_text(s.get("voice_text") or s.get("source_chunk") or "", max_chars=1200)
+        if not raw_text:
+            fixed.append(s)
+            continue
+
+        # First remove repeated sentences inside the same scene.
+        cleaned_text = _dedupe_repeated_sentences(raw_text, max_chars=1200)
+
+        # Then trim overlap with previous scene.
+        cleaned_text = _remove_prefix_overlap(prev_text, cleaned_text, min_words=6, max_words=40)
+        cleaned_text = sanitize_tts_text(cleaned_text, max_chars=1200)
+        key = _dedupe_normalize_text(cleaned_text)
+
+        # Drop only clear repeated scene chunks, not intentional short phrases.
+        if key and (key == _dedupe_normalize_text(prev_text) or key in seen_recent[-2:]):
+            continue
+
+        if cleaned_text:
+            s["voice_text"] = cleaned_text
+            s["source_chunk"] = cleaned_text
+            # Keep overlay aligned with the deduped narration.
+            if s.get("text_overlay"):
+                s["text_overlay"] = cleaned_text
+            prev_text = cleaned_text
+            seen_recent.append(key)
+
+        fixed.append(s)
+
+    # Reassign scene ids after removing duplicates so filenames/timeline remain consistent.
+    for i, s in enumerate(fixed, start=1):
+        s["scene_id"] = i
+
+    return fixed
+
+
+def _build_safe_full_narration(adaptive_plan: Dict[str, Any], scene_objects: List[Dict[str, Any]], story_text: str) -> str:
+    """Build final narration text for TTS and remove accidental repeats automatically."""
+    raw = sanitize_tts_text(adaptive_plan.get("full_narration_text", ""), max_chars=4000)
+
+    if not raw:
+        raw = sanitize_tts_text(
+            " ".join([
+                str(s.get("voice_text") or s.get("source_chunk") or "")
+                for s in scene_objects
+                if str(s.get("voice_text") or s.get("source_chunk") or "").strip()
+            ]),
+            max_chars=4000,
+        )
+
+    if not raw:
+        raw = sanitize_tts_text(story_text, max_chars=4000)
+
+    deduped = _dedupe_repeated_sentences(raw, max_chars=4000)
+    return deduped or raw
+
+
 # ===== CELL 7 =====
 # B7 — run_job FIXED FULL (single narration audio, no overlap, with progress, safe return)
 
@@ -3878,9 +4029,7 @@ def allocate_scene_durations_from_narration(scene_objects, total_audio_duration,
 
     weights = []
     for s in scene_objects:
-        # Use voice_text only as the single source for narration timing.
-        # Do not fallback to source_chunk here, because source_chunk may duplicate voice_text.
-        txt = str(s.get("voice_text", "") or "").strip()
+        txt = str(s.get("voice_text", "") or s.get("source_chunk", "") or "").strip()
         w = max(1, len(txt.split()))
         weights.append(w)
 
@@ -4181,6 +4330,9 @@ def run_job(job_config, job_id):
         num_inference_steps = min(max(num_inference_steps, 8), 24)
         guidance_scale = max(1.0, min(guidance_scale, 8.0))
     scene_objects = adaptive_plan["scene_objects"]
+    # Auto-fix accidental repeated/overlapped scene narration before any image/audio work.
+    scene_objects = _fix_scene_text_repetition(scene_objects)
+    adaptive_plan["scene_objects"] = scene_objects
     selected_voice = adaptive_plan.get(
         "selected_voice",
         job_config.get("primary_voice") or job_config.get("voice") or "fable"
@@ -4201,8 +4353,8 @@ def run_job(job_config, job_id):
         "global_negative_prompt": adaptive_plan["global_negative_prompt"],
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
-        "full_narration_text": "",
-        "timeline_mode": "pippit_style_stock_video_per_scene_tts_audio",
+        "full_narration_text": adaptive_plan.get("full_narration_text", ""),
+        "timeline_mode": "pippit_style_stock_video_single_full_narration_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
@@ -4304,111 +4456,113 @@ def run_job(job_config, job_id):
         raise RuntimeError("Some scene images were not generated")
 
     write_status(job_dir, job_id, "running", {
-        "step": "generate_scene_audio",
+        "step": "generate_full_narration_audio",
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
         "progress_pct": 50,
-        "eta_sec": max(20, total_scenes * 5),
+        "eta_sec": 20,
     })
 
     # ------------------------------------------------------------------
-    # PER-SCENE TTS MODE — BEST ALIGNMENT VERSION
+    # SINGLE FULL NARRATION AUDIO MODE
     # ------------------------------------------------------------------
-    # Each scene gets its own narration audio. Each clip duration is based on
-    # that scene's real audio duration. Text overlay uses the same voice_text.
-    # This is the safest mode for voice/text/scene alignment.
+    # Old behavior generated one TTS file per scene. That made narration
+    # speed inconsistent because OpenAI/Edge TTS may speak each segment with
+    # a different rhythm. New behavior generates one full narration track,
+    # then allocates scene durations from that single audio duration.
+    # Build narration safely and remove accidental repeated sentences/overlaps before TTS.
+    full_narration_text = _build_safe_full_narration(adaptive_plan, scene_objects, story_text)
 
+    full_audio_raw_path = os.path.join(AUDIO_DIR, "full_narration_raw.mp3")
     tts_started_at = time.time()
+    tts_meta = run_async_safely(save_tts(
+        text=full_narration_text,
+        out_path=full_audio_raw_path,
+        voice=selected_voice,
+        rate=job_config.get("tts_rate", "+0%"),
+        pitch=job_config.get("tts_pitch", "+0Hz"),
+    ))
+
+    if not os.path.exists(full_audio_raw_path) or os.path.getsize(full_audio_raw_path) <= 0:
+        raise RuntimeError(f"Full narration TTS output missing or empty: {full_audio_raw_path}")
+
+    # Apply one consistent speed factor to the whole narration track.
+    # This keeps the entire voice rhythm uniform, unlike per-scene speed-up.
     speech_speed = _clamp_float(job_config.get("speech_speed"), 1.18, min_value=0.85, max_value=1.35)
-    scene_pause_sec = _clamp_float(job_config.get("scene_pause_sec"), 0.08, min_value=0.0, max_value=0.35)
+    full_audio_path = speed_up_audio_ffmpeg(full_audio_raw_path, speech_speed)
 
-    audio_paths = []
-    audio_clips = []
-    scene_durations = []
+    full_audio_clip = AudioFileClip(full_audio_path)
+    total_audio_duration = float(full_audio_clip.duration or 0)
+    if total_audio_duration <= 0:
+        try:
+            full_audio_clip.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Full narration audio duration is zero: {full_audio_path}")
+
+    # Allocate scene durations according to the amount of narration text per scene.
+    # The sum is forced to match the full audio duration, so the final video stays synced.
+    scene_weights = []
     scene_text_log = []
-    tts_engine_used = "unknown"
-    voice_used = selected_voice
-
     for idx, scene in enumerate(scene_objects, start=1):
-        scene_id = int(scene.get("scene_id", idx))
-        voice_text = sanitize_tts_text(scene.get("voice_text") or "", max_chars=900)
-
-        # Rare fallback only. Normal B6 output should always have voice_text.
+        voice_text = sanitize_tts_text(scene.get("voice_text") or scene.get("source_chunk") or "", max_chars=900)
         if not voice_text:
-            voice_text = sanitize_tts_text(scene.get("source_chunk") or "", max_chars=900)
-
-        if not voice_text:
-            raise ValueError(f"Scene {scene_id} has empty voice_text; cannot generate per-scene TTS")
-
-        raw_audio_path = os.path.join(AUDIO_DIR, f"scene_{scene_id:02d}_raw.mp3")
-
-        tts_meta = run_async_safely(save_tts(
-            text=voice_text,
-            out_path=raw_audio_path,
-            voice=selected_voice,
-            rate=job_config.get("tts_rate", "+0%"),
-            pitch=job_config.get("tts_pitch", "+0Hz"),
-        ))
-
-        if not os.path.exists(raw_audio_path) or os.path.getsize(raw_audio_path) <= 0:
-            raise RuntimeError(f"Scene TTS output missing or empty: {raw_audio_path}")
-
-        # Normalize every scene with the same speed factor to reduce scene-to-scene tempo differences.
-        scene_audio_path = speed_up_audio_ffmpeg(raw_audio_path, speech_speed)
-
-        audio_clip = AudioFileClip(scene_audio_path)
-        audio_duration = float(audio_clip.duration or 0)
-        if audio_duration <= 0:
-            try:
-                audio_clip.close()
-            except Exception:
-                pass
-            raise RuntimeError(f"Scene audio duration is zero: {scene_audio_path}")
-
-        # Small visual tail prevents transition/fade from cutting the final syllable.
-        duration = audio_duration + (scene_pause_sec if idx < total_scenes else 0.0)
-
-        audio_paths.append(scene_audio_path)
-        audio_clips.append(audio_clip)
-        scene_durations.append(duration)
-
-        tts_engine_used = tts_meta.get("engine", tts_engine_used)
-        voice_used = tts_meta.get("voice_used", voice_used)
-
+            voice_text = sanitize_tts_text(story_text, max_chars=900)
+        word_count = max(1, len(voice_text.split()))
+        char_count = max(1, len(voice_text))
+        # Blend word and character counts so Vietnamese/English allocation is more stable.
+        weight = max(1.0, (word_count * 1.0) + (char_count / 28.0))
+        scene_weights.append(weight)
         scene_text_log.append({
-            "scene_id": scene_id,
-            "word_count": max(1, len(voice_text.split())),
+            "scene_id": int(scene.get("scene_id", idx)),
+            "word_count": word_count,
             "text_len": len(voice_text),
             "voice_text": voice_text,
-            "raw_audio_file": os.path.basename(raw_audio_path),
-            "audio_file": os.path.basename(scene_audio_path),
-            "audio_duration": round(audio_duration, 3),
-            "final_scene_duration": round(float(duration), 3),
         })
 
-        progress_pct = int(50 + (idx / max(total_scenes, 1)) * 20)
-        write_status(job_dir, job_id, "running", {
-            "step": "generate_scene_audio",
-            "generated_audio": idx,
-            "scene_count": total_scenes,
-            "selected_voice": selected_voice,
-            "progress_pct": progress_pct,
-            "eta_sec": estimate_eta(time.time() - tts_started_at, idx, total_scenes, fallback_sec=max(8, total_scenes * 3)),
-        })
+    total_weight = sum(scene_weights) or float(total_scenes)
+    raw_durations = [total_audio_duration * (w / total_weight) for w in scene_weights]
 
-    total_audio_duration = float(sum(float(c.duration or 0) for c in audio_clips))
+    # Avoid extremely tiny scenes when many chunks are produced. Then renormalize.
+    min_scene_sec = 1.05 if total_audio_duration >= total_scenes * 1.05 else max(0.45, total_audio_duration / max(total_scenes, 1) * 0.65)
+    adjusted_durations = [max(min_scene_sec, d) for d in raw_durations]
+    adjusted_sum = sum(adjusted_durations) or total_audio_duration
+    scene_durations = [max(0.35, d * total_audio_duration / adjusted_sum) for d in adjusted_durations]
 
+    # Correct tiny floating drift on the last scene.
+    drift = total_audio_duration - sum(scene_durations)
+    if scene_durations:
+        scene_durations[-1] = max(0.35, scene_durations[-1] + drift)
+
+    audio_clips = [full_audio_clip]
     write_json(os.path.join(META_DIR, "tts_debug.json"), {
-        "tts_mode": "per_scene_tts_audio",
+        "tts_mode": "single_full_narration_audio",
         "scene_count": total_scenes,
         "selected_voice": selected_voice,
+        "audio_file": os.path.basename(full_audio_path),
+        "raw_audio_file": os.path.basename(full_audio_raw_path),
         "total_audio_duration": round(total_audio_duration, 3),
-        "total_video_duration_with_pauses": round(float(sum(scene_durations)), 3),
         "speech_speed": speech_speed,
-        "scene_pause_sec": scene_pause_sec,
-        "voice_used": voice_used,
-        "tts_engine": tts_engine_used,
-        "scenes": scene_text_log,
+        "voice_used": tts_meta.get("voice_used", selected_voice),
+        "tts_engine": tts_meta.get("engine", "unknown"),
+        "full_narration_text": full_narration_text,
+        "scenes": [
+            {
+                **scene_text_log[i],
+                "allocated_duration": round(float(scene_durations[i]), 3),
+                "weight": round(float(scene_weights[i]), 3),
+            }
+            for i in range(total_scenes)
+        ],
+    })
+
+    write_status(job_dir, job_id, "running", {
+        "step": "generate_full_narration_audio",
+        "generated_audio": 1,
+        "scene_count": total_scenes,
+        "selected_voice": selected_voice,
+        "progress_pct": 70,
+        "eta_sec": estimate_eta(time.time() - tts_started_at, 1, 1, fallback_sec=5),
     })
 
     write_status(job_dir, job_id, "running", {
@@ -4422,7 +4576,7 @@ def run_job(job_config, job_id):
     scene_duration_log = []
     build_started_at = time.time()
 
-    for idx, (scene, img_path, duration, audio_clip) in enumerate(zip(scene_objects, image_paths, scene_durations, audio_clips), start=1):
+    for idx, (scene, img_path, duration) in enumerate(zip(scene_objects, image_paths, scene_durations), start=1):
         scene_id = int(scene.get("scene_id", idx))
         duration = max(float(duration or 0), 0.35)
 
@@ -4463,26 +4617,25 @@ def run_job(job_config, job_id):
 
         vclip = apply_visual_finish(vclip, video_style_preset)
 
-        # Text overlay uses the exact same voice_text as this scene's audio.
+        # Lightweight Pippit-like caption layer. Can be disabled by setting enable_text_overlay=False.
         if _safe_bool(job_config.get("enable_text_overlay"), True):
-            overlay_text = str(scene.get("voice_text") or "")
+            overlay_text = str(scene.get("text_overlay") or scene.get("hook_text") or scene.get("voice_text") or "")
             vclip = add_pippit_text_overlay(vclip, overlay_text, width, height, video_style_preset)
 
         if idx < total_scenes:
-            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.10, duration / 5)
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.12, duration / 4)
             vclip = vclip.with_effects([vfx.FadeIn(transition_duration), vfx.FadeOut(transition_duration)])
         else:
-            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.08, duration / 5)
+            transition_duration = min(get_transition_duration(scene["profile"], video_style_preset), 0.08, duration / 4)
             vclip = vclip.with_effects([vfx.FadeIn(transition_duration)])
 
-        # Attach each scene's own audio directly to the matching visual clip.
-        vclip = vclip.with_audio(audio_clip)
+        # Do not attach per-scene audio. The full narration track is attached
+        # once after all visual clips are concatenated.
         video_clips.append(vclip)
 
         scene_duration_log.append({
             "scene_id": scene_id,
             "final_duration": round(float(duration), 3),
-            "audio_duration": round(float(audio_clip.duration or 0), 3),
             "scene_profile": scene["profile"],
             "voice_used": selected_voice,
             "transition_duration": round(float(transition_duration), 3),
@@ -4518,6 +4671,7 @@ def run_job(job_config, job_id):
     })
 
     final_video = concatenate_videoclips(video_clips, method="compose")
+    final_video = final_video.with_audio(full_audio_clip)
     final_path = os.path.join(OUT_DIR, "final_story_video_adaptive.mp4")
 
     final_video.write_videofile(
@@ -4568,7 +4722,7 @@ def run_job(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "used_ai_planner": adaptive_plan["used_ai_planner"],
-        "timeline_mode": "per_scene_tts_audio",
+        "timeline_mode": "single_full_narration_audio",
         "image_max_workers": _get_image_max_workers(job_config),
         "image_model": SDXL_MODEL_ID,
         "image_acceleration": IMAGE_ACCELERATION,
@@ -4615,3 +4769,4 @@ def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_call
 
     finally:
         _PROGRESS_CALLBACK = old_callback
+        
