@@ -757,12 +757,15 @@ STYLE_PRESETS = {
     "warm_storybook": {
         "name": "warm_storybook",
         "prompt_style": (
-            "storybook illustration, warm tones, soft light, painterly texture, "
-            "expressive composition, emotional storytelling, beautiful framing"
+            "photorealistic cinematic documentary still, realistic human proportions, "
+            "real human face, natural skin texture, realistic eyes, realistic nose and mouth, "
+            "natural lighting, realistic environment, emotional storytelling moment, "
+            "35mm film still, shallow depth of field, high detail"
         ),
         "negative_style": (
-            "photorealistic, realistic photography, live action, harsh flash, ugly composition, "
-            "low detail, flat background"
+            "cartoon, chibi, anime, manga, illustration, drawing, painting, storybook, 2d, vector art, "
+            "toy-like character, doll face, childish mascot, flat color, cel shading, fake face, "
+            "oversimplified eyes, tiny mouth, exaggerated head, deformed face, bad anatomy"
         ),
         "motion_mode": "gentle",
         "duration_profile": "standard",
@@ -2531,67 +2534,115 @@ def _story_text_has_any(text: str, terms) -> bool:
 def build_consistent_character_profile(story_text: str, scene_source: List[Dict[str, Any]], video_style_preset: str = "") -> str:
     """Create one compact recurring-character description for Warm Story AI image scenes.
 
-    This is intentionally prompt-based only, so it does not add new models or cost.
-    It helps SDXL keep the main character visually consistent across scenes.
+    IMPORTANT:
+    - Do NOT hard-code a monk/novice monk as the default character.
+    - Infer the recurring character from story_text and scene_plan.
+    - If the story is about a monk, the profile can become a monk; if the story is about
+      an old man, a girl, a mother, an animal, etc., it must follow that story.
+    - Prompt-only consistency: no extra model/cost.
     """
     style = normalize_style_preset(video_style_preset)
     if not is_warm_story_style(style):
         return ""
 
+    def _clean_piece(value: str, max_words: int = 12) -> str:
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
+        if not value:
+            return ""
+        return " ".join(value.split()[:max_words])
+
+    def _translate_role_from_story(text: str) -> str:
+        """Map only when the story itself clearly says that role.
+        This is not a fixed default; it is a conditional translation for SDXL.
+        """
+        t = str(text or "").lower()
+        role_rules = [
+            (["chú tiểu", "tiểu tăng", "novice monk", "young monk"],
+             "a realistic young Buddhist novice monk, shaved head, orange Buddhist robe"),
+            (["nhà sư", "thiền sư", "tỳ kheo", "monk", "zen master"],
+             "a realistic Buddhist monk, shaved head, saffron robe"),
+            (["ông lão", "cụ già", "old man", "elderly man"],
+             "a realistic elderly man, kind wrinkled face, simple traditional clothing"),
+            (["bà lão", "cụ bà", "old woman", "elderly woman"],
+             "a realistic elderly woman, kind wrinkled face, simple traditional clothing"),
+            (["cậu bé", "bé trai", "boy", "young boy"],
+             "a realistic young boy, natural face, simple clothing"),
+            (["cô bé", "bé gái", "cô gái", "girl", "young girl"],
+             "a realistic young girl, natural face, simple clothing"),
+            (["người mẹ", "bà mẹ", "mother"],
+             "a realistic mother, natural face, simple everyday clothing"),
+            (["người cha", "father"],
+             "a realistic father, natural face, simple everyday clothing"),
+            (["vị vua", "nhà vua", "king"],
+             "a realistic king, mature face, historically appropriate royal clothing"),
+            (["công chúa", "princess"],
+             "a realistic princess, natural face, historically appropriate clothing"),
+        ]
+        for terms, desc in role_rules:
+            if _story_text_has_any(t, terms):
+                return desc
+        return ""
+
     all_text_parts = [str(story_text or "")]
-    first_subject = ""
-    first_appearance = ""
-    first_clothing = ""
+    subject_candidates = []
+    appearance_candidates = []
+    clothing_candidates = []
 
     for item in scene_source or []:
         sp = item.get("scene_plan", {}) or {}
-        chunk = str(item.get("chunk", "") or "")
+        chunk = str(item.get("chunk", "") or item.get("voice_text", "") or item.get("source_chunk", "") or "")
         all_text_parts.append(chunk)
-        all_text_parts.append(str(sp.get("main_subject", "") or ""))
-        all_text_parts.append(str(sp.get("clothing_or_appearance", "") or sp.get("appearance", "") or ""))
-        if not first_subject and str(sp.get("main_subject", "") or "").strip():
-            first_subject = str(sp.get("main_subject", "") or "").strip()
-        if not first_appearance and str(sp.get("appearance", "") or "").strip():
-            first_appearance = str(sp.get("appearance", "") or "").strip()
-        if not first_clothing and str(sp.get("clothing_or_appearance", "") or "").strip():
-            first_clothing = str(sp.get("clothing_or_appearance", "") or "").strip()
 
-    all_text = " ".join(all_text_parts).lower()
+        subject = _clean_piece(sp.get("main_subject", ""), 14)
+        appearance = _clean_piece(sp.get("appearance", "") or sp.get("clothing_or_appearance", ""), 14)
+        clothing = _clean_piece(sp.get("clothing_or_appearance", ""), 12)
 
-    # Common Vietnamese / Buddhist story characters. These are only identity anchors,
-    # not story-specific prompts.
-    if _story_text_has_any(all_text, ["chú tiểu", "tiểu tăng", "novice monk", "young monk"]):
-        base = (
-            "same recurring young Asian novice monk, shaved head, small gentle round face, calm dark eyes, "
-            "simple orange Buddhist robe, humble childlike appearance"
-        )
-    elif _story_text_has_any(all_text, ["nhà sư", "thiền sư", "tỳ kheo", "monk", "zen master"]):
-        base = (
-            "same recurring Asian Buddhist monk, shaved head, calm oval face, gentle dark eyes, "
-            "simple saffron robe, serene posture"
-        )
-    elif _story_text_has_any(all_text, ["ông lão", "cụ già", "old man", "elderly man"]):
-        base = "same recurring elderly Asian man, kind wrinkled face, gentle eyes, simple traditional clothing"
-    elif _story_text_has_any(all_text, ["bà lão", "old woman", "elderly woman"]):
-        base = "same recurring elderly Asian woman, kind wrinkled face, gentle eyes, simple traditional clothing"
-    elif _story_text_has_any(all_text, ["cậu bé", "bé trai", "boy", "young boy"]):
-        base = "same recurring young Asian boy, gentle face, dark eyes, simple clothing"
-    elif _story_text_has_any(all_text, ["cô gái", "bé gái", "girl", "young girl"]):
-        base = "same recurring young Asian girl, gentle face, dark eyes, simple clothing"
-    elif first_subject:
-        appearance = ", ".join([x for x in [first_appearance, first_clothing] if x])
-        base = f"same recurring main character: {first_subject}"
+        if subject:
+            subject_candidates.append(subject)
+            all_text_parts.append(subject)
         if appearance:
-            base += f", {appearance}"
+            appearance_candidates.append(appearance)
+            all_text_parts.append(appearance)
+        if clothing:
+            clothing_candidates.append(clothing)
+            all_text_parts.append(clothing)
+
+    all_text = " ".join(all_text_parts)
+
+    # Prefer planner subject if available, because it is specific to this video.
+    main_subject = ""
+    for cand in subject_candidates:
+        c = cand.lower()
+        # Avoid using generic objects/settings as character identity.
+        if not any(x in c for x in ["bình", "jar", "road", "temple", "chùa", "river", "mountain", "forest", "room", "house", "object"]):
+            main_subject = cand
+            break
+
+    role_desc = _translate_role_from_story(all_text)
+
+    if role_desc:
+        base = role_desc
+    elif main_subject:
+        base = f"a realistic recurring main character: {main_subject}"
     else:
+        # If there is no clear recurring character, do not force one.
         return ""
+
+    appearance = ""
+    if appearance_candidates:
+        appearance = appearance_candidates[0]
+    elif clothing_candidates:
+        appearance = clothing_candidates[0]
+
+    if appearance and appearance.lower() not in base.lower():
+        base = f"{base}, {appearance}"
 
     profile = (
         base
-        + ", consistent identity across all scenes, same face shape, same age, same hairstyle, same clothing colors"
+        + ", consistent identity across all AI-generated scenes, same face shape, same age, "
+          "same hairstyle, same clothing colors, realistic human proportions, natural skin texture"
     )
-    return shorten_prompt_for_sdxl(profile, max_chars=230, max_words=42)
-
+    return shorten_prompt_for_sdxl(profile, max_chars=250, max_words=48)
 
 def build_story_moment_context(narration: str, scene_plan: Dict[str, Any]) -> str:
     """Add action + emotion + cause/effect so AI images show the story moment, not just nouns."""
