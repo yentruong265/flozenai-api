@@ -254,7 +254,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "fps": fps,
 
         "duration_per_scene": _clamp_float(job_config.get("duration_per_scene"), 3.0, min_value=0.5, max_value=20.0),
-        "target_words_per_scene": _clamp_int(job_config.get("target_words_per_scene"), 40, min_value=8, max_value=120),
+        "target_words_per_scene": _clamp_int(job_config.get("target_words_per_scene"), 30, min_value=8, max_value=120),
         "target_total_sec": target_total_sec,
         "target_total_video_sec": target_total_video_sec,
         "max_scene_duration": _clamp_float(job_config.get("max_scene_duration"), 12.0, min_value=2.0, max_value=30.0),
@@ -639,14 +639,27 @@ def generate_image(
     complex_pose_prompt = _has_any_term(prompt, _COMPLEX_BODY_POSE_WORDS) if "_COMPLEX_BODY_POSE_WORDS" in globals() else False
     if complex_pose_prompt and not _is_turbo_model():
         prompt = shorten_prompt_for_sdxl(
-            prompt + ", simple athletic pose, natural body alignment, anatomically correct limbs, realistic joints,anatomically correct human body, natural face, symmetrical eyes, clear nose, natural mouth, normal hands, five fingers per hand, natural arms, natural legs",
-            max_chars=260,
-            max_words=58,
+            prompt + ", photorealistic human, anatomically correct full body, correct human proportions, "
+        "natural body alignment, realistic joints, balanced posture, stable standing pose, "
+        "natural hands with five fingers, correct finger structure, no distortion, "
+        "natural face, symmetrical face, aligned eyes, clear eyes, realistic pupils, "
+        "proportional nose, natural mouth, correct lips, detailed facial structure, "
+        "consistent identity, realistic skin texture, natural lighting",
+            max_chars=280,
+            max_words=65,
         )
         negative_prompt = shorten_prompt_for_sdxl(
-            negative_prompt + ", twisted limbs, impossible pose, disconnected legs, floating foot, reversed knee, broken ankle",
-            max_chars=300,
-            max_words=65,
+            negative_prompt + ", deformed body, distorted body, malformed body, broken body, bad anatomy, "
+        "extra limbs, missing limbs, extra arms, extra legs, missing arms, missing legs, "
+        "twisted limbs, impossible pose, disconnected joints, broken joints, floating limbs, "
+        "bad hands, malformed hands, fused fingers, extra fingers, missing fingers, "
+        "distorted fingers, broken fingers, unnatural hands, "
+        "deformed face, distorted face, asymmetrical face, broken face, ugly face, uncanny face, "
+        "bad eyes, misaligned eyes, cross-eyed, extra eyes, missing eyes, "
+        "deformed nose, missing nose, distorted nose, "
+        "bad mouth, deformed mouth, missing mouth, distorted lips",
+            max_chars=320,
+            max_words=70,
         )
         num_inference_steps = min(num_inference_steps + 2, 24)
         guidance_scale = min(max(guidance_scale, 6.3), 7.2)
@@ -3105,7 +3118,7 @@ Return JSON exactly with this schema:
 def create_adaptive_video_plan(
     story_text: str,
     job_config: Dict[str, Any],
-    target_words_per_scene: int = 40
+    target_words_per_scene: int = 30
 ) -> Dict[str, Any]:
     """
     Create a production-grade video plan.
@@ -4309,7 +4322,7 @@ def run_job(job_config, job_id):
     width = int(job_config.get("width", 768))
     height = int(job_config.get("height", 432))
     fps = int(job_config.get("fps", 24))
-    target_words_per_scene = int(job_config.get("target_words_per_scene", 40))
+    target_words_per_scene = int(job_config.get("target_words_per_scene", 30))
     max_scene_duration = float(job_config.get("max_scene_duration", 12.0))
     seed = int(job_config.get("seed", 42) or 42)
 
@@ -4741,6 +4754,481 @@ def run_job(job_config, job_id):
 
 
 
+
+
+# ===== SALES VIDEO PIPELINE V1 =====
+# Dedicated sales-video path. It reuses existing TTS, Pexels, MoviePy, R2/callback flow,
+# but does not alter the entertainment/story pipeline.
+
+SALES_JOB_TYPES = {"sales", "sales_video", "sales_ads", "product_ads", "ecommerce_ads"}
+
+
+def is_sales_job(job_config: Dict[str, Any]) -> bool:
+    job_type = str((job_config or {}).get("job_type", "") or "").strip().lower()
+    return job_type in SALES_JOB_TYPES
+
+
+def _sales_clean(v, default=""):
+    return str(v if v is not None else default).strip()
+
+
+def _sales_split_benefits(raw) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = re.split(r"[,;\n\|]+", str(raw))
+    out = []
+    for x in items:
+        s = re.sub(r"\s+", " ", str(x or "")).strip(" -•\t")
+        if s:
+            out.append(s)
+    return out[:5]
+
+
+def _sales_platform_defaults(platform: str) -> Dict[str, Any]:
+    p = (platform or "").strip().lower()
+    if any(k in p for k in ["youtube", "website", "landing", "facebook feed", "demo", "review"]):
+        return {"aspect_ratio": "16:9", "target_total_video_sec": 45, "scene_count": 7}
+    # TikTok / Shopee / Shorts / Reels default.
+    return {"aspect_ratio": "9:16", "target_total_video_sec": 30, "scene_count": 6}
+
+
+def normalize_sales_job_config(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(job_config or {})
+    platform = _sales_clean(cfg.get("sales_platform") or cfg.get("platform") or cfg.get("sales_channel") or "TikTok / TikTok Shop")
+    defaults = _sales_platform_defaults(platform)
+
+    aspect_mode = _sales_clean(cfg.get("sales_aspect_mode"), "auto").lower()
+    aspect = _sales_clean(cfg.get("sales_aspect_ratio") or cfg.get("aspect_ratio") or defaults["aspect_ratio"])
+    if aspect_mode in {"auto", "", "tự động"}:
+        aspect = defaults["aspect_ratio"]
+    if aspect not in {"9:16", "16:9"}:
+        aspect = defaults["aspect_ratio"]
+
+    w, h = _infer_dimensions_from_aspect_ratio(aspect)
+    cfg.update({
+        "job_type": "sales_video",
+        "style": "bold_promo",
+        "video_style_preset": "bold_promo",
+        "aspect_ratio": aspect,
+        "width": int(cfg.get("width") or w),
+        "height": int(cfg.get("height") or h),
+        "fps": int(cfg.get("fps") or 24),
+        "target_total_video_sec": int(cfg.get("target_total_video_sec") or cfg.get("duration_sec") or defaults["target_total_video_sec"]),
+        "speech_speed": float(cfg.get("speech_speed") or 1.22),
+        "enable_text_overlay": True,
+        "image_source_mode": "stock_first",
+        "sales_platform": platform,
+        "sales_goal": _sales_clean(cfg.get("sales_goal"), "Ra đơn / chuyển đổi"),
+        "sales_visual_strategy": _sales_clean(cfg.get("sales_visual_strategy"), "Pexels video thật + text overlay mạnh"),
+    })
+    cfg["width"] = int(cfg["width"]) - (int(cfg["width"]) % 8)
+    cfg["height"] = int(cfg["height"]) - (int(cfg["height"]) % 8)
+    return cfg
+
+
+def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a conversion-oriented sales script from product form fields.
+
+    Uses OpenAI when available; deterministic fallback keeps the pipeline usable
+    even if planner API is disabled.
+    """
+    product_name = _sales_clean(job_config.get("product_name") or job_config.get("sales_product_name") or job_config.get("product"), "sản phẩm này")
+    price = _sales_clean(job_config.get("price") or job_config.get("sales_price") or job_config.get("offer") or job_config.get("sales_offer"))
+    product_link = _sales_clean(job_config.get("product_link") or job_config.get("sales_product_link") or job_config.get("link"))
+    target_user = _sales_clean(job_config.get("target_user") or job_config.get("sales_target_user") or job_config.get("audience"), "người đang cần giải pháp nhanh và tiện lợi")
+    pain_point = _sales_clean(job_config.get("pain_point") or job_config.get("sales_pain_point") or job_config.get("problem"), "mất thời gian và khó chọn đúng sản phẩm")
+    benefits = _sales_split_benefits(job_config.get("benefits") or job_config.get("sales_benefits") or job_config.get("key_benefits"))
+    if not benefits:
+        benefits = ["tiện lợi hơn", "tiết kiệm thời gian", "dễ sử dụng"]
+    tone = _sales_clean(job_config.get("sales_tone") or job_config.get("tone"), "viral mạnh / bắt trend")
+    platform = _sales_clean(job_config.get("sales_platform") or job_config.get("platform"), "TikTok / TikTok Shop")
+    goal = _sales_clean(job_config.get("sales_goal"), "Ra đơn / chuyển đổi")
+
+    fallback = {
+        "hook": f"Bạn đang gặp vấn đề: {pain_point}?",
+        "pain": f"Với {target_user}, chuyện này thường làm mất thời gian, tốn công và dễ nản.",
+        "solution": f"{product_name} giúp giải quyết việc đó nhanh gọn hơn mỗi ngày.",
+        "benefits": benefits,
+        "proof": f"Điểm đáng chú ý là: {', '.join(benefits[:3])}.",
+        "cta": f"Bấm vào link để xem {product_name} ngay" + (f" với ưu đãi {price}." if price else "."),
+        "short_overlays": [
+            "Đừng bỏ qua!",
+            pain_point[:42],
+            product_name[:38],
+            benefits[0][:34] if benefits else "Tiện lợi hơn",
+            benefits[1][:34] if len(benefits) > 1 else "Tiết kiệm thời gian",
+            "Mua ngay hôm nay",
+        ],
+        "product_name": product_name,
+        "price": price,
+        "product_link": product_link,
+        "target_user": target_user,
+        "pain_point": pain_point,
+        "tone": tone,
+        "platform": platform,
+        "goal": goal,
+    }
+
+    if not OPENAI_API_KEY or os.getenv("ENABLE_SALES_AI_PLANNER", "1").strip() not in {"1", "true", "yes", "y"}:
+        return fallback
+
+    try:
+        client = get_openai_client()
+        prompt = f"""
+Bạn là chuyên gia viết video quảng cáo ngắn cho TikTok Shop, Shopee và YouTube Shorts.
+Hãy tạo nội dung bán hàng tiếng Việt, ngắn, mạnh, dễ đọc voice-over, không phóng đại sai sự thật.
+
+Thông tin:
+- Sản phẩm: {product_name}
+- Giá/ưu đãi: {price or 'không cung cấp'}
+- Link: {product_link or 'không cung cấp'}
+- Khách hàng mục tiêu: {target_user}
+- Nỗi đau: {pain_point}
+- Lợi ích: {', '.join(benefits)}
+- Nền tảng: {platform}
+- Tone: {tone}
+- Mục tiêu: {goal}
+
+Trả về JSON với keys: hook, pain, solution, benefits(array 3-5), proof, cta, short_overlays(array 6-8).
+Mỗi overlay tối đa 7 từ. CTA rõ ràng nhưng không spam.
+""".strip()
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.55,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```json\s*|```$", "", raw, flags=re.IGNORECASE).strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return fallback
+        merged = {**fallback, **data}
+        merged["benefits"] = _sales_split_benefits(merged.get("benefits")) or benefits
+        overlays = merged.get("short_overlays") or fallback["short_overlays"]
+        merged["short_overlays"] = [sanitize_tts_text(str(x), max_chars=56) for x in overlays if str(x).strip()][:8]
+        return merged
+    except Exception as e:
+        print("WARN: sales AI planner failed, using fallback:", repr(e))
+        return fallback
+
+
+def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    product = sales_script.get("product_name", "sản phẩm")
+    target_user = sales_script.get("target_user", "khách hàng")
+    benefits = sales_script.get("benefits", []) or []
+    overlays = sales_script.get("short_overlays", []) or []
+    is_vertical = str(job_config.get("aspect_ratio", "9:16")) == "9:16"
+
+    scene_templates = [
+        {
+            "role": "hook",
+            "voice_text": sales_script.get("hook", "Đừng bỏ qua sản phẩm này."),
+            "overlay": overlays[0] if len(overlays) > 0 else "Đừng bỏ qua!",
+            "query": f"{target_user} problem stressed lifestyle",
+            "profile": "standard",
+        },
+        {
+            "role": "pain",
+            "voice_text": sales_script.get("pain", "Vấn đề này khiến bạn mất thời gian mỗi ngày."),
+            "overlay": overlays[1] if len(overlays) > 1 else "Bạn có gặp vấn đề này?",
+            "query": f"person frustrated problem daily life {target_user}",
+            "profile": "standard",
+        },
+        {
+            "role": "solution",
+            "voice_text": sales_script.get("solution", f"{product} là giải pháp đơn giản và tiện lợi hơn."),
+            "overlay": overlays[2] if len(overlays) > 2 else product,
+            "query": f"happy customer using product online shopping home lifestyle",
+            "profile": "standard",
+        },
+    ]
+    for i, b in enumerate(benefits[:3], start=1):
+        scene_templates.append({
+            "role": f"benefit_{i}",
+            "voice_text": f"Lợi ích thứ {i}: {b}.",
+            "overlay": overlays[2 + i] if len(overlays) > 2 + i else b,
+            "query": f"modern lifestyle product benefit happy customer {b}",
+            "profile": "standard",
+        })
+    scene_templates.append({
+        "role": "cta",
+        "voice_text": sales_script.get("cta", f"Bấm link để xem {product} ngay hôm nay."),
+        "overlay": overlays[-1] if overlays else "Mua ngay hôm nay",
+        "query": "shopping online smartphone checkout happy customer",
+        "profile": "standard",
+    })
+
+    scenes = []
+    for idx, s in enumerate(scene_templates, start=1):
+        text = sanitize_tts_text(s["voice_text"], max_chars=420)
+        overlay = sanitize_tts_text(s.get("overlay") or text, max_chars=80)
+        query = re.sub(r"\s+", " ", str(s.get("query") or product)).strip()
+        scene_plan = {
+            "main_subject": query,
+            "action": s["role"],
+            "location": "modern real-life ecommerce advertising scene",
+            "mood": "energetic conversion-focused commercial mood",
+            "shot": "vertical medium shot" if is_vertical else "wide commercial shot",
+            "lighting": "bright clean professional lighting",
+            "details": [product, target_user, s["role"]],
+        }
+        scenes.append({
+            "scene_id": idx,
+            "profile": s.get("profile", "standard"),
+            "voice_text": text,
+            "source_chunk": text,
+            "text_overlay": overlay,
+            "hook_text": overlay,
+            "stock_query": query,
+            "visual_prompt": shorten_prompt_for_sdxl(
+                f"commercial lifestyle photo, {query}, real people, natural emotion, professional advertising look, no text",
+                max_chars=260,
+                max_words=48,
+            ),
+            "negative_prompt": BASE_NEGATIVE_PROMPT + ", fake product, unreadable text, watermark, logo",
+            "scene_plan": scene_plan,
+            "visual_source": "stock",
+            "visual_asset_type": "video",
+            "prefer_pexels_video_first": True,
+            "allow_video_assets": True,
+            "video_style_preset": "bold_promo",
+            "aspect_ratio": job_config.get("aspect_ratio", "9:16"),
+        })
+    return scenes
+
+
+def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, height: int, is_vertical: bool) -> str:
+    """Pexels video first, then Pexels photo, then optional AI, then placeholder."""
+    query = scene.get("stock_query") or scene.get("visual_prompt") or "online shopping happy customer"
+    video_path = os.path.splitext(img_path)[0] + ".mp4"
+
+    if ENABLE_STOCK_FETCH and PEXELS_API_KEY:
+        try:
+            pvid = fetch_pexels_video(query, is_vertical=is_vertical)
+            if pvid:
+                ok = prepare_pexels_video(pvid["url"], video_path)
+                if ok:
+                    scene["visual_used"] = "sales_pexels_video"
+                    scene["visual_video_path"] = ok
+                    scene["pexels_id"] = pvid.get("pexels_id", "")
+                    scene["stock_query_used"] = pvid.get("query", query)
+                    create_fast_placeholder_image(img_path, width, height, title="FlozenAI Ads")
+                    scene["visual_file"] = os.path.basename(img_path)
+                    return img_path
+        except Exception as e:
+            print("WARN: sales Pexels video failed:", repr(e))
+
+        try:
+            pimg = fetch_pexels_photo(query, is_vertical=is_vertical, min_match_score=0.0)
+            if pimg:
+                ok = prepare_pexels_image(pimg["url"], img_path, width, height)
+                if ok:
+                    scene["visual_used"] = "sales_pexels_image"
+                    scene["visual_source"] = "stock"
+                    scene["pexels_id"] = pimg.get("pexels_id", "")
+                    scene["stock_query_used"] = pimg.get("query", query)
+                    scene["visual_file"] = os.path.basename(img_path)
+                    return img_path
+        except Exception as e:
+            print("WARN: sales Pexels image failed:", repr(e))
+
+    if _safe_bool(scene.get("allow_ai_fallback") or os.getenv("SALES_ALLOW_AI_FALLBACK", "0"), False):
+        try:
+            generate_image(
+                scene.get("visual_prompt", query),
+                img_path,
+                negative_prompt=scene.get("negative_prompt", BASE_NEGATIVE_PROMPT),
+                width=width,
+                height=height,
+                num_inference_steps=14,
+                guidance_scale=5.8,
+                seed=SEED + int(scene.get("scene_id", 1)),
+                retries=1,
+                scene_id=scene.get("scene_id"),
+            )
+            scene["visual_used"] = "sales_ai_image_fallback"
+            scene["visual_file"] = os.path.basename(img_path)
+            return img_path
+        except Exception as e:
+            print("WARN: sales AI fallback failed:", repr(e))
+
+    create_fast_placeholder_image(img_path, width, height, title="FlozenAI Ads")
+    scene["visual_used"] = "sales_placeholder"
+    scene["visual_file"] = os.path.basename(img_path)
+    return img_path
+
+
+def run_sales_pipeline(job_config, job_id):
+    """Sales video pipeline: product form -> sales script -> fast Pexels-first ad video."""
+    job_config = normalize_sales_job_config(job_config)
+    job_dir = os.path.join(RUNNING_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    write_status(job_dir, job_id, "running", {"step": "sales_init", "progress_pct": 1, "eta_sec": 90})
+
+    IMG_DIR = os.path.join(job_dir, "images")
+    AUDIO_DIR = os.path.join(job_dir, "audio")
+    OUT_DIR = os.path.join(job_dir, "outputs")
+    META_DIR = os.path.join(job_dir, "meta")
+    for d in [IMG_DIR, AUDIO_DIR, OUT_DIR, META_DIR]:
+        os.makedirs(d, exist_ok=True)
+        clear_folder(d)
+
+    width = int(job_config.get("width", 432))
+    height = int(job_config.get("height", 768))
+    fps = int(job_config.get("fps", 24))
+    is_vertical = height > width
+    selected_voice = resolve_single_voice(job_config)
+    video_style_preset = "bold_promo"
+    video_style = STYLE_PRESETS.get(video_style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
+
+    write_status(job_dir, job_id, "running", {"step": "sales_plan", "progress_pct": 8, "eta_sec": 75})
+    sales_script = build_sales_script(job_config)
+    scene_objects = build_sales_scenes(sales_script, job_config)
+    total_scenes = len(scene_objects)
+
+    write_json(os.path.join(META_DIR, "sales_script.json"), sales_script)
+    write_json(os.path.join(META_DIR, "sales_scene_plan.json"), scene_objects)
+
+    write_status(job_dir, job_id, "running", {"step": "sales_fetch_visuals", "scene_count": total_scenes, "progress_pct": 16, "eta_sec": max(30, total_scenes * 6)})
+    image_paths = []
+    for idx, scene in enumerate(scene_objects, start=1):
+        img_path = os.path.join(IMG_DIR, f"scene_{idx:02d}.png")
+        _download_sales_visual(scene, img_path, width, height, is_vertical)
+        image_paths.append(img_path)
+        write_status(job_dir, job_id, "running", {
+            "step": "sales_fetch_visuals",
+            "generated_images": idx,
+            "scene_count": total_scenes,
+            "progress_pct": int(16 + (idx / max(total_scenes, 1)) * 28),
+            "eta_sec": max(8, (total_scenes - idx) * 5),
+        })
+
+    full_narration_text = sanitize_tts_text(" ".join([s.get("voice_text", "") for s in scene_objects]), max_chars=4000)
+    full_narration_text = _dedupe_repeated_sentences(full_narration_text, max_chars=4000) if "_dedupe_repeated_sentences" in globals() else full_narration_text
+
+    write_status(job_dir, job_id, "running", {"step": "sales_tts", "progress_pct": 50, "eta_sec": 20})
+    full_audio_raw_path = os.path.join(AUDIO_DIR, "sales_narration_raw.mp3")
+    tts_meta = asyncio.run(save_tts(
+        text=full_narration_text,
+        out_path=full_audio_raw_path,
+        voice=selected_voice,
+        rate=job_config.get("tts_rate", "+0%"),
+        pitch=job_config.get("tts_pitch", "+0Hz"),
+    ))
+    speech_speed = float(job_config.get("speech_speed", 1.22) or 1.22)
+    full_audio_path = speed_up_audio_ffmpeg(full_audio_raw_path, speech_speed)
+    full_audio_clip = AudioFileClip(full_audio_path)
+    total_audio_duration = float(full_audio_clip.duration or 1.0)
+
+    target_total = float(job_config.get("target_total_video_sec") or total_audio_duration)
+    # Ads should not drag: use audio duration, but cap a little near target if TTS is long.
+    total_duration = max(8.0, min(max(total_audio_duration, target_total * 0.85), target_total * 1.25))
+    scene_durations = allocate_scene_durations_from_narration(scene_objects, total_duration, min_scene_sec=1.4 if is_vertical else 1.8, max_scene_sec=6.5)
+
+    write_json(os.path.join(META_DIR, "sales_tts_debug.json"), {
+        "voice_used": tts_meta.get("voice_used", selected_voice),
+        "tts_engine": tts_meta.get("engine", "unknown"),
+        "speech_speed": speech_speed,
+        "total_audio_duration": round(total_audio_duration, 3),
+        "visual_total_duration": round(total_duration, 3),
+        "full_narration_text": full_narration_text,
+    })
+
+    write_status(job_dir, job_id, "running", {"step": "sales_build_video", "progress_pct": 62, "eta_sec": max(12, total_scenes * 2)})
+    video_clips = []
+    scene_duration_log = []
+    for idx, (scene, img_path, duration) in enumerate(zip(scene_objects, image_paths, scene_durations), start=1):
+        stock_video_path = scene.get("visual_video_path", "")
+        duration = max(1.0, float(duration or 2.0))
+        if stock_video_path and os.path.exists(str(stock_video_path)):
+            vclip = make_stock_video_clip(stock_video_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
+            if vclip is None:
+                vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
+        else:
+            vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
+        vclip = apply_visual_finish(vclip, video_style_preset)
+        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or scene.get("voice_text") or "", width, height, video_style_preset)
+        if idx < total_scenes:
+            vclip = vclip.with_effects([vfx.FadeIn(0.08), vfx.FadeOut(0.10)])
+        else:
+            vclip = vclip.with_effects([vfx.FadeIn(0.08)])
+        video_clips.append(vclip)
+        scene_duration_log.append({
+            "scene_id": idx,
+            "role": scene.get("scene_plan", {}).get("action", ""),
+            "duration": round(duration, 3),
+            "visual_used": scene.get("visual_used", ""),
+            "stock_query": scene.get("stock_query", ""),
+            "overlay": scene.get("text_overlay", ""),
+        })
+        write_status(job_dir, job_id, "running", {
+            "step": "sales_build_video",
+            "built_scenes": idx,
+            "scene_count": total_scenes,
+            "progress_pct": int(62 + (idx / max(total_scenes, 1)) * 28),
+            "eta_sec": max(5, (total_scenes - idx) * 2),
+        })
+
+    write_json(os.path.join(META_DIR, "sales_scene_duration_log.json"), scene_duration_log)
+
+    final_video = concatenate_videoclips(video_clips, method="compose")
+    # If visuals are shorter/longer than audio, moviepy will handle duration by clip length.
+    # Attach narration once to avoid overlap.
+    final_video = final_video.with_audio(full_audio_clip)
+    final_path = os.path.join(OUT_DIR, "final_sales_video.mp4")
+
+    write_status(job_dir, job_id, "running", {"step": "sales_final_render", "progress_pct": 96, "eta_sec": 8})
+    final_video.write_videofile(
+        final_path,
+        fps=fps,
+        codec="libx264",
+        audio_codec="aac",
+        threads=4,
+        preset=os.getenv("FFMPEG_PRESET", "veryfast"),
+    )
+
+    for v in video_clips:
+        try: v.close()
+        except Exception: pass
+    try: full_audio_clip.close()
+    except Exception: pass
+    try: final_video.close()
+    except Exception: pass
+    free_memory()
+
+    write_status(job_dir, job_id, "completed", {
+        "step": "done",
+        "progress_pct": 100,
+        "eta_sec": 0,
+        "video_path": f"completed/{job_id}/outputs/final_sales_video.mp4",
+        "finished_at": now_str(),
+        "job_type": "sales_video",
+    })
+
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "ok": True,
+        "video_path": final_path,
+        "relative_video_path": f"completed/{job_id}/outputs/final_sales_video.mp4",
+        "scene_count": total_scenes,
+        "job_type": "sales_video",
+        "video_style_preset": video_style_preset,
+        "selected_voice": selected_voice,
+        "sales_script": sales_script,
+        "timeline_mode": "sales_video_single_full_narration_audio",
+        "finished_at": now_str(),
+    }
+
+
 # ===== SERVERLESS ENTRYPOINT =====
 def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_callback=None):
     """
@@ -4762,7 +5250,10 @@ def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_call
     _PROGRESS_CALLBACK = progress_callback
 
     try:
-        result = run_job(normalized, normalized["job_id"])
+        if is_sales_job(normalized):
+            result = run_sales_pipeline(normalized, normalized["job_id"])
+        else:
+            result = run_job(normalized, normalized["job_id"])
 
         video_path = result.get("video_path")
         if not video_path or not os.path.exists(video_path):
