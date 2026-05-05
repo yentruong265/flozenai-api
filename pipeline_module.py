@@ -293,12 +293,31 @@ def normalize_job_config(job_config, fallback_job_id=None):
         # Image source routing: smart | stock_first | ai_first
         "image_source_mode": _safe_str(job_config.get("image_source_mode"), os.getenv("IMAGE_SOURCE_MODE", "smart")).lower(),
 
+        # Sales-video payload passthrough. Keep these fields when run_job_serverless() normalizes config.
+        "sales_info": job_config.get("sales_info") if isinstance(job_config.get("sales_info"), dict) else {},
+        "sales_script": job_config.get("sales_script") if isinstance(job_config.get("sales_script"), dict) else {},
+        "sales_platform": _safe_str(job_config.get("sales_platform") or job_config.get("platform")),
+        "sales_aspect_mode": _safe_str(job_config.get("sales_aspect_mode")),
+        "sales_aspect_ratio": _safe_str(job_config.get("sales_aspect_ratio")),
+        "sales_visual_strategy": _safe_str(job_config.get("sales_visual_strategy")),
+        "sales_goal": _safe_str(job_config.get("sales_goal")),
+        "sales_tone": _safe_str(job_config.get("sales_tone")),
+        "product_name": _safe_str(job_config.get("product_name")),
+        "price": _safe_str(job_config.get("price")),
+        "target_user": _safe_str(job_config.get("target_user")),
+        "pain_point": _safe_str(job_config.get("pain_point")),
+        "benefits": job_config.get("benefits"),
+        "product_asset": job_config.get("product_asset") if isinstance(job_config.get("product_asset"), dict) else {},
+        "product_asset_data_url": _safe_str(job_config.get("product_asset_data_url")),
+        "product_asset_name": _safe_str(job_config.get("product_asset_name")),
+        "product_asset_mime_type": _safe_str(job_config.get("product_asset_mime_type")),
+        "product_asset_url": _safe_str(job_config.get("product_asset_url")),
+
         "created_at": _safe_str(job_config.get("created_at"), now_str()),
         "meta": meta,
     }
 
     return normalized
-
 
 # ===== CELL 5 =====
 # B5 — SDXL image generation (PRO+, aspect-ratio-aware, anti-crop for 9:16)
@@ -4756,17 +4775,17 @@ def run_job(job_config, job_id):
 
 
 
-# ===== SALES VIDEO PIPELINE V2 =====
-# Product-aware sales-video path. It reuses existing TTS, Pexels, MoviePy, R2/callback flow,
-# but keeps the entertainment/story pipeline untouched.
-# V2 upgrades:
-# - Reads product URL metadata when possible (title, description, og:image, json-ld image).
-# - Accepts explicit product_image_urls / product_video_urls from frontend.
-# - Uses product images/videos first for hook/solution/benefit/CTA scenes.
-# - Uses Pexels lifestyle video mainly for pain/lifestyle context.
-# - Uses faster TTS and shorter scenes for TikTok/Shopee sales ads.
 
-SALES_JOB_TYPES = {"sales", "sales_video", "sales_ads", "product_ads", "ecommerce_ads", "video_ban_hang", "ads"}
+# ===== SALES VIDEO PIPELINE V1.5 — PRODUCT-ASSET FIRST =====
+# Stable sales path: no Shopee/TikTok crawling. The frontend uploads a real
+# product image/video and this pipeline uses that asset directly as the main visual.
+
+import base64
+import mimetypes
+from urllib.parse import urlparse
+from PIL import ImageOps
+
+SALES_JOB_TYPES = {"sales", "sales_video", "sales_ads", "product_ads", "ecommerce_ads"}
 
 
 def is_sales_job(job_config: Dict[str, Any]) -> bool:
@@ -4776,6 +4795,18 @@ def is_sales_job(job_config: Dict[str, Any]) -> bool:
 
 def _sales_clean(v, default=""):
     return str(v if v is not None else default).strip()
+
+
+def _sales_nested(job_config: Dict[str, Any], key: str, default=""):
+    """Read sales field from top-level first, then sales_info."""
+    if not isinstance(job_config, dict):
+        return default
+    if job_config.get(key) not in (None, ""):
+        return job_config.get(key)
+    info = job_config.get("sales_info") or {}
+    if isinstance(info, dict) and info.get(key) not in (None, ""):
+        return info.get(key)
+    return default
 
 
 def _sales_split_benefits(raw) -> List[str]:
@@ -4790,49 +4821,38 @@ def _sales_split_benefits(raw) -> List[str]:
         s = re.sub(r"\s+", " ", str(x or "")).strip(" -•\t")
         if s:
             out.append(s)
-    # keep short but useful
-    return out[:8]
+    return out[:6]
 
 
 def _sales_platform_defaults(platform: str) -> Dict[str, Any]:
     p = (platform or "").strip().lower()
-    if any(k in p for k in ["youtube", "website", "landing", "facebook feed", "demo", "review"]):
-        return {
-            "aspect_ratio": "16:9",
-            "target_total_video_sec": 45,
-            "scene_count": 7,
-            "speech_speed": 1.24,
-            "tts_rate": "+18%",
-            "duration_per_scene": 2.8,
-            "max_scene_duration": 4.8,
-            "target_words_per_scene": 16,
-        }
-    # TikTok / Shopee / Shorts / Reels default: faster and denser.
-    return {
-        "aspect_ratio": "9:16",
-        "target_total_video_sec": 28,
-        "scene_count": 7,
-        "speech_speed": 1.34,
-        "tts_rate": "+24%",
-        "duration_per_scene": 2.1,
-        "max_scene_duration": 3.8,
-        "target_words_per_scene": 11,
-    }
+    if any(k in p for k in ["youtube_long", "youtube review", "website", "landing", "facebook_feed", "demo", "review"]):
+        return {"aspect_ratio": "16:9", "target_total_video_sec": 40, "scene_count": 7}
+    return {"aspect_ratio": "9:16", "target_total_video_sec": 25, "scene_count": 6}
 
 
 def normalize_sales_job_config(job_config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(job_config or {})
+    info = cfg.get("sales_info") or {}
+    if isinstance(info, dict):
+        # Flatten common fields so the rest of the sales pipeline can read them safely.
+        for k in ["product_name", "price", "target_user", "pain_point", "benefits", "platform", "tone", "goal", "visual_strategy", "sales_duration"]:
+            if cfg.get(k) in (None, "") and info.get(k) not in (None, ""):
+                cfg[k] = info.get(k)
+
     platform = _sales_clean(cfg.get("sales_platform") or cfg.get("platform") or cfg.get("sales_channel") or "TikTok / TikTok Shop")
     defaults = _sales_platform_defaults(platform)
 
     aspect_mode = _sales_clean(cfg.get("sales_aspect_mode"), "auto").lower()
     aspect = _sales_clean(cfg.get("sales_aspect_ratio") or cfg.get("aspect_ratio") or defaults["aspect_ratio"])
-    if aspect_mode in {"auto", "", "tự động", "tu dong"}:
+    if aspect_mode in {"auto", "", "tự động"}:
         aspect = defaults["aspect_ratio"]
     if aspect not in {"9:16", "16:9"}:
         aspect = defaults["aspect_ratio"]
 
     w, h = _infer_dimensions_from_aspect_ratio(aspect)
+    target_sec = cfg.get("target_total_video_sec") or cfg.get("target_total_sec") or cfg.get("duration_sec") or cfg.get("sales_duration") or defaults["target_total_video_sec"]
+
     cfg.update({
         "job_type": "sales_video",
         "style": "bold_promo",
@@ -4841,354 +4861,176 @@ def normalize_sales_job_config(job_config: Dict[str, Any]) -> Dict[str, Any]:
         "width": int(cfg.get("width") or w),
         "height": int(cfg.get("height") or h),
         "fps": int(cfg.get("fps") or 24),
-        "target_total_video_sec": int(cfg.get("target_total_video_sec") or cfg.get("duration_sec") or defaults["target_total_video_sec"]),
-        "duration_per_scene": float(cfg.get("duration_per_scene") or defaults["duration_per_scene"]),
-        "max_scene_duration": float(cfg.get("max_scene_duration") or defaults["max_scene_duration"]),
-        "target_words_per_scene": int(cfg.get("target_words_per_scene") or defaults["target_words_per_scene"]),
-        # Faster voice for sales video. User can still override from frontend/env.
-        "speech_speed": float(cfg.get("speech_speed") or os.getenv("SALES_SPEECH_SPEED", defaults["speech_speed"])),
-        "tts_rate": _sales_clean(cfg.get("tts_rate") or os.getenv("SALES_TTS_RATE", defaults["tts_rate"])),
-        "tts_pitch": _sales_clean(cfg.get("tts_pitch"), "+0Hz"),
+        "target_total_video_sec": int(float(target_sec or defaults["target_total_video_sec"])),
+        # Faster sales voice; still inside OpenAI/edge safe range.
+        "speech_speed": float(cfg.get("speech_speed") or os.getenv("SALES_SPEECH_SPEED", "1.34")),
+        "tts_rate": _sales_clean(cfg.get("tts_rate"), os.getenv("SALES_TTS_RATE", "+24%")),
+        "target_words_per_scene": int(cfg.get("target_words_per_scene") or 12),
+        "max_scene_duration": float(cfg.get("max_scene_duration") or 2.8),
         "enable_text_overlay": True,
-        "image_source_mode": "product_first",
+        "image_source_mode": "product_asset_first",
         "sales_platform": platform,
-        "sales_goal": _sales_clean(cfg.get("sales_goal"), "Ra đơn / chuyển đổi"),
-        "sales_visual_strategy": _sales_clean(cfg.get("sales_visual_strategy"), "product_assets_first"),
+        "sales_goal": _sales_clean(cfg.get("sales_goal") or cfg.get("goal"), "Ra đơn / chuyển đổi"),
+        "sales_visual_strategy": "uploaded_product_asset_first",
     })
     cfg["width"] = int(cfg["width"]) - (int(cfg["width"]) % 8)
     cfg["height"] = int(cfg["height"]) - (int(cfg["height"]) % 8)
     return cfg
 
 
-def _sales_url_list(raw) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        items = raw
-    else:
-        items = re.split(r"[,;\n\|]+", str(raw))
-    out = []
-    for x in items:
-        s = str(x or "").strip().strip('"\'')
-        if s.startswith("http://") or s.startswith("https://"):
-            out.append(s)
-    # de-dupe preserving order
-    seen = set()
-    clean = []
-    for u in out:
-        if u not in seen:
-            clean.append(u)
-            seen.add(u)
-    return clean[:12]
-
-
-def _extract_meta_content(html_text: str, key: str) -> str:
-    # Supports <meta property="og:title" content="..."> and reversed attr order.
-    patterns = [
-        rf'<meta[^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\'][^>]*>',
-        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]*>',
-    ]
-    for pat in patterns:
-        m = re.search(pat, html_text or "", flags=re.I | re.S)
-        if m:
-            try:
-                import html as _html
-                return _html.unescape(m.group(1)).strip()
-            except Exception:
-                return m.group(1).strip()
-    return ""
-
-
-def _extract_jsonld_product(html_text: str) -> Dict[str, Any]:
-    out = {}
-    try:
-        import html as _html
-        blocks = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_text or "", flags=re.I | re.S)
-        for raw in blocks[:5]:
-            raw = _html.unescape(raw).strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            candidates = data if isinstance(data, list) else [data]
-            # Also inspect @graph.
-            expanded = []
-            for item in candidates:
-                if isinstance(item, dict) and isinstance(item.get("@graph"), list):
-                    expanded.extend(item.get("@graph"))
-                expanded.append(item)
-            for item in expanded:
-                if not isinstance(item, dict):
-                    continue
-                typ = str(item.get("@type", "")).lower()
-                if "product" not in typ and not any(k in item for k in ["name", "image", "description", "offers"]):
-                    continue
-                if item.get("name") and not out.get("title"):
-                    out["title"] = str(item.get("name")).strip()
-                if item.get("description") and not out.get("description"):
-                    out["description"] = str(item.get("description")).strip()
-                imgs = item.get("image")
-                if imgs:
-                    if isinstance(imgs, str):
-                        out.setdefault("image_urls", []).append(imgs)
-                    elif isinstance(imgs, list):
-                        out.setdefault("image_urls", []).extend([str(x) for x in imgs if str(x).startswith("http")])
-                offers = item.get("offers")
-                if isinstance(offers, dict):
-                    price = offers.get("price") or offers.get("lowPrice")
-                    currency = offers.get("priceCurrency") or ""
-                    if price and not out.get("price"):
-                        out["price"] = f"{price} {currency}".strip()
-    except Exception as e:
-        print("WARN: jsonld product parse failed:", repr(e))
-    return out
-
-
-def _extract_feature_candidates(description: str, max_items: int = 6) -> List[str]:
-    text = re.sub(r"\s+", " ", description or "").strip()
-    if not text:
-        return []
-    # Prefer bullet-like fragments and short sentences.
-    parts = re.split(r"(?:[\.;•\n]| - | – )+", text)
-    features = []
-    for p in parts:
-        s = re.sub(r"\s+", " ", p).strip(" -–—:;,.•")
-        if 8 <= len(s) <= 105:
-            features.append(s)
-        if len(features) >= max_items:
-            break
-    return features[:max_items]
-
-
-def extract_product_context(job_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Best-effort product context extraction.
-
-    Notes:
-    - Shopee/TikTok pages may block server-side scraping. This function still works when the page exposes
-      OpenGraph/JSON-LD metadata, and it always falls back to user-provided fields.
-    - For best production quality, frontend should pass product_image_urls/product_video_urls if available.
-    """
-    product_url = _sales_clean(
-        job_config.get("product_url") or job_config.get("product_link") or job_config.get("sales_product_link") or job_config.get("link")
-    )
-    explicit_image_urls = _sales_url_list(
-        job_config.get("product_image_urls") or job_config.get("sales_product_image_urls") or job_config.get("image_urls") or job_config.get("images")
-    )
-    explicit_video_urls = _sales_url_list(
-        job_config.get("product_video_urls") or job_config.get("sales_product_video_urls") or job_config.get("video_urls") or job_config.get("videos")
-    )
-    fallback_name = _sales_clean(job_config.get("product_name") or job_config.get("sales_product_name") or job_config.get("product"), "sản phẩm này")
-    fallback_price = _sales_clean(job_config.get("price") or job_config.get("sales_price") or job_config.get("offer") or job_config.get("sales_offer"))
-    fallback_benefits = _sales_split_benefits(job_config.get("benefits") or job_config.get("sales_benefits") or job_config.get("key_benefits"))
-
-    ctx = {
-        "source_url": product_url,
-        "product_name": fallback_name,
-        "price": fallback_price,
-        "description": _sales_clean(job_config.get("product_description") or job_config.get("sales_product_description") or job_config.get("description")),
-        "features": list(fallback_benefits),
-        "image_urls": list(explicit_image_urls),
-        "video_urls": list(explicit_video_urls),
-        "extraction_status": "fallback_only",
+def _get_product_asset_payload(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    asset = job_config.get("product_asset") or {}
+    if not isinstance(asset, dict):
+        asset = {}
+    data_url = asset.get("data_url") or job_config.get("product_asset_data_url") or ""
+    name = asset.get("name") or job_config.get("product_asset_name") or "product_asset"
+    mime_type = asset.get("mime_type") or job_config.get("product_asset_mime_type") or ""
+    url = asset.get("url") or job_config.get("product_asset_url") or ""
+    return {
+        "data_url": _sales_clean(data_url),
+        "name": _sales_clean(name, "product_asset"),
+        "mime_type": _sales_clean(mime_type),
+        "url": _sales_clean(url),
     }
 
-    if product_url and os.getenv("ENABLE_PRODUCT_URL_FETCH", "1").strip().lower() in {"1", "true", "yes", "y"}:
+
+def _guess_ext_from_mime(mime_type: str, fallback: str = ".bin") -> str:
+    mime_type = _sales_clean(mime_type).split(";", 1)[0].strip().lower()
+    if mime_type == "image/jpeg": return ".jpg"
+    if mime_type == "image/png": return ".png"
+    if mime_type == "image/webp": return ".webp"
+    if mime_type == "video/mp4": return ".mp4"
+    if mime_type == "video/quicktime": return ".mov"
+    ext = mimetypes.guess_extension(mime_type) if mime_type else None
+    return ext or fallback
+
+
+def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dict[str, Any]:
+    """Decode uploaded product asset from JSON data URL or download direct URL.
+
+    Returns {path, kind, mime_type, name}. kind is image/video/unknown.
+    """
+    os.makedirs(asset_dir, exist_ok=True)
+    asset = _get_product_asset_payload(job_config)
+    data_url = asset.get("data_url", "")
+    url = asset.get("url", "")
+    mime_type = asset.get("mime_type", "")
+    name = asset.get("name", "product_asset")
+
+    if data_url:
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-            }
-            resp = requests.get(product_url, headers=headers, timeout=int(os.getenv("PRODUCT_URL_FETCH_TIMEOUT", "12")))
-            if resp.ok and resp.text:
-                html_text = resp.text[:1500000]
-                try:
-                    from urllib.parse import urljoin
-                except Exception:
-                    urljoin = None
-                meta_title = _extract_meta_content(html_text, "og:title") or _extract_meta_content(html_text, "twitter:title")
-                meta_desc = _extract_meta_content(html_text, "og:description") or _extract_meta_content(html_text, "description") or _extract_meta_content(html_text, "twitter:description")
-                meta_img = _extract_meta_content(html_text, "og:image") or _extract_meta_content(html_text, "twitter:image")
-                meta_price = _extract_meta_content(html_text, "product:price:amount") or _extract_meta_content(html_text, "og:price:amount")
-                jsonld = _extract_jsonld_product(html_text)
-
-                if jsonld.get("title"):
-                    meta_title = jsonld["title"]
-                if jsonld.get("description"):
-                    meta_desc = jsonld["description"]
-                if jsonld.get("price") and not meta_price:
-                    meta_price = jsonld["price"]
-
-                if meta_title:
-                    ctx["product_name"] = meta_title[:140]
-                if meta_price and not ctx.get("price"):
-                    ctx["price"] = str(meta_price)[:60]
-                if meta_desc:
-                    ctx["description"] = meta_desc[:1200]
-
-                image_urls = []
-                if meta_img:
-                    image_urls.append(meta_img)
-                image_urls.extend(jsonld.get("image_urls") or [])
-                # Fallback: scan image URLs in HTML for common product/CDN images.
-                raw_imgs = re.findall(r'https?://[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s<>]*)?', html_text, flags=re.I)
-                image_urls.extend(raw_imgs[:8])
-                if urljoin:
-                    image_urls = [urljoin(product_url, u) for u in image_urls if u]
-                ctx["image_urls"] = _sales_url_list(ctx["image_urls"] + image_urls)
-                if ctx.get("description"):
-                    ctx["features"] = (_sales_split_benefits(ctx.get("features")) + _extract_feature_candidates(ctx["description"]))[:8]
-                ctx["extraction_status"] = "metadata_extracted"
-            else:
-                ctx["extraction_status"] = f"fetch_failed_http_{getattr(resp, 'status_code', 'unknown')}"
-        except Exception as e:
-            ctx["extraction_status"] = f"fetch_error: {repr(e)[:180]}"
-            print("WARN: product URL extraction failed:", repr(e))
-
-    if not ctx["features"]:
-        ctx["features"] = ["tiện lợi hơn", "tiết kiệm thời gian", "dễ sử dụng"]
-    ctx["image_urls"] = _sales_url_list(ctx.get("image_urls"))
-    ctx["video_urls"] = _sales_url_list(ctx.get("video_urls"))
-    return ctx
-
-
-def _download_binary_url(url: str, out_path: str, timeout: int = 25, max_bytes: int = 80_000_000) -> bool:
-    try:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
-        with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
-            r.raise_for_status()
-            total = 0
+            header, b64 = data_url.split(",", 1) if "," in data_url else ("", data_url)
+            m = re.search(r"data:([^;]+);base64", header, flags=re.IGNORECASE)
+            if m:
+                mime_type = m.group(1).strip()
+            raw = base64.b64decode(b64, validate=False)
+            ext = os.path.splitext(name)[1].lower() or _guess_ext_from_mime(mime_type)
+            out_path = os.path.join(asset_dir, f"uploaded_product_asset{ext}")
             with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 256):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise ValueError("download exceeds max_bytes")
-                    f.write(chunk)
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 1024
-    except Exception as e:
-        print("WARN: download url failed:", url, repr(e))
+                f.write(raw)
+            kind = "video" if (mime_type.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".webm"}) else "image" if (mime_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}) else "unknown"
+            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "uploaded_data_url"}
+        except Exception as e:
+            print("WARN: cannot decode product_asset_data_url:", repr(e))
+
+    if url:
         try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except Exception:
-            pass
-        return False
+            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            ctype = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            mime_type = mime_type or ctype
+            parsed_ext = os.path.splitext(urlparse(url).path)[1].lower()
+            ext = parsed_ext or _guess_ext_from_mime(mime_type)
+            out_path = os.path.join(asset_dir, f"downloaded_product_asset{ext}")
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            kind = "video" if (mime_type.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".webm"}) else "image" if (mime_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}) else "unknown"
+            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "downloaded_url"}
+        except Exception as e:
+            print("WARN: cannot download product_asset_url:", repr(e))
+
+    return {"path": "", "kind": "none", "mime_type": mime_type, "name": name, "source": "none"}
 
 
-def _prepare_product_image(url: str, out_path: str, width: int, height: int) -> bool:
-    try:
-        import io
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        # cover crop to target ratio, then resize
-        src_w, src_h = img.size
-        target_ratio = width / max(height, 1)
-        src_ratio = src_w / max(src_h, 1)
-        if src_ratio > target_ratio:
-            new_w = int(src_h * target_ratio)
-            left = max(0, (src_w - new_w) // 2)
-            img = img.crop((left, 0, left + new_w, src_h))
-        else:
-            new_h = int(src_w / target_ratio)
-            top = max(0, (src_h - new_h) // 2)
-            img = img.crop((0, top, src_w, top + new_h))
-        img = img.resize((width, height), Image.LANCZOS)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        img.save(out_path, "PNG")
-        return True
-    except Exception as e:
-        print("WARN: product image prepare failed:", repr(e))
-        return False
+def prepare_product_image(src_path: str, out_path: str, width: int, height: int) -> str:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with Image.open(src_path) as im:
+        im = im.convert("RGB")
+        # Contain image on clean commercial background, not aggressive crop.
+        bg = Image.new("RGB", (width, height), (248, 248, 252))
+        im.thumbnail((int(width * 0.88), int(height * 0.78)), Image.Resampling.LANCZOS)
+        x = (width - im.width) // 2
+        y = (height - im.height) // 2
+        bg.paste(im, (x, y))
+        bg.save(out_path, format="PNG")
+    return out_path
 
 
-def _pick_cycled(urls: List[str], idx: int) -> str:
-    if not urls:
-        return ""
-    return urls[max(0, idx - 1) % len(urls)]
+def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a conversion-oriented sales script from product form fields.
 
-
-def build_sales_script(job_config: Dict[str, Any], product_context: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Create a conversion-oriented, product-aware sales script."""
-    product_context = product_context or extract_product_context(job_config)
-    product_name = _sales_clean(product_context.get("product_name") or job_config.get("product_name") or job_config.get("sales_product_name") or job_config.get("product"), "sản phẩm này")
-    price = _sales_clean(product_context.get("price") or job_config.get("price") or job_config.get("sales_price") or job_config.get("offer") or job_config.get("sales_offer"))
-    product_link = _sales_clean(product_context.get("source_url") or job_config.get("product_url") or job_config.get("product_link") or job_config.get("sales_product_link") or job_config.get("link"))
-    target_user = _sales_clean(job_config.get("target_user") or job_config.get("sales_target_user") or job_config.get("audience"), "người đang cần giải pháp nhanh và tiện lợi")
-    pain_point = _sales_clean(job_config.get("pain_point") or job_config.get("sales_pain_point") or job_config.get("problem"), "mất thời gian và khó chọn đúng sản phẩm")
-    benefits = _sales_split_benefits(product_context.get("features")) or _sales_split_benefits(job_config.get("benefits") or job_config.get("sales_benefits") or job_config.get("key_benefits"))
+    Does NOT crawl product links. It uses the user-provided product name,
+    benefits, pain point, price, and uploaded asset.
+    """
+    product_name = _sales_clean(_sales_nested(job_config, "product_name") or _sales_nested(job_config, "sales_product_name") or _sales_nested(job_config, "product"), "sản phẩm này")
+    price = _sales_clean(_sales_nested(job_config, "price") or _sales_nested(job_config, "sales_price") or _sales_nested(job_config, "offer") or _sales_nested(job_config, "sales_offer"))
+    target_user = _sales_clean(_sales_nested(job_config, "target_user") or _sales_nested(job_config, "sales_target_user") or _sales_nested(job_config, "audience"), "người mua online")
+    pain_point = _sales_clean(_sales_nested(job_config, "pain_point") or _sales_nested(job_config, "sales_pain_point") or _sales_nested(job_config, "problem"), "mất thời gian và khó chọn đúng sản phẩm")
+    benefits = _sales_split_benefits(_sales_nested(job_config, "benefits") or _sales_nested(job_config, "sales_benefits") or _sales_nested(job_config, "key_benefits"))
     if not benefits:
         benefits = ["tiện lợi hơn", "tiết kiệm thời gian", "dễ sử dụng"]
-    description = _sales_clean(product_context.get("description"))
-    tone = _sales_clean(job_config.get("sales_tone") or job_config.get("tone"), "viral mạnh / bắt trend")
-    platform = _sales_clean(job_config.get("sales_platform") or job_config.get("platform"), "TikTok / TikTok Shop")
-    goal = _sales_clean(job_config.get("sales_goal"), "Ra đơn / chuyển đổi")
+    tone = _sales_clean(_sales_nested(job_config, "sales_tone") or _sales_nested(job_config, "tone"), "nhanh, rõ, thuyết phục")
+    platform = _sales_clean(job_config.get("sales_platform") or _sales_nested(job_config, "platform"), "TikTok / TikTok Shop")
+    goal = _sales_clean(job_config.get("sales_goal") or _sales_nested(job_config, "goal"), "Ra đơn / chuyển đổi")
 
-    feature_phrase = ", ".join(benefits[:3])
     fallback = {
-        "hook": f"{product_name}: có đáng mua không? Xem nhanh nhé!",
-        "pain": f"Nếu bạn là {target_user} và đang gặp vấn đề {pain_point}, sản phẩm này có thể giúp tiết kiệm thời gian hơn.",
-        "solution": f"{product_name} nổi bật ở các điểm: {feature_phrase}.",
-        "benefits": benefits[:5],
-        "proof": f"Thông tin sản phẩm cho thấy các điểm chính gồm: {feature_phrase}.",
-        "cta": f"Bấm link để xem chi tiết {product_name}" + (f" với giá/ưu đãi {price}." if price else "."),
+        "hook": f"{target_user}, đừng bỏ qua {product_name}.",
+        "pain": f"Nếu bạn đang {pain_point}, đây là cách xử lý nhanh hơn.",
+        "solution": f"{product_name} giúp mọi việc gọn hơn, tiện hơn và dễ dùng hơn mỗi ngày.",
+        "benefits": benefits,
+        "proof": f"Nổi bật nhất: {', '.join(benefits[:3])}.",
+        "cta": f"Xem ngay {product_name}" + (f" với ưu đãi {price}." if price else " hôm nay."),
         "short_overlays": [
-            "Xem nhanh sản phẩm!",
+            "Đừng bỏ qua!",
             pain_point[:42],
             product_name[:38],
             benefits[0][:34] if benefits else "Tiện lợi hơn",
-            benefits[1][:34] if len(benefits) > 1 else "Tiết kiệm thời gian",
-            (price[:30] if price else "Bấm link xem ngay"),
+            benefits[1][:34] if len(benefits) > 1 else "Dễ dùng hơn",
+            price[:34] if price else "Ưu đãi hôm nay",
             "Mua ngay hôm nay",
         ],
         "product_name": product_name,
         "price": price,
-        "product_link": product_link,
         "target_user": target_user,
         "pain_point": pain_point,
         "tone": tone,
         "platform": platform,
         "goal": goal,
-        "product_description": description,
-        "product_context_status": product_context.get("extraction_status", "unknown"),
-        "product_image_count": len(product_context.get("image_urls") or []),
-        "product_video_count": len(product_context.get("video_urls") or []),
     }
 
-    if not OPENAI_API_KEY or os.getenv("ENABLE_SALES_AI_PLANNER", "1").strip().lower() not in {"1", "true", "yes", "y"}:
+    if not OPENAI_API_KEY or os.getenv("ENABLE_SALES_AI_PLANNER", "1").strip() not in {"1", "true", "yes", "y"}:
         return fallback
 
     try:
         client = get_openai_client()
         prompt = f"""
-Bạn là chuyên gia viết video quảng cáo ngắn cho TikTok Shop, Shopee và YouTube Shorts.
-Hãy tạo nội dung bán hàng tiếng Việt, rất nhanh, mạnh, dễ đọc voice-over, dựa trên thông tin sản phẩm thật.
-Không bịa tính năng ngoài thông tin được cung cấp. Nếu mô tả từ link còn thiếu, chỉ nói theo benefit/user input.
+Bạn là chuyên gia viết video bán hàng ngắn cho TikTok Shop, Shopee, Reels và YouTube Shorts.
+Chỉ sử dụng thông tin người dùng cung cấp. Không tự bịa tính năng, không nhắc link sản phẩm.
+Viết tiếng Việt, nhịp nhanh, câu ngắn, voice-over dễ đọc, tập trung ra đơn.
 
-Thông tin sản phẩm từ user/link:
+Thông tin:
 - Sản phẩm: {product_name}
 - Giá/ưu đãi: {price or 'không cung cấp'}
-- Link: {product_link or 'không cung cấp'}
-- Mô tả trích xuất từ link: {description or 'không trích xuất được'}
-- Tính năng/lợi ích đã biết: {', '.join(benefits)}
 - Khách hàng mục tiêu: {target_user}
 - Nỗi đau: {pain_point}
+- Lợi ích/tính năng do user nhập: {', '.join(benefits)}
 - Nền tảng: {platform}
 - Tone: {tone}
 - Mục tiêu: {goal}
+- Visual chính: dùng ảnh/video sản phẩm user upload.
 
-Yêu cầu:
-- Hook phải nhắc trực tiếp sản phẩm.
-- Solution/proof phải nói tính năng cụ thể trong mô tả/link.
-- Voice-over ngắn, dồn dập, hợp video 15-35s.
-- Trả về JSON với keys: hook, pain, solution, benefits(array 3-5), proof, cta, short_overlays(array 6-8).
-- Mỗi overlay tối đa 6 từ, dễ đọc trên màn hình.
+Trả về JSON với keys: hook, pain, solution, benefits(array 3-5), proof, cta, short_overlays(array 6-8).
+Mỗi overlay tối đa 6 từ. Mỗi câu voice-over ngắn, mạnh, không nói quá sự thật.
 """.strip()
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -5197,7 +5039,7 @@ Yêu cầu:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.45,
-            max_tokens=850,
+            max_tokens=650,
         )
         raw = resp.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|```$", "", raw, flags=re.IGNORECASE).strip()
@@ -5205,118 +5047,62 @@ Yêu cầu:
         if not isinstance(data, dict):
             return fallback
         merged = {**fallback, **data}
-        merged["benefits"] = _sales_split_benefits(merged.get("benefits")) or benefits[:5]
+        merged["benefits"] = _sales_split_benefits(merged.get("benefits")) or benefits
         overlays = merged.get("short_overlays") or fallback["short_overlays"]
         merged["short_overlays"] = [sanitize_tts_text(str(x), max_chars=48) for x in overlays if str(x).strip()][:8]
-        # Preserve metadata fields.
-        for k in ["product_name", "price", "product_link", "target_user", "pain_point", "tone", "platform", "goal", "product_description", "product_context_status", "product_image_count", "product_video_count"]:
-            merged[k] = fallback[k]
         return merged
     except Exception as e:
         print("WARN: sales AI planner failed, using fallback:", repr(e))
         return fallback
 
 
-def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-    product_context = product_context or {}
+def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_asset: Dict[str, Any]) -> List[Dict[str, Any]]:
     product = sales_script.get("product_name", "sản phẩm")
     target_user = sales_script.get("target_user", "khách hàng")
     benefits = sales_script.get("benefits", []) or []
     overlays = sales_script.get("short_overlays", []) or []
     is_vertical = str(job_config.get("aspect_ratio", "9:16")) == "9:16"
-    image_urls = product_context.get("image_urls") or []
-    video_urls = product_context.get("video_urls") or []
-    has_product_assets = bool(image_urls or video_urls)
+    has_product_asset = bool(product_asset.get("path") and os.path.exists(str(product_asset.get("path"))))
 
     scene_templates = [
-        {
-            "role": "hook",
-            "voice_text": sales_script.get("hook", "Đừng bỏ qua sản phẩm này."),
-            "overlay": overlays[0] if len(overlays) > 0 else "Xem nhanh sản phẩm!",
-            "query": f"{product} product close up ecommerce advertisement",
-            "asset_priority": "product_first",
-            "profile": "fast_zoom",
-        },
-        {
-            "role": "pain",
-            "voice_text": sales_script.get("pain", "Vấn đề này khiến bạn mất thời gian mỗi ngày."),
-            "overlay": overlays[1] if len(overlays) > 1 else "Bạn có gặp vấn đề này?",
-            "query": f"person frustrated daily problem {target_user}",
-            "asset_priority": "pexels_first",
-            "profile": "standard",
-        },
-        {
-            "role": "solution",
-            "voice_text": sales_script.get("solution", f"{product} là giải pháp đơn giản và tiện lợi hơn."),
-            "overlay": overlays[2] if len(overlays) > 2 else product,
-            "query": f"product demonstration online shopping customer using product",
-            "asset_priority": "product_first",
-            "profile": "fast_zoom",
-        },
+        {"role": "hook", "voice_text": sales_script.get("hook", f"Đừng bỏ qua {product}."), "overlay": overlays[0] if len(overlays) > 0 else "Đừng bỏ qua!", "source": "product", "query": f"{target_user} online shopping product reveal"},
+        {"role": "pain", "voice_text": sales_script.get("pain", "Vấn đề này khiến bạn mất thời gian mỗi ngày."), "overlay": overlays[1] if len(overlays) > 1 else "Bạn có gặp vấn đề này?", "source": "pexels", "query": f"person frustrated daily problem {target_user}"},
+        {"role": "solution", "voice_text": sales_script.get("solution", f"{product} là giải pháp tiện lợi hơn."), "overlay": overlays[2] if len(overlays) > 2 else product, "source": "product", "query": f"product demo happy customer ecommerce"},
     ]
     for i, b in enumerate(benefits[:3], start=1):
-        scene_templates.append({
-            "role": f"benefit_{i}",
-            "voice_text": f"Điểm {i}: {b}.",
-            "overlay": overlays[2 + i] if len(overlays) > 2 + i else b,
-            "query": f"modern lifestyle product benefit happy customer {b}",
-            "asset_priority": "product_first" if has_product_assets else "pexels_first",
-            "profile": "fast_zoom",
-        })
-    scene_templates.append({
-        "role": "proof",
-        "voice_text": sales_script.get("proof", f"Thông tin sản phẩm nhấn mạnh các điểm nổi bật của {product}."),
-        "overlay": overlays[-2] if len(overlays) >= 2 else "Tính năng nổi bật",
-        "query": f"product details close up ecommerce review",
-        "asset_priority": "product_first" if has_product_assets else "pexels_first",
-        "profile": "standard",
-    })
-    scene_templates.append({
-        "role": "cta",
-        "voice_text": sales_script.get("cta", f"Bấm link để xem {product} ngay hôm nay."),
-        "overlay": overlays[-1] if overlays else "Mua ngay hôm nay",
-        "query": "shopping online smartphone checkout happy customer",
-        "asset_priority": "product_first" if has_product_assets else "pexels_first",
-        "profile": "fast_zoom",
-    })
+        scene_templates.append({"role": f"benefit_{i}", "voice_text": f"{b}.", "overlay": overlays[2 + i] if len(overlays) > 2 + i else b, "source": "product" if i <= 2 else "pexels", "query": f"modern lifestyle happy customer product benefit {b}"})
+    scene_templates.append({"role": "cta", "voice_text": sales_script.get("cta", f"Xem ngay {product} hôm nay."), "overlay": overlays[-1] if overlays else "Mua ngay hôm nay", "source": "product", "query": "online shopping smartphone checkout happy customer"})
 
     scenes = []
     for idx, s in enumerate(scene_templates, start=1):
-        text = sanitize_tts_text(s["voice_text"], max_chars=360)
+        text = sanitize_tts_text(s["voice_text"], max_chars=320)
         overlay = sanitize_tts_text(s.get("overlay") or text, max_chars=64)
         query = re.sub(r"\s+", " ", str(s.get("query") or product)).strip()
-        asset_priority = s.get("asset_priority", "pexels_first")
+        use_product = has_product_asset and s.get("source") == "product"
         scene_plan = {
-            "main_subject": query,
+            "main_subject": product if use_product else query,
             "action": s["role"],
-            "location": "modern ecommerce sales video scene",
+            "location": "clean ecommerce advertising scene" if use_product else "modern real-life ecommerce advertising scene",
             "mood": "fast energetic conversion-focused commercial mood",
-            "shot": "vertical commercial product shot" if is_vertical else "wide commercial product shot",
+            "shot": "vertical product hero shot" if is_vertical else "wide product commercial shot",
             "lighting": "bright clean professional lighting",
-            "details": [product, target_user, s["role"]] + benefits[:3],
+            "details": [product, target_user, s["role"]],
         }
         scenes.append({
             "scene_id": idx,
-            "profile": s.get("profile", "standard"),
+            "profile": "standard",
             "voice_text": text,
             "source_chunk": text,
             "text_overlay": overlay,
             "hook_text": overlay,
             "stock_query": query,
-            "asset_priority": asset_priority,
-            "product_image_urls": image_urls,
-            "product_video_urls": video_urls,
-            "prefer_product_asset_first": asset_priority == "product_first",
-            "visual_prompt": shorten_prompt_for_sdxl(
-                f"commercial product advertising photo, {query}, real product, realistic ecommerce ad, professional lighting, no text",
-                max_chars=260,
-                max_words=48,
-            ),
-            "negative_prompt": BASE_NEGATIVE_PROMPT + ", fake product, wrong product, unreadable text, watermark, logo",
+            "visual_prompt": shorten_prompt_for_sdxl(f"commercial lifestyle photo, {query}, real people, natural emotion, professional advertising look, no text", max_chars=240, max_words=44),
+            "negative_prompt": BASE_NEGATIVE_PROMPT + ", fake product, unreadable text, watermark, logo",
             "scene_plan": scene_plan,
-            "visual_source": "product" if asset_priority == "product_first" and has_product_assets else "stock",
-            "visual_asset_type": "video" if asset_priority != "product_first" else "image",
-            "prefer_pexels_video_first": asset_priority != "product_first",
+            "visual_source": "product_asset" if use_product else "stock",
+            "visual_asset_type": product_asset.get("kind") if use_product else "video",
+            "prefer_product_asset": bool(use_product),
+            "prefer_pexels_video_first": not bool(use_product),
             "allow_video_assets": True,
             "video_style_preset": "bold_promo",
             "aspect_ratio": job_config.get("aspect_ratio", "9:16"),
@@ -5324,45 +5110,34 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
     return scenes
 
 
-def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, height: int, is_vertical: bool) -> str:
-    """Product asset first for product scenes, then Pexels video/photo, optional AI, placeholder."""
-    query = scene.get("stock_query") or scene.get("visual_prompt") or "online shopping happy customer"
+def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, height: int, is_vertical: bool, product_asset: Dict[str, Any]) -> str:
+    """Product asset first for product scenes; Pexels for pain/lifestyle fallback."""
     video_path = os.path.splitext(img_path)[0] + ".mp4"
-    scene_id = int(scene.get("scene_id", 1) or 1)
 
-    # 1) Product assets from URL/user input: best for real sales conversion.
-    if scene.get("prefer_product_asset_first"):
-        product_videos = scene.get("product_video_urls") or []
-        product_images = scene.get("product_image_urls") or []
-        # Use product video first if a direct video URL is available.
-        pvideo = _pick_cycled(product_videos, scene_id)
-        if pvideo:
-            try:
-                ok = _download_binary_url(pvideo, video_path, max_bytes=int(os.getenv("SALES_PRODUCT_VIDEO_MAX_BYTES", "90000000")))
-                if ok:
-                    scene["visual_used"] = "product_video_from_link"
-                    scene["visual_video_path"] = video_path
-                    scene["visual_source"] = "product"
-                    scene["product_asset_url"] = pvideo
-                    create_fast_placeholder_image(img_path, width, height, title="Product")
-                    scene["visual_file"] = os.path.basename(img_path)
-                    return img_path
-            except Exception as e:
-                print("WARN: product video download failed:", repr(e))
-        pimg = _pick_cycled(product_images, scene_id)
-        if pimg:
-            try:
-                ok = _prepare_product_image(pimg, img_path, width, height)
-                if ok:
-                    scene["visual_used"] = "product_image_from_link"
-                    scene["visual_source"] = "product"
-                    scene["product_asset_url"] = pimg
-                    scene["visual_file"] = os.path.basename(img_path)
-                    return img_path
-            except Exception as e:
-                print("WARN: product image download failed:", repr(e))
+    if scene.get("prefer_product_asset") and product_asset.get("path") and os.path.exists(str(product_asset.get("path"))):
+        try:
+            if product_asset.get("kind") == "video":
+                # Keep uploaded video as real product visual.
+                src = product_asset["path"]
+                ext = os.path.splitext(src)[1].lower() or ".mp4"
+                product_video_path = os.path.splitext(img_path)[0] + f"_product{ext}"
+                shutil.copyfile(src, product_video_path)
+                scene["visual_used"] = "uploaded_product_video"
+                scene["visual_video_path"] = product_video_path
+                create_fast_placeholder_image(img_path, width, height, title="Product Video")
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+            elif product_asset.get("kind") == "image":
+                prepare_product_image(product_asset["path"], img_path, width, height)
+                scene["visual_used"] = "uploaded_product_image"
+                scene["visual_source"] = "product_asset"
+                scene["visual_file"] = os.path.basename(img_path)
+                return img_path
+        except Exception as e:
+            print("WARN: uploaded product asset failed, fallback to Pexels:", repr(e))
 
-    # 2) Pexels video/photo for pain/lifestyle and fallback.
+    query = scene.get("stock_query") or scene.get("visual_prompt") or "online shopping happy customer"
+
     if ENABLE_STOCK_FETCH and PEXELS_API_KEY:
         try:
             pvid = fetch_pexels_video(query, is_vertical=is_vertical)
@@ -5371,7 +5146,6 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
                 if ok:
                     scene["visual_used"] = "sales_pexels_video"
                     scene["visual_video_path"] = ok
-                    scene["visual_source"] = "stock"
                     scene["pexels_id"] = pvid.get("pexels_id", "")
                     scene["stock_query_used"] = pvid.get("query", query)
                     create_fast_placeholder_image(img_path, width, height, title="FlozenAI Ads")
@@ -5394,27 +5168,6 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
         except Exception as e:
             print("WARN: sales Pexels image failed:", repr(e))
 
-    # 3) Optional AI fallback is disabled by default for sales to avoid fake product visuals.
-    if _safe_bool(scene.get("allow_ai_fallback") or os.getenv("SALES_ALLOW_AI_FALLBACK", "0"), False):
-        try:
-            generate_image(
-                scene.get("visual_prompt", query),
-                img_path,
-                negative_prompt=scene.get("negative_prompt", BASE_NEGATIVE_PROMPT),
-                width=width,
-                height=height,
-                num_inference_steps=14,
-                guidance_scale=5.8,
-                seed=SEED + int(scene.get("scene_id", 1)),
-                retries=1,
-                scene_id=scene.get("scene_id"),
-            )
-            scene["visual_used"] = "sales_ai_image_fallback"
-            scene["visual_file"] = os.path.basename(img_path)
-            return img_path
-        except Exception as e:
-            print("WARN: sales AI fallback failed:", repr(e))
-
     create_fast_placeholder_image(img_path, width, height, title="FlozenAI Ads")
     scene["visual_used"] = "sales_placeholder"
     scene["visual_file"] = os.path.basename(img_path)
@@ -5422,7 +5175,7 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
 
 
 def run_sales_pipeline(job_config, job_id):
-    """Sales video pipeline V2: product URL/form -> product-aware script -> product assets first -> fast ad video."""
+    """Sales video pipeline: uploaded product asset -> sales script -> fast ad video."""
     job_config = normalize_sales_job_config(job_config)
     job_dir = os.path.join(RUNNING_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -5433,7 +5186,8 @@ def run_sales_pipeline(job_config, job_id):
     AUDIO_DIR = os.path.join(job_dir, "audio")
     OUT_DIR = os.path.join(job_dir, "outputs")
     META_DIR = os.path.join(job_dir, "meta")
-    for d in [IMG_DIR, AUDIO_DIR, OUT_DIR, META_DIR]:
+    ASSET_DIR = os.path.join(job_dir, "product_assets")
+    for d in [IMG_DIR, AUDIO_DIR, OUT_DIR, META_DIR, ASSET_DIR]:
         os.makedirs(d, exist_ok=True)
         clear_folder(d)
 
@@ -5445,37 +5199,36 @@ def run_sales_pipeline(job_config, job_id):
     video_style_preset = "bold_promo"
     video_style = STYLE_PRESETS.get(video_style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
 
-    write_status(job_dir, job_id, "running", {"step": "sales_extract_product", "progress_pct": 5, "eta_sec": 80})
-    product_context = extract_product_context(job_config)
-    write_json(os.path.join(META_DIR, "sales_product_context.json"), product_context)
+    write_status(job_dir, job_id, "running", {"step": "sales_prepare_product_asset", "progress_pct": 5, "eta_sec": 80})
+    product_asset = materialize_product_asset(job_config, ASSET_DIR)
+    write_json(os.path.join(META_DIR, "product_asset.json"), {k: v for k, v in product_asset.items() if k != "path"} | {"has_path": bool(product_asset.get("path")), "kind": product_asset.get("kind")})
 
     write_status(job_dir, job_id, "running", {"step": "sales_plan", "progress_pct": 10, "eta_sec": 70})
-    sales_script = build_sales_script(job_config, product_context=product_context)
-    scene_objects = build_sales_scenes(sales_script, job_config, product_context=product_context)
+    sales_script = build_sales_script(job_config)
+    scene_objects = build_sales_scenes(sales_script, job_config, product_asset)
     total_scenes = len(scene_objects)
 
     write_json(os.path.join(META_DIR, "sales_script.json"), sales_script)
     write_json(os.path.join(META_DIR, "sales_scene_plan.json"), scene_objects)
 
-    write_status(job_dir, job_id, "running", {"step": "sales_fetch_visuals", "scene_count": total_scenes, "progress_pct": 18, "eta_sec": max(30, total_scenes * 6)})
+    write_status(job_dir, job_id, "running", {"step": "sales_prepare_visuals", "scene_count": total_scenes, "progress_pct": 18, "eta_sec": max(30, total_scenes * 5)})
     image_paths = []
     for idx, scene in enumerate(scene_objects, start=1):
         img_path = os.path.join(IMG_DIR, f"scene_{idx:02d}.png")
-        _download_sales_visual(scene, img_path, width, height, is_vertical)
+        _download_sales_visual(scene, img_path, width, height, is_vertical, product_asset)
         image_paths.append(img_path)
         write_status(job_dir, job_id, "running", {
-            "step": "sales_fetch_visuals",
+            "step": "sales_prepare_visuals",
             "generated_images": idx,
             "scene_count": total_scenes,
             "progress_pct": int(18 + (idx / max(total_scenes, 1)) * 26),
-            "eta_sec": max(8, (total_scenes - idx) * 5),
+            "eta_sec": max(8, (total_scenes - idx) * 4),
         })
 
-    # Very compact narration for faster ad pacing.
-    full_narration_text = sanitize_tts_text(" ".join([s.get("voice_text", "") for s in scene_objects]), max_chars=4000)
-    full_narration_text = _dedupe_repeated_sentences(full_narration_text, max_chars=4000) if "_dedupe_repeated_sentences" in globals() else full_narration_text
+    full_narration_text = sanitize_tts_text(" ".join([s.get("voice_text", "") for s in scene_objects]), max_chars=3600)
+    full_narration_text = _dedupe_repeated_sentences(full_narration_text, max_chars=3600) if "_dedupe_repeated_sentences" in globals() else full_narration_text
 
-    write_status(job_dir, job_id, "running", {"step": "sales_tts", "progress_pct": 50, "eta_sec": 18})
+    write_status(job_dir, job_id, "running", {"step": "sales_tts_fast", "progress_pct": 50, "eta_sec": 20})
     full_audio_raw_path = os.path.join(AUDIO_DIR, "sales_narration_raw.mp3")
     tts_meta = asyncio.run(save_tts(
         text=full_narration_text,
@@ -5490,20 +5243,14 @@ def run_sales_pipeline(job_config, job_id):
     total_audio_duration = float(full_audio_clip.duration or 1.0)
 
     target_total = float(job_config.get("target_total_video_sec") or total_audio_duration)
-    # Ads should not drag. Keep visual duration close to the faster TTS.
-    total_duration = max(7.0, min(max(total_audio_duration, target_total * 0.78), target_total * 1.12))
-    scene_durations = allocate_scene_durations_from_narration(
-        scene_objects,
-        total_duration,
-        min_scene_sec=1.05 if is_vertical else 1.35,
-        max_scene_sec=float(job_config.get("max_scene_duration", 3.8 if is_vertical else 4.8)),
-    )
+    total_duration = max(7.0, min(max(total_audio_duration, target_total * 0.80), target_total * 1.12))
+    scene_durations = allocate_scene_durations_from_narration(scene_objects, total_duration, min_scene_sec=1.15 if is_vertical else 1.45, max_scene_sec=4.2 if is_vertical else 5.2)
 
     write_json(os.path.join(META_DIR, "sales_tts_debug.json"), {
         "voice_used": tts_meta.get("voice_used", selected_voice),
         "tts_engine": tts_meta.get("engine", "unknown"),
-        "tts_rate": job_config.get("tts_rate", "+24%"),
         "speech_speed": speech_speed,
+        "tts_rate": job_config.get("tts_rate", "+24%"),
         "total_audio_duration": round(total_audio_duration, 3),
         "visual_total_duration": round(total_duration, 3),
         "full_narration_text": full_narration_text,
@@ -5518,23 +5265,21 @@ def run_sales_pipeline(job_config, job_id):
         if stock_video_path and os.path.exists(str(stock_video_path)):
             vclip = make_stock_video_clip(stock_video_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
             if vclip is None:
-                vclip = make_motion_clip(img_path, duration, width, height, scene_profile=scene.get("profile", "standard"), fps=fps, video_style=video_style)
+                vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         else:
-            vclip = make_motion_clip(img_path, duration, width, height, scene_profile=scene.get("profile", "standard"), fps=fps, video_style=video_style)
+            vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         vclip = apply_visual_finish(vclip, video_style_preset)
         vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or scene.get("voice_text") or "", width, height, video_style_preset)
         if idx < total_scenes:
-            vclip = vclip.with_effects([vfx.FadeIn(0.04), vfx.FadeOut(0.06)])
+            vclip = vclip.with_effects([vfx.FadeIn(0.05), vfx.FadeOut(0.07)])
         else:
-            vclip = vclip.with_effects([vfx.FadeIn(0.04)])
+            vclip = vclip.with_effects([vfx.FadeIn(0.05)])
         video_clips.append(vclip)
         scene_duration_log.append({
             "scene_id": idx,
             "role": scene.get("scene_plan", {}).get("action", ""),
             "duration": round(duration, 3),
             "visual_used": scene.get("visual_used", ""),
-            "visual_source": scene.get("visual_source", ""),
-            "product_asset_url": scene.get("product_asset_url", ""),
             "stock_query": scene.get("stock_query", ""),
             "overlay": scene.get("text_overlay", ""),
         })
@@ -5591,12 +5336,9 @@ def run_sales_pipeline(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "sales_script": sales_script,
-        "product_context": product_context,
-        "timeline_mode": "sales_video_v2_product_aware_fast_narration",
+        "timeline_mode": "sales_video_uploaded_product_asset_first_fast_voice",
         "finished_at": now_str(),
     }
-
-
 
 
 # ===== SERVERLESS ENTRYPOINT =====
@@ -5638,4 +5380,3 @@ def run_job_serverless(job_config, job_id, base_dir="/tmp/easyai", progress_call
 
     finally:
         _PROGRESS_CALLBACK = old_callback
-        
