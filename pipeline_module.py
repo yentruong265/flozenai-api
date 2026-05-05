@@ -307,6 +307,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "target_user": _safe_str(job_config.get("target_user")),
         "pain_point": _safe_str(job_config.get("pain_point")),
         "benefits": job_config.get("benefits"),
+        "product_assets": job_config.get("product_assets") if isinstance(job_config.get("product_assets"), list) else [],
         "product_asset": job_config.get("product_asset") if isinstance(job_config.get("product_asset"), dict) else {},
         "product_asset_data_url": _safe_str(job_config.get("product_asset_data_url")),
         "product_asset_name": _safe_str(job_config.get("product_asset_name")),
@@ -318,6 +319,7 @@ def normalize_job_config(job_config, fallback_job_id=None):
     }
 
     return normalized
+
 
 # ===== CELL 5 =====
 # B5 — SDXL image generation (PRO+, aspect-ratio-aware, anti-crop for 9:16)
@@ -4879,19 +4881,57 @@ def normalize_sales_job_config(job_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_product_asset_payload(job_config: Dict[str, Any]) -> Dict[str, Any]:
-    asset = job_config.get("product_asset") or {}
-    if not isinstance(asset, dict):
-        asset = {}
-    data_url = asset.get("data_url") or job_config.get("product_asset_data_url") or ""
-    name = asset.get("name") or job_config.get("product_asset_name") or "product_asset"
-    mime_type = asset.get("mime_type") or job_config.get("product_asset_mime_type") or ""
-    url = asset.get("url") or job_config.get("product_asset_url") or ""
-    return {
-        "data_url": _sales_clean(data_url),
-        "name": _sales_clean(name, "product_asset"),
-        "mime_type": _sales_clean(mime_type),
-        "url": _sales_clean(url),
-    }
+    """Backward-compatible single-asset reader."""
+    assets = _get_product_asset_payloads(job_config)
+    return assets[0] if assets else {"data_url": "", "name": "product_asset", "mime_type": "", "url": ""}
+
+
+def _get_product_asset_payloads(job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Read multiple uploaded product assets from product_assets[].
+
+    Supports both the new payload:
+      product_assets: [{data_url, name, mime_type, size_bytes}, ...]
+    and the legacy single asset fields:
+      product_asset / product_asset_data_url / product_asset_url.
+    """
+    out = []
+    raw_assets = job_config.get("product_assets") or []
+    if isinstance(raw_assets, list):
+        for i, a in enumerate(raw_assets):
+            if not isinstance(a, dict):
+                continue
+            data_url = a.get("data_url") or a.get("dataUrl") or ""
+            url = a.get("url") or a.get("asset_url") or ""
+            name = a.get("name") or a.get("filename") or f"product_asset_{i+1}"
+            mime_type = a.get("mime_type") or a.get("mimeType") or ""
+            if data_url or url:
+                out.append({
+                    "data_url": _sales_clean(data_url),
+                    "name": _sales_clean(name, f"product_asset_{i+1}"),
+                    "mime_type": _sales_clean(mime_type),
+                    "url": _sales_clean(url),
+                })
+
+    # Legacy single asset support.
+    legacy = job_config.get("product_asset") or {}
+    if not isinstance(legacy, dict):
+        legacy = {}
+    legacy_data_url = legacy.get("data_url") or job_config.get("product_asset_data_url") or ""
+    legacy_url = legacy.get("url") or job_config.get("product_asset_url") or ""
+    if legacy_data_url or legacy_url:
+        legacy_payload = {
+            "data_url": _sales_clean(legacy_data_url),
+            "name": _sales_clean(legacy.get("name") or job_config.get("product_asset_name") or "product_asset"),
+            "mime_type": _sales_clean(legacy.get("mime_type") or job_config.get("product_asset_mime_type") or ""),
+            "url": _sales_clean(legacy_url),
+        }
+        # Avoid exact duplicate if frontend also included first asset in both places.
+        key = (legacy_payload["data_url"][:80], legacy_payload["url"], legacy_payload["name"])
+        existing = {(x.get("data_url", "")[:80], x.get("url", ""), x.get("name", "")) for x in out}
+        if key not in existing:
+            out.append(legacy_payload)
+
+    return out[:8]
 
 
 def _guess_ext_from_mime(mime_type: str, fallback: str = ".bin") -> str:
@@ -4901,21 +4941,26 @@ def _guess_ext_from_mime(mime_type: str, fallback: str = ".bin") -> str:
     if mime_type == "image/webp": return ".webp"
     if mime_type == "video/mp4": return ".mp4"
     if mime_type == "video/quicktime": return ".mov"
+    if mime_type == "video/webm": return ".webm"
     ext = mimetypes.guess_extension(mime_type) if mime_type else None
     return ext or fallback
 
 
-def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dict[str, Any]:
-    """Decode uploaded product asset from JSON data URL or download direct URL.
-
-    Returns {path, kind, mime_type, name}. kind is image/video/unknown.
-    """
+def _materialize_one_product_asset(asset: Dict[str, Any], asset_dir: str, index: int = 1) -> Dict[str, Any]:
     os.makedirs(asset_dir, exist_ok=True)
-    asset = _get_product_asset_payload(job_config)
     data_url = asset.get("data_url", "")
     url = asset.get("url", "")
     mime_type = asset.get("mime_type", "")
-    name = asset.get("name", "product_asset")
+    name = asset.get("name", f"product_asset_{index}")
+
+    def _kind_from(ext: str, mime: str) -> str:
+        ext = (ext or "").lower()
+        mime = (mime or "").lower()
+        if mime.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".webm"}:
+            return "video"
+        if mime.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            return "image"
+        return "unknown"
 
     if data_url:
         try:
@@ -4925,13 +4970,13 @@ def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dic
                 mime_type = m.group(1).strip()
             raw = base64.b64decode(b64, validate=False)
             ext = os.path.splitext(name)[1].lower() or _guess_ext_from_mime(mime_type)
-            out_path = os.path.join(asset_dir, f"uploaded_product_asset{ext}")
+            out_path = os.path.join(asset_dir, f"uploaded_product_asset_{index:02d}{ext}")
             with open(out_path, "wb") as f:
                 f.write(raw)
-            kind = "video" if (mime_type.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".webm"}) else "image" if (mime_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}) else "unknown"
-            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "uploaded_data_url"}
+            kind = _kind_from(ext, mime_type)
+            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "uploaded_data_url", "index": index}
         except Exception as e:
-            print("WARN: cannot decode product_asset_data_url:", repr(e))
+            print(f"WARN: cannot decode product_assets[{index}]:", repr(e))
 
     if url:
         try:
@@ -4941,15 +4986,32 @@ def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dic
             mime_type = mime_type or ctype
             parsed_ext = os.path.splitext(urlparse(url).path)[1].lower()
             ext = parsed_ext or _guess_ext_from_mime(mime_type)
-            out_path = os.path.join(asset_dir, f"downloaded_product_asset{ext}")
+            out_path = os.path.join(asset_dir, f"downloaded_product_asset_{index:02d}{ext}")
             with open(out_path, "wb") as f:
                 f.write(resp.content)
-            kind = "video" if (mime_type.startswith("video/") or ext in {".mp4", ".mov", ".m4v", ".webm"}) else "image" if (mime_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}) else "unknown"
-            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "downloaded_url"}
+            kind = _kind_from(ext, mime_type)
+            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "downloaded_url", "index": index}
         except Exception as e:
-            print("WARN: cannot download product_asset_url:", repr(e))
+            print(f"WARN: cannot download product_assets[{index}]:", repr(e))
 
-    return {"path": "", "kind": "none", "mime_type": mime_type, "name": name, "source": "none"}
+    return {"path": "", "kind": "none", "mime_type": mime_type, "name": name, "source": "none", "index": index}
+
+
+def materialize_product_assets(job_config: Dict[str, Any], asset_dir: str) -> List[Dict[str, Any]]:
+    """Materialize all uploaded product assets into local temp files."""
+    payloads = _get_product_asset_payloads(job_config)
+    assets = []
+    for idx, payload in enumerate(payloads, start=1):
+        asset = _materialize_one_product_asset(payload, asset_dir, idx)
+        if asset.get("path") and os.path.exists(str(asset.get("path"))) and asset.get("kind") in {"image", "video"}:
+            assets.append(asset)
+    return assets[:8]
+
+
+def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dict[str, Any]:
+    """Backward-compatible single-asset wrapper."""
+    assets = materialize_product_assets(job_config, asset_dir)
+    return assets[0] if assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "index": 0}
 
 
 def prepare_product_image(src_path: str, out_path: str, width: int, height: int) -> str:
@@ -5056,13 +5118,14 @@ Mỗi overlay tối đa 6 từ. Mỗi câu voice-over ngắn, mạnh, không nó
         return fallback
 
 
-def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_asset: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     product = sales_script.get("product_name", "sản phẩm")
     target_user = sales_script.get("target_user", "khách hàng")
     benefits = sales_script.get("benefits", []) or []
     overlays = sales_script.get("short_overlays", []) or []
     is_vertical = str(job_config.get("aspect_ratio", "9:16")) == "9:16"
-    has_product_asset = bool(product_asset.get("path") and os.path.exists(str(product_asset.get("path"))))
+    product_assets = [a for a in (product_assets or []) if a.get("path") and os.path.exists(str(a.get("path"))) and a.get("kind") in {"image", "video"}]
+    has_product_asset = bool(product_assets)
 
     scene_templates = [
         {"role": "hook", "voice_text": sales_script.get("hook", f"Đừng bỏ qua {product}."), "overlay": overlays[0] if len(overlays) > 0 else "Đừng bỏ qua!", "source": "product", "query": f"{target_user} online shopping product reveal"},
@@ -5070,15 +5133,21 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
         {"role": "solution", "voice_text": sales_script.get("solution", f"{product} là giải pháp tiện lợi hơn."), "overlay": overlays[2] if len(overlays) > 2 else product, "source": "product", "query": f"product demo happy customer ecommerce"},
     ]
     for i, b in enumerate(benefits[:3], start=1):
-        scene_templates.append({"role": f"benefit_{i}", "voice_text": f"{b}.", "overlay": overlays[2 + i] if len(overlays) > 2 + i else b, "source": "product" if i <= 2 else "pexels", "query": f"modern lifestyle happy customer product benefit {b}"})
+        # Use uploaded product assets for most benefit scenes. Pexels remains only for lifestyle/pain fallback.
+        scene_templates.append({"role": f"benefit_{i}", "voice_text": f"{b}.", "overlay": overlays[2 + i] if len(overlays) > 2 + i else b, "source": "product" if i <= 3 else "pexels", "query": f"modern lifestyle happy customer product benefit {b}"})
     scene_templates.append({"role": "cta", "voice_text": sales_script.get("cta", f"Xem ngay {product} hôm nay."), "overlay": overlays[-1] if overlays else "Mua ngay hôm nay", "source": "product", "query": "online shopping smartphone checkout happy customer"})
 
+    product_asset_counter = 0
     scenes = []
     for idx, s in enumerate(scene_templates, start=1):
         text = sanitize_tts_text(s["voice_text"], max_chars=320)
         overlay = sanitize_tts_text(s.get("overlay") or text, max_chars=64)
         query = re.sub(r"\s+", " ", str(s.get("query") or product)).strip()
         use_product = has_product_asset and s.get("source") == "product"
+        selected_asset = None
+        if use_product:
+            selected_asset = product_assets[product_asset_counter % len(product_assets)]
+            product_asset_counter += 1
         scene_plan = {
             "main_subject": product if use_product else query,
             "action": s["role"],
@@ -5100,8 +5169,11 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "negative_prompt": BASE_NEGATIVE_PROMPT + ", fake product, unreadable text, watermark, logo",
             "scene_plan": scene_plan,
             "visual_source": "product_asset" if use_product else "stock",
-            "visual_asset_type": product_asset.get("kind") if use_product else "video",
+            "visual_asset_type": selected_asset.get("kind") if selected_asset else "video",
             "prefer_product_asset": bool(use_product),
+            "product_asset_index": selected_asset.get("index") if selected_asset else None,
+            "product_asset_path": selected_asset.get("path") if selected_asset else "",
+            "product_asset_kind": selected_asset.get("kind") if selected_asset else "",
             "prefer_pexels_video_first": not bool(use_product),
             "allow_video_assets": True,
             "video_style_preset": "bold_promo",
@@ -5114,21 +5186,30 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
     """Product asset first for product scenes; Pexels for pain/lifestyle fallback."""
     video_path = os.path.splitext(img_path)[0] + ".mp4"
 
-    if scene.get("prefer_product_asset") and product_asset.get("path") and os.path.exists(str(product_asset.get("path"))):
+    selected_product_asset = product_asset
+    if scene.get("product_asset_path"):
+        selected_product_asset = {
+            "path": scene.get("product_asset_path"),
+            "kind": scene.get("product_asset_kind") or product_asset.get("kind"),
+            "index": scene.get("product_asset_index"),
+        }
+
+    if scene.get("prefer_product_asset") and selected_product_asset.get("path") and os.path.exists(str(selected_product_asset.get("path"))):
         try:
-            if product_asset.get("kind") == "video":
+            if selected_product_asset.get("kind") == "video":
                 # Keep uploaded video as real product visual.
-                src = product_asset["path"]
+                src = selected_product_asset["path"]
                 ext = os.path.splitext(src)[1].lower() or ".mp4"
                 product_video_path = os.path.splitext(img_path)[0] + f"_product{ext}"
                 shutil.copyfile(src, product_video_path)
                 scene["visual_used"] = "uploaded_product_video"
                 scene["visual_video_path"] = product_video_path
-                create_fast_placeholder_image(img_path, width, height, title="Product Video")
+                scene["visual_source"] = "product_asset"
                 scene["visual_file"] = os.path.basename(img_path)
+                create_fast_placeholder_image(img_path, width, height, title="Product Video")
                 return img_path
-            elif product_asset.get("kind") == "image":
-                prepare_product_image(product_asset["path"], img_path, width, height)
+            elif selected_product_asset.get("kind") == "image":
+                prepare_product_image(selected_product_asset["path"], img_path, width, height)
                 scene["visual_used"] = "uploaded_product_image"
                 scene["visual_source"] = "product_asset"
                 scene["visual_file"] = os.path.basename(img_path)
@@ -5200,12 +5281,16 @@ def run_sales_pipeline(job_config, job_id):
     video_style = STYLE_PRESETS.get(video_style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
 
     write_status(job_dir, job_id, "running", {"step": "sales_prepare_product_asset", "progress_pct": 5, "eta_sec": 80})
-    product_asset = materialize_product_asset(job_config, ASSET_DIR)
-    write_json(os.path.join(META_DIR, "product_asset.json"), {k: v for k, v in product_asset.items() if k != "path"} | {"has_path": bool(product_asset.get("path")), "kind": product_asset.get("kind")})
+    product_assets = materialize_product_assets(job_config, ASSET_DIR)
+    product_asset = product_assets[0] if product_assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "index": 0}
+    write_json(os.path.join(META_DIR, "product_assets.json"), [
+        ({k: v for k, v in a.items() if k != "path"} | {"has_path": bool(a.get("path")), "kind": a.get("kind")})
+        for a in product_assets
+    ])
 
     write_status(job_dir, job_id, "running", {"step": "sales_plan", "progress_pct": 10, "eta_sec": 70})
     sales_script = build_sales_script(job_config)
-    scene_objects = build_sales_scenes(sales_script, job_config, product_asset)
+    scene_objects = build_sales_scenes(sales_script, job_config, product_assets)
     total_scenes = len(scene_objects)
 
     write_json(os.path.join(META_DIR, "sales_script.json"), sales_script)
@@ -5336,7 +5421,7 @@ def run_sales_pipeline(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "sales_script": sales_script,
-        "timeline_mode": "sales_video_uploaded_product_asset_first_fast_voice",
+        "timeline_mode": "sales_video_multi_uploaded_product_assets_first_fast_voice",
         "finished_at": now_str(),
     }
 
