@@ -5050,6 +5050,13 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
         or _sales_nested(job_config, "offer")
         or _sales_nested(job_config, "sales_offer")
     )
+    shop_name = _sales_clean(
+        _sales_nested(job_config, "shop_name")
+        or _sales_nested(job_config, "sales_shop_name")
+        or _sales_nested(job_config, "store_name")
+        or _sales_nested(job_config, "seller_name")
+        or _sales_nested(job_config, "shop")
+    )
     target_user = _sales_clean(
         _sales_nested(job_config, "target_user")
         or _sales_nested(job_config, "sales_target_user")
@@ -5082,36 +5089,54 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
     compact_details = sanitize_tts_text(details, max_chars=420)
     compact_benefits = ", ".join(benefits[:4]) if benefits else "tiện hơn, nhanh hơn, dễ dùng hơn"
 
-    hook = f"{target_user}, đừng bỏ qua {product_name}."
-    pain = f"Nếu bạn đang {pain_point}, đây là lựa chọn đáng xem."
-    solution = f"{product_name} giúp bạn giải quyết nhu cầu đó nhanh hơn và tiện hơn."
+    # Smarter, less repetitive sales copy. Still product-faithful: do not invent specs.
+    hook_templates = [
+        f"Bạn đang tìm {product_name} mà vẫn chưa biết chọn loại nào cho đúng?",
+        f"Nếu bạn muốn mua {product_name}, hãy xem nhanh điểm đáng chú ý này.",
+        f"{target_user}, đây là một lựa chọn đáng cân nhắc khi cần {product_name}.",
+        f"Trước khi lướt qua, hãy nhìn kỹ {product_name} này trong vài giây.",
+    ]
+    hook = hook_templates[abs(hash(product_name + target_user)) % len(hook_templates)]
+
+    pain = f"Nhiều người thường {pain_point}, nên rất dễ mất thời gian và mua không đúng nhu cầu."
+    solution = f"{product_name} tập trung vào sự tiện lợi, dễ dùng và giúp bạn ra quyết định nhanh hơn."
 
     benefit_sentences = []
     if benefits:
-        benefit_sentences.append(f"Điểm nổi bật là {compact_benefits}.")
+        for i, b in enumerate(benefits[:4], start=1):
+            b = sanitize_tts_text(b, max_chars=120)
+            if i == 1:
+                benefit_sentences.append(f"Điểm nổi bật đầu tiên là {b}, rất dễ hiểu ngay khi nhìn sản phẩm thật.")
+            elif i == 2:
+                benefit_sentences.append(f"Tiếp theo là {b}, giúp sản phẩm phù hợp hơn với nhu cầu sử dụng hằng ngày.")
+            else:
+                benefit_sentences.append(f"Ngoài ra, sản phẩm còn có điểm đáng chú ý: {b}.")
     if compact_details:
-        benefit_sentences.append(compact_details)
+        benefit_sentences.append(f"Thông tin cần nhấn mạnh thêm là: {compact_details}")
     if not benefit_sentences:
-        benefit_sentences.append(f"{product_name} được thiết kế để dùng đơn giản, rõ lợi ích và phù hợp với nhu cầu hằng ngày.")
+        benefit_sentences.append(f"{product_name} phù hợp khi bạn cần một lựa chọn rõ ràng, dễ cân nhắc và thuận tiện hơn trong cuộc sống hằng ngày.")
 
-    cta = f"Đặt mua ngay hôm nay"
+    cta_banner = f"Mua ngay hôm nay {product_name}" + (f" tại {shop_name}" if shop_name else "")
+    cta = cta_banner
     if price:
         cta += f" với {price}"
     cta += "."
 
     # Short overlays for video text; no long paragraph on screen.
     short_overlays = [
-        f"Đừng bỏ qua {product_name}"[:52],
-        "Giải quyết đúng vấn đề"[:34],
-        "Dễ dùng • Tiện lợi"[:34],
-        (benefits[0] if benefits else "Nổi bật mỗi ngày")[:34],
-        (benefits[1] if len(benefits) > 1 else "Xem ưu đãi hôm nay")[:34],
-        "Mua ngay hôm nay"[:34],
+        f"Xem nhanh {product_name}"[:52],
+        "Đúng vấn đề bạn cần"[:34],
+        "Sản phẩm thật • Dễ xem"[:34],
+        (benefits[0] if benefits else "Tiện lợi hơn mỗi ngày")[:34],
+        (benefits[1] if len(benefits) > 1 else "Ưu đãi đáng chú ý")[:34],
+        cta_banner[:46],
     ]
 
     return {
         "product_name": product_name,
         "price": price,
+        "shop_name": shop_name,
+        "cta_banner": cta_banner,
         "target_user": target_user,
         "pain_point": pain_point,
         "benefits": benefits,
@@ -5158,7 +5183,7 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "source": "product",
         })
 
-    scene_templates.append({"role": "cta", "voice_text": sales_script.get("cta", f"Xem ngay {product} hôm nay."), "overlay": overlays[-1] if overlays else "Mua ngay hôm nay", "source": "product"})
+    scene_templates.append({"role": "cta", "voice_text": sales_script.get("cta", f"Xem ngay {product} hôm nay."), "overlay": sales_script.get("cta_banner") or (overlays[-1] if overlays else "Mua ngay hôm nay"), "source": "product"})
 
     # Respect target duration by keeping enough scenes for longer ads.
     target_total = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
@@ -5188,6 +5213,7 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "stock_query": f"online shopping product problem customer" if allow_scene_pexels else "",
             "visual_source": "product_asset" if use_product else ("stock" if allow_scene_pexels else "product_asset"),
             "prefer_product_asset": bool(use_product),
+            "cta_banner": sales_script.get("cta_banner", ""),
             "allow_pexels_fallback": allow_scene_pexels,
             "product_asset_index": selected_asset.get("index") if selected_asset else None,
             "product_asset_path": selected_asset.get("path") if selected_asset else "",
@@ -5275,7 +5301,8 @@ def _sales_extra_scene_templates(sales_script: Dict[str, Any]) -> List[Dict[str,
     rows.append({"role": "usage_context", "overlay": "Dễ cân nhắc mua", "voice_text": f"Với {target_user}, video cần cho thấy tình huống sử dụng rõ ràng, lợi ích dễ hiểu và cảm giác mua hàng an tâm hơn."})
     if price:
         rows.append({"role": "offer_expand", "overlay": "Ưu đãi hôm nay", "voice_text": f"Nếu mức {price} đang phù hợp với ngân sách của bạn, đây là thời điểm tốt để cân nhắc đặt mua {product}."})
-    rows.append({"role": "cta_expand", "overlay": "Bấm mua ngay", "voice_text": f"Đừng chỉ xem rồi lướt qua. Nếu {product} đúng với nhu cầu của bạn, hãy bấm mua ngay hôm nay."})
+    shop = _sales_clean(sales_script.get("shop_name"))
+    rows.append({"role": "cta_expand", "overlay": sales_script.get("cta_banner") or "Bấm mua ngay", "voice_text": f"Đừng chỉ xem rồi lướt qua. Nếu {product} đúng với nhu cầu của bạn, hãy mua ngay hôm nay" + (f" tại {shop}." if shop else ".")})
     return rows
 
 
@@ -5456,6 +5483,79 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
     return img_path
 
 
+def add_sales_bottom_cta_banner(clip, cta_text: str, width: int, height: int):
+    """Add a persistent bottom CTA banner for sales videos.
+
+    Example: Mua ngay hôm nay + product name + tại + shop name.
+    """
+    cta_text = sanitize_tts_text(cta_text or "", max_chars=110)
+    if not cta_text:
+        return clip
+
+    try:
+        from PIL import ImageDraw, ImageFont
+        font_size = max(18, int(min(width, height) * (0.036 if height > width else 0.034)))
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except Exception:
+        from PIL import ImageDraw, ImageFont
+        font = ImageFont.load_default()
+        font_size = 20
+
+    def _wrap(text, max_chars=34):
+        words = text.split()
+        lines, cur = [], []
+        for w in words:
+            cand = " ".join(cur + [w])
+            if len(cand) > max_chars and cur:
+                lines.append(" ".join(cur))
+                cur = [w]
+            else:
+                cur.append(w)
+            if len(lines) >= 2:
+                break
+        if cur and len(lines) < 2:
+            lines.append(" ".join(cur))
+        return "\n".join(lines[:2])
+
+    wrapped = _wrap(cta_text, max_chars=30 if height > width else 50)
+
+    def make_frame(t):
+        frame = clip.get_frame(t).astype(np.uint8)
+        img = Image.fromarray(frame).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        lines = wrapped.split("\n")
+        boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=1) for line in lines]
+        line_h = max([b[3] - b[1] for b in boxes] or [font_size])
+        gap = max(4, int(font_size * 0.22))
+        pad_x = int(width * 0.045)
+        pad_y = max(9, int(font_size * 0.42))
+        text_h = line_h * len(lines) + gap * (len(lines) - 1)
+        banner_h = text_h + pad_y * 2
+        y0 = height - banner_h - int(height * 0.025)
+        x0 = int(width * 0.045)
+        x1 = width - x0
+        y1 = y0 + banner_h
+
+        # rounded banner
+        draw.rounded_rectangle(
+            (x0, y0, x1, y1),
+            radius=max(14, int(font_size * 0.9)),
+            fill=(255, 47, 146, 224),
+            outline=(255, 255, 255, 90),
+            width=1,
+        )
+        yy = y0 + pad_y
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=1)
+            tw = bbox[2] - bbox[0]
+            tx = int((width - tw) / 2)
+            draw.text((tx, yy), line, font=font, fill=(255,255,255,245), stroke_width=1, stroke_fill=(95,0,48,170))
+            yy += line_h + gap
+        return np.array(img.convert("RGB"))
+
+    return VideoClip(make_frame, duration=float(getattr(clip, "duration", 0) or 0))
+
+
 def run_sales_pipeline(job_config, job_id):
     """Sales video pipeline: uploaded product asset -> sales script -> fast ad video."""
     job_config = normalize_sales_job_config(job_config)
@@ -5573,6 +5673,8 @@ def run_sales_pipeline(job_config, job_id):
             vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         vclip = apply_visual_finish(vclip, video_style_preset)
         vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset)
+        if _safe_bool(job_config.get("enable_sales_bottom_cta", True)):
+            vclip = add_sales_bottom_cta_banner(vclip, scene.get("cta_banner") or sales_script.get("cta_banner") or "", width, height)
         audio_clip = AudioFileClip(audio_path)
         opened_audio_clips.append(audio_clip)
         vclip = vclip.with_audio(audio_clip)
