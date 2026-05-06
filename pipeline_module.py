@@ -3762,7 +3762,10 @@ def _current_progressive_subtitle(text: str, t: float, duration: float) -> str:
     return units[-1]
 
 
-def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_style_preset: str = ""):
+def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_style_preset: str = "", overlay_position: str = "bottom"):
+    overlay_position = str(overlay_position or "bottom").strip().lower()
+    if overlay_position not in {"top", "bottom"}:
+        overlay_position = "bottom"
     """Draw progressive subtitles: only current sentence/chunk, no background box.
 
     Behavior:
@@ -3811,12 +3814,16 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         gap = int(font_size * 0.20)
         text_h = line_h * len(lines) + gap * (len(lines) - 1)
 
-        # Place the progressive script overlay near the TOP of the video.
-        # Sales/product videos often need the product image and CTA visible at the bottom,
-        # so narration subtitles are intentionally placed above the main product area.
-        top_margin = int(height * (0.075 if is_vertical else 0.065))
-        y = max(top_margin, int(font_size * 0.7))
-        y = min(y, height - text_h - int(font_size * 0.8))
+        # Overlay position rule:
+        # - Sales/product videos: TOP, so product CTA/banner can stay visible at the bottom.
+        # - Entertainment/story videos: BOTTOM, like classic subtitles.
+        if overlay_position == "top":
+            top_margin = int(height * (0.075 if is_vertical else 0.065))
+            y = max(top_margin, int(font_size * 0.7))
+        else:
+            bottom_margin = int(height * (0.105 if is_vertical else 0.085))
+            y = height - text_h - bottom_margin
+        y = max(int(font_size * 0.7), min(y, height - text_h - int(font_size * 0.8)))
 
         yy = y
         for line in lines:
@@ -5093,16 +5100,12 @@ def _sales_make_overlay(text: str, fallback: str = "") -> str:
     return text[:70].strip(" .,:;|-–")
 
 
-def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a smarter product-faithful sales script from frontend input.
 
-    V3.1 rules:
-    - The beginning of the video must use what the user typed first: product name,
-      detailed features/ad notes, benefits, pain point, price, and shop.
-    - Expansion lines are added only after the user-provided points are used.
-    - Do not invent concrete specs such as materials, ingredients, warranty, SPF,
-      battery life, certifications, origin, or discounts unless the user provided them.
-    - Avoid repetitive openings like "Bạn đang... Bạn đang...".
+def _sales_collect_input_context(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect only user-provided sales fields for the AI planner.
+
+    This function intentionally does not invent product facts. It just normalizes the
+    frontend payload so ChatGPT can plan a natural sales video for each product.
     """
     product_name = _sales_clean(
         _sales_nested(job_config, "product_name")
@@ -5126,8 +5129,7 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
     target_user = _sales_clean(
         _sales_nested(job_config, "target_user")
         or _sales_nested(job_config, "sales_target_user")
-        or _sales_nested(job_config, "audience"),
-        "người mua online"
+        or _sales_nested(job_config, "audience")
     )
     pain_point = _sales_clean(
         _sales_nested(job_config, "pain_point")
@@ -5139,199 +5141,389 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
         or _sales_nested(job_config, "sales_benefits")
         or _sales_nested(job_config, "key_benefits")
     )
-    details = _sales_clean(
+    product_details = _sales_clean(
         _sales_nested(job_config, "product_details")
         or _sales_nested(job_config, "sales_product_details")
         or _sales_nested(job_config, "ad_points")
         or _sales_nested(job_config, "selling_points")
         or _sales_nested(job_config, "product_features")
     )
+    platform = _sales_clean(job_config.get("sales_platform") or _sales_nested(job_config, "platform"), "TikTok / TikTok Shop")
 
-    benefits = _sales_unique_list(_sales_split_benefits(benefits_raw), max_items=6)
-    detail_points = _sales_unique_list(_sales_split_benefits(details) + _sales_split_sentences(details, max_items=6), max_items=7)
-    compact_details = sanitize_tts_text(details, max_chars=520)
+    try:
+        target_total_sec = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
+    except Exception:
+        target_total_sec = 30
+    target_total_sec = max(12, min(target_total_sec, 75))
 
-    # Start from concrete user input first.
-    first_detail = detail_points[0] if detail_points else ""
-    first_benefit = benefits[0] if benefits else ""
-    second_benefit = benefits[1] if len(benefits) > 1 else ""
-
-    if first_detail:
-        hook = f"Đây là {product_name}. Điểm đáng chú ý đầu tiên: {first_detail}."
-    elif first_benefit:
-        hook = f"Đây là {product_name}. Lợi ích nổi bật nhất là {first_benefit}."
-    elif pain_point:
-        hook = f"Nếu bạn đang gặp tình trạng {pain_point}, hãy xem nhanh {product_name}."
-    else:
-        hook = f"Đây là {product_name}. Hãy xem sản phẩm thật trong vài giây trước khi quyết định."
-
-    user_focus_lines = []
-    if first_benefit and first_benefit.lower() not in hook.lower():
-        user_focus_lines.append(f"Sản phẩm nhấn mạnh vào lợi ích {first_benefit}.")
-    if second_benefit:
-        user_focus_lines.append(f"Ngoài ra, còn có điểm đáng chú ý là {second_benefit}.")
-    if pain_point:
-        user_focus_lines.append(f"Nó phù hợp khi bạn muốn xử lý vấn đề {pain_point} một cách gọn hơn.")
-    if target_user:
-        user_focus_lines.append(f"Đặc biệt phù hợp cho {target_user}.")
-    if price:
-        user_focus_lines.append(f"Mức giá hoặc ưu đãi hiện tại: {price}.")
-
-    benefit_sentences = []
-    # Use detail/benefit points as the core of the middle video.
-    used_keys = set()
-    for point in detail_points:
-        key = point.lower()
-        if key in used_keys:
-            continue
-        used_keys.add(key)
-        benefit_sentences.append(f"Thông tin cần chú ý: {point}.")
-    for point in benefits:
-        key = point.lower()
-        if key in used_keys:
-            continue
-        used_keys.add(key)
-        benefit_sentences.append(f"Lợi ích nổi bật: {point}.")
-
-    if not benefit_sentences:
-        benefit_sentences.append(f"{product_name} giúp người xem nhìn rõ sản phẩm, hiểu nhanh công dụng và dễ cân nhắc hơn.")
-
-    # Expansion is deliberately placed AFTER user input scenes.
-    expansion_lines = []
-    expansion_lines.append(f"Khi mua online, điều quan trọng là nhìn rõ sản phẩm thật và hiểu nhanh lý do nên chọn {product_name}.")
-    if target_user:
-        expansion_lines.append(f"Với {target_user}, một sản phẩm dễ hiểu, dễ cân nhắc và đúng nhu cầu sẽ tạo cảm giác yên tâm hơn.")
-    if pain_point:
-        expansion_lines.append(f"Thay vì mất thời gian so sánh quá nhiều lựa chọn, hãy tập trung vào sản phẩm giải quyết đúng vấn đề bạn đang gặp.")
-    expansion_lines.append("Nếu sản phẩm phù hợp với nhu cầu của bạn, hãy đặt mua khi còn ưu đãi.")
-    expansion_lines = _sales_unique_list(expansion_lines, max_items=4)
-
-    cta_banner = f"Mua ngay hôm nay {product_name}" + (f" tại {shop_name}" if shop_name else "")
-    cta = cta_banner
-    if price:
-        cta += f" với {price}"
-    cta += "."
-
-    short_overlays = _sales_unique_list([
-        f"Xem nhanh {product_name}",
-        first_detail or first_benefit or "Điểm nổi bật",
-        second_benefit or (pain_point if pain_point else "Đúng nhu cầu"),
-        "Sản phẩm thật • Dễ xem",
-        price or "Ưu đãi hôm nay",
-        cta_banner,
-    ], max_items=8)
+    benefits = _sales_unique_list(_sales_split_benefits(benefits_raw), max_items=8)
+    detail_points = _sales_unique_list(_sales_split_benefits(product_details) + _sales_split_sentences(product_details, max_items=8), max_items=10)
 
     return {
         "product_name": product_name,
         "price": price,
         "shop_name": shop_name,
-        "cta_banner": cta_banner,
         "target_user": target_user,
         "pain_point": pain_point,
         "benefits": benefits,
-        "product_details": compact_details,
+        "product_details": sanitize_tts_text(product_details, max_chars=900),
         "detail_points": detail_points,
-        "hook": _sales_dedupe_sentence_text(hook),
-        "user_focus_lines": [_sales_dedupe_sentence_text(x) for x in user_focus_lines],
-        "benefit_sentences": [_sales_dedupe_sentence_text(x) for x in benefit_sentences],
-        "expansion_lines": [_sales_dedupe_sentence_text(x) for x in expansion_lines],
-        "cta": _sales_dedupe_sentence_text(cta),
-        "short_overlays": [_sales_make_overlay(x) for x in short_overlays],
-        "platform": _sales_clean(job_config.get("sales_platform") or _sales_nested(job_config, "platform"), "TikTok / TikTok Shop"),
-        "goal": "conversion",
-        "tone": "fast_conversion",
+        "platform": platform,
+        "target_total_sec": target_total_sec,
+        "aspect_ratio": _sales_clean(job_config.get("aspect_ratio"), "9:16"),
     }
 
 
-def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build scene list with user input first, then safe expansion.
+def _sales_parse_json_object(raw_text: str) -> Dict[str, Any]:
+    raw_text = str(raw_text or "").strip()
+    if not raw_text:
+        return {}
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", raw_text)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
 
-    Product assets are the primary visuals. Pexels is disabled by default and only used
-    when explicitly enabled and no uploaded asset exists.
+
+def _sales_planner_scene_count(target_total_sec: int) -> int:
+    # Only a soft target for ChatGPT; not a hardcoded script structure.
+    if target_total_sec <= 18:
+        return 4
+    if target_total_sec <= 30:
+        return 5
+    if target_total_sec <= 45:
+        return 7
+    return 8
+
+
+def call_openai_sales_planner(job_config: Dict[str, Any], product_assets: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Use OpenAI as the sales planner instead of hard-coded script templates.
+
+    The planner creates product-specific narration, overlays, visual prompts, and
+    scene roles. It must stay faithful to user input and must not invent concrete
+    product claims that were not provided.
+    """
+    if not OPENAI_API_KEY:
+        raise ValueError("Missing OPENAI_API_KEY for sales planner")
+
+    ctx = _sales_collect_input_context(job_config)
+    product_assets = product_assets or []
+    asset_summary = [
+        {
+            "index": a.get("index"),
+            "kind": a.get("kind"),
+            "name": a.get("name"),
+            "mime_type": a.get("mime_type"),
+        }
+        for a in product_assets[:8]
+    ]
+    target_scene_count = _sales_planner_scene_count(ctx["target_total_sec"])
+    target_words = max(40, int(ctx["target_total_sec"] * float(os.getenv("SALES_TARGET_WORDS_PER_SEC", "2.55"))))
+
+    system_prompt = (
+        "Bạn là chuyên gia creative strategist cho video bán hàng TikTok Shop, Shopee, YouTube Shorts. "
+        "Nhiệm vụ: lập kế hoạch video bán hàng tự nhiên, không cứng nhắc, không lặp ý, bám sát thông tin người dùng nhập. "
+        "Không được bịa các claim cụ thể như thành phần, chất liệu, bảo hành, SPF, pin, chứng nhận, xuất xứ, giảm giá nếu người dùng không cung cấp. "
+        "Được phép mở rộng bằng ngữ cảnh mua hàng, pain point, cảm xúc, tình huống sử dụng, CTA, nhưng phải nói rõ ràng và thuyết phục. "
+        "Phần đầu video phải ưu tiên nội dung user nhập: tên sản phẩm, tính năng/mô tả, lợi ích, pain point, giá, shop. "
+        "Overlay phải ngắn, mạnh, phù hợp scene. Visual prompt phải cụ thể theo sản phẩm và nội dung scene, không generic. "
+        "Trả về JSON hợp lệ, không markdown."
+    )
+
+    user_prompt = {
+        "input": ctx,
+        "uploaded_product_assets": asset_summary,
+        "requirements": {
+            "target_scene_count": target_scene_count,
+            "target_total_sec": ctx["target_total_sec"],
+            "target_total_words_approx": target_words,
+            "language": "Vietnamese",
+            "style": "fast, persuasive, natural, product-specific sales video",
+            "scene_rules": [
+                "Mỗi scene có voice_text riêng, không trùng ý với scene trước.",
+                "voice_text phải là lời đọc tự nhiên, không phải bullet list.",
+                "text_overlay tối đa 8 từ, đặt phía trên video.",
+                "visual_prompt phải mô tả hình/video cần dùng cho scene, ưu tiên uploaded product asset.",
+                "Chỉ đề xuất pexels nếu scene cần lifestyle/pain context và thật sự phù hợp.",
+                "CTA cuối phải chứa: Mua ngay hôm nay + tên sản phẩm + tại + tên shop nếu có."
+            ],
+            "json_schema": {
+                "product_name": "string",
+                "price": "string",
+                "shop_name": "string",
+                "cta_banner": "string",
+                "hook": "string",
+                "scenes": [
+                    {
+                        "role": "hook|feature|benefit|pain|use_case|proof|cta|custom",
+                        "voice_text": "Vietnamese narration for this scene",
+                        "text_overlay": "short overlay",
+                        "visual_prompt": "specific product-aware visual prompt",
+                        "stock_query": "specific stock query only if needed, otherwise empty",
+                        "visual_source": "product_asset|pexels|product_asset_or_pexels",
+                        "preferred_asset_kind": "image|video|any",
+                        "mood": "short mood"
+                    }
+                ],
+                "expansion_lines": ["extra persuasive lines only if more duration is needed"]
+            }
+        }
+    }
+
+    client = get_openai_client()
+    model = os.getenv("OPENAI_SALES_PLANNER_MODEL", OPENAI_MODEL or "gpt-4.1-mini").strip()
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+        temperature=float(os.getenv("SALES_PLANNER_TEMPERATURE", "0.75")),
+        response_format={"type": "json_object"},
+        timeout=60,
+    )
+    content = resp.choices[0].message.content if resp and resp.choices else "{}"
+    plan = _sales_parse_json_object(content)
+    if not isinstance(plan, dict) or not isinstance(plan.get("scenes"), list) or not plan.get("scenes"):
+        raise ValueError("OpenAI sales planner returned invalid scene plan")
+    return plan
+
+
+def _fallback_sales_planner(job_config: Dict[str, Any], product_assets: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Minimal fallback only when OpenAI planner is unavailable.
+
+    This is intentionally simple and faithful, not a creative replacement.
+    """
+    ctx = _sales_collect_input_context(job_config)
+    product = ctx["product_name"]
+    shop = ctx.get("shop_name", "")
+    details = ctx.get("detail_points") or []
+    benefits = ctx.get("benefits") or []
+    pain = ctx.get("pain_point", "")
+    price = ctx.get("price", "")
+
+    user_points = []
+    user_points.extend(details[:3])
+    user_points.extend([b for b in benefits if b not in user_points][:3])
+    if pain:
+        user_points.append(f"phù hợp khi bạn gặp vấn đề {pain}")
+    if price:
+        user_points.append(f"mức giá hoặc ưu đãi hiện tại: {price}")
+    if not user_points:
+        user_points.append("hãy xem kỹ hình ảnh sản phẩm thật trước khi quyết định")
+
+    scenes = []
+    scenes.append({
+        "role": "hook",
+        "voice_text": f"Đây là {product}. Hãy xem nhanh sản phẩm thật và những điểm đáng chú ý nhất.",
+        "text_overlay": f"Xem nhanh {product}",
+        "visual_prompt": f"Uploaded real product visual of {product}, clean ecommerce ad framing",
+        "stock_query": "",
+        "visual_source": "product_asset",
+        "preferred_asset_kind": "any",
+        "mood": "direct product intro",
+    })
+    for i, point in enumerate(user_points[:5], start=1):
+        scenes.append({
+            "role": "feature" if i <= 3 else "benefit",
+            "voice_text": f"Điểm cần chú ý: {point}.",
+            "text_overlay": _sales_make_overlay(point, "Điểm nổi bật"),
+            "visual_prompt": f"Close product-focused shot showing {product}, highlight: {point}",
+            "stock_query": "",
+            "visual_source": "product_asset",
+            "preferred_asset_kind": "any",
+            "mood": "product detail",
+        })
+    cta_banner = f"Mua ngay hôm nay {product}" + (f" tại {shop}" if shop else "")
+    scenes.append({
+        "role": "cta",
+        "voice_text": cta_banner + (f" với {price}." if price else "."),
+        "text_overlay": cta_banner,
+        "visual_prompt": f"Final product ad frame for {product}, clear call to action",
+        "stock_query": "",
+        "visual_source": "product_asset",
+        "preferred_asset_kind": "any",
+        "mood": "clear CTA",
+    })
+    return {
+        **ctx,
+        "cta_banner": cta_banner,
+        "hook": scenes[0]["voice_text"],
+        "scenes": scenes,
+        "expansion_lines": [
+            f"Nếu {product} đúng với nhu cầu của bạn, hãy lưu lại và đặt mua khi còn ưu đãi.",
+        ],
+        "planner_source": "fallback_no_openai",
+    }
+
+
+def _normalize_sales_plan(plan: Dict[str, Any], job_config: Dict[str, Any]) -> Dict[str, Any]:
+    ctx = _sales_collect_input_context(job_config)
+    if not isinstance(plan, dict):
+        plan = {}
+    product = _sales_clean(plan.get("product_name"), ctx["product_name"])
+    price = _sales_clean(plan.get("price"), ctx.get("price", ""))
+    shop = _sales_clean(plan.get("shop_name"), ctx.get("shop_name", ""))
+    cta_banner = _sales_clean(plan.get("cta_banner"), f"Mua ngay hôm nay {product}" + (f" tại {shop}" if shop else ""))
+
+    raw_scenes = plan.get("scenes") or []
+    scenes = []
+    seen_voice = set()
+    for idx, s in enumerate(raw_scenes, start=1):
+        if not isinstance(s, dict):
+            continue
+        voice = _sales_dedupe_sentence_text(sanitize_tts_text(s.get("voice_text") or s.get("narration") or "", max_chars=720))
+        if not voice:
+            continue
+        # Near-duplicate scene guard.
+        voice_key = " ".join(re.sub(r"[^\wÀ-ỹ]+", " ", voice.lower(), flags=re.UNICODE).split()[:16])
+        if voice_key in seen_voice:
+            continue
+        seen_voice.add(voice_key)
+        overlay = _sales_make_overlay(s.get("text_overlay") or s.get("overlay") or voice)
+        visual_source = _sales_clean(s.get("visual_source"), "product_asset").lower()
+        if visual_source not in {"product_asset", "pexels", "product_asset_or_pexels", "stock"}:
+            visual_source = "product_asset"
+        if visual_source == "stock":
+            visual_source = "pexels"
+        scenes.append({
+            "role": _sales_clean(s.get("role"), f"scene_{idx}"),
+            "voice_text": voice,
+            "text_overlay": overlay,
+            "visual_prompt": sanitize_tts_text(s.get("visual_prompt") or f"commercial product ad visual for {product}", max_chars=260),
+            "stock_query": sanitize_tts_text(s.get("stock_query") or "", max_chars=160),
+            "visual_source": visual_source,
+            "preferred_asset_kind": _sales_clean(s.get("preferred_asset_kind"), "any").lower(),
+            "mood": _sales_clean(s.get("mood"), "product advertisement"),
+        })
+
+    if not scenes:
+        return _fallback_sales_planner(job_config)
+
+    # Force CTA to exist and be last, but do not duplicate if planner already created it.
+    if not any(str(s.get("role", "")).lower() == "cta" for s in scenes):
+        scenes.append({
+            "role": "cta",
+            "voice_text": cta_banner + (f" với {price}." if price else "."),
+            "text_overlay": cta_banner,
+            "visual_prompt": f"Final ecommerce product ad frame for {product}, clear call to action",
+            "stock_query": "",
+            "visual_source": "product_asset",
+            "preferred_asset_kind": "any",
+            "mood": "CTA",
+        })
+
+    short_overlays = _sales_unique_list([s.get("text_overlay", "") for s in scenes] + [cta_banner], max_items=10)
+    return {
+        "product_name": product,
+        "price": price,
+        "shop_name": shop,
+        "target_user": ctx.get("target_user", ""),
+        "pain_point": ctx.get("pain_point", ""),
+        "benefits": ctx.get("benefits", []),
+        "product_details": ctx.get("product_details", ""),
+        "detail_points": ctx.get("detail_points", []),
+        "platform": ctx.get("platform", "TikTok / TikTok Shop"),
+        "cta_banner": cta_banner,
+        "hook": scenes[0].get("voice_text", ""),
+        "scenes": scenes,
+        "expansion_lines": _sales_unique_list(plan.get("expansion_lines") or [], max_items=6),
+        "short_overlays": short_overlays,
+        "goal": "conversion",
+        "tone": "ai_planned_dynamic_sales",
+        "planner_source": plan.get("planner_source") or "openai_sales_planner",
+    }
+
+
+def build_sales_script(job_config: Dict[str, Any], product_assets: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build sales script with OpenAI planner first, fallback second.
+
+    This replaces hard-coded sales scripts. The returned structure remains backward
+    compatible with the existing renderer.
+    """
+    use_ai = str(job_config.get("enable_openai_sales_planner", os.getenv("ENABLE_OPENAI_SALES_PLANNER", "1"))).strip().lower() in {"1", "true", "yes", "y"}
+    try:
+        if use_ai:
+            plan = call_openai_sales_planner(job_config, product_assets=product_assets)
+        else:
+            plan = _fallback_sales_planner(job_config, product_assets=product_assets)
+    except Exception as e:
+        print("WARN: OpenAI sales planner failed, using fallback:", repr(e))
+        plan = _fallback_sales_planner(job_config, product_assets=product_assets)
+    return _normalize_sales_plan(plan, job_config)
+
+
+def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert AI planner scenes into renderer scenes.
+
+    The planner decides narration, overlay, prompt, and whether a stock/lifestyle visual
+    is useful. Uploaded product assets remain the default visual source.
     """
     product = sales_script.get("product_name", "sản phẩm")
-    overlays = sales_script.get("short_overlays", []) or []
     product_assets = [a for a in (product_assets or []) if a.get("path") and os.path.exists(str(a.get("path"))) and a.get("kind") in {"image", "video"}]
     has_product_asset = bool(product_assets)
-    allow_pexels = bool(job_config.get("allow_sales_pexels_fallback", False)) and not has_product_asset
+    allow_pexels_global = bool(job_config.get("allow_sales_pexels_fallback", False))
 
-    scene_templates = []
-    scene_templates.append({
-        "role": "user_product_intro",
-        "voice_text": sales_script.get("hook", f"Đây là {product}."),
-        "overlay": overlays[0] if len(overlays) > 0 else f"Xem nhanh {product}",
-        "source": "product",
-    })
+    try:
+        target_total = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
+    except Exception:
+        target_total = 30
+    max_scenes_by_duration = 4 if target_total <= 18 else (6 if target_total <= 30 else (8 if target_total <= 45 else 10))
 
-    # Put user-provided focus lines immediately after the opening.
-    for i, line in enumerate(sales_script.get("user_focus_lines", [])[:3], start=1):
-        scene_templates.append({
-            "role": f"user_focus_{i}",
-            "voice_text": line,
-            "overlay": overlays[i] if len(overlays) > i else _sales_make_overlay(line),
-            "source": "product",
-        })
+    planner_scenes = sales_script.get("scenes") or []
+    if len(planner_scenes) > max_scenes_by_duration:
+        # Keep the final CTA scene and trim middle scenes only if planner overshoots.
+        cta_scenes = [s for s in planner_scenes if str(s.get("role", "")).lower() == "cta"]
+        non_cta = [s for s in planner_scenes if str(s.get("role", "")).lower() != "cta"]
+        planner_scenes = non_cta[:max_scenes_by_duration - (1 if cta_scenes else 0)] + (cta_scenes[-1:] if cta_scenes else [])
 
-    # Then use detailed feature / benefit points.
-    for i, sentence in enumerate((sales_script.get("benefit_sentences", []) or [])[:5], start=1):
-        scene_templates.append({
-            "role": f"user_feature_{i}",
-            "voice_text": sentence,
-            "overlay": overlays[min(len(overlays)-1, i + 1)] if overlays else _sales_make_overlay(sentence),
-            "source": "product",
-        })
-
-    # Expansion comes only after user input has been covered.
-    target_total = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
-    expansion_limit = 1 if target_total <= 30 else (2 if target_total <= 45 else 3)
-    for i, line in enumerate((sales_script.get("expansion_lines", []) or [])[:expansion_limit], start=1):
-        scene_templates.append({
-            "role": f"safe_expand_{i}",
-            "voice_text": line,
-            "overlay": _sales_make_overlay(line, fallback="Lý do nên xem"),
-            "source": "product" if has_product_asset else "pexels",
-        })
-
-    scene_templates.append({
-        "role": "cta",
-        "voice_text": sales_script.get("cta", f"Mua ngay hôm nay {product}."),
-        "overlay": sales_script.get("cta_banner") or (overlays[-1] if overlays else "Mua ngay hôm nay"),
-        "source": "product",
-    })
-
-    # Cap scenes by target duration so we do not create a long repetitive ad.
-    max_scenes_by_duration = 5 if target_total <= 20 else (6 if target_total <= 30 else (8 if target_total <= 45 else 10))
-    if len(scene_templates) > max_scenes_by_duration:
-        # Always keep first user-input scene and CTA. Trim expansion first.
-        intro = scene_templates[:1]
-        cta = scene_templates[-1:]
-        middle = scene_templates[1:-1]
-        middle_user = [x for x in middle if not str(x.get("role", "")).startswith("safe_expand")]
-        middle_expand = [x for x in middle if str(x.get("role", "")).startswith("safe_expand")]
-        keep_n = max_scenes_by_duration - len(intro) - len(cta)
-        scene_templates = intro + (middle_user + middle_expand)[:keep_n] + cta
-
-    product_asset_counter = 0
     scenes = []
-    for idx, item in enumerate(scene_templates, start=1):
-        use_product = has_product_asset and item.get("source") == "product"
+    product_asset_counter = 0
+    for idx, item in enumerate(planner_scenes, start=1):
+        visual_source = str(item.get("visual_source") or "product_asset").lower()
+        wants_pexels = visual_source in {"pexels", "product_asset_or_pexels"} and allow_pexels_global
+        use_product = has_product_asset and (visual_source in {"product_asset", "product_asset_or_pexels"} or not wants_pexels)
+
+        # Prefer matching uploaded video/image kind if planner asked for it.
         selected_asset = None
         if use_product:
-            selected_asset = product_assets[product_asset_counter % len(product_assets)]
+            preferred_kind = str(item.get("preferred_asset_kind") or "any").lower()
+            candidates = product_assets
+            if preferred_kind in {"image", "video"}:
+                kind_matches = [a for a in product_assets if a.get("kind") == preferred_kind]
+                if kind_matches:
+                    candidates = kind_matches
+            selected_asset = candidates[product_asset_counter % len(candidates)]
             product_asset_counter += 1
 
-        allow_scene_pexels = bool(allow_pexels and item.get("source") == "pexels")
-        voice_text = _sales_dedupe_sentence_text(sanitize_tts_text(item.get("voice_text", ""), max_chars=560))
-        overlay = sanitize_tts_text(item.get("overlay", ""), max_chars=70)
+        allow_scene_pexels = bool(wants_pexels and not selected_asset)
+        voice_text = _sales_dedupe_sentence_text(sanitize_tts_text(item.get("voice_text", ""), max_chars=760))
+        overlay = sanitize_tts_text(item.get("text_overlay", ""), max_chars=70)
+        if not voice_text:
+            continue
+        if not overlay:
+            overlay = _sales_make_overlay(voice_text)
+
+        visual_prompt = sanitize_tts_text(item.get("visual_prompt") or f"commercial product ad visual for {product}", max_chars=260)
+        stock_query = sanitize_tts_text(item.get("stock_query") or "", max_chars=160)
+        if allow_scene_pexels and not stock_query:
+            stock_query = visual_prompt
+
         scenes.append({
             "scene_id": idx,
             "voice_text": voice_text,
             "source_chunk": voice_text,
             "text_overlay": overlay,
-            "visual_prompt": f"commercial product ad scene for {product}",
-            "stock_query": f"online shopping product problem customer" if allow_scene_pexels else "",
-            "visual_source": "product_asset" if use_product else ("stock" if allow_scene_pexels else "product_asset"),
-            "prefer_product_asset": bool(use_product),
+            "visual_prompt": visual_prompt,
+            "stock_query": stock_query,
+            "visual_source": "product_asset" if selected_asset else ("stock" if allow_scene_pexels else "product_asset"),
+            "prefer_product_asset": bool(selected_asset),
             "cta_banner": sales_script.get("cta_banner", ""),
             "allow_pexels_fallback": allow_scene_pexels,
             "product_asset_index": selected_asset.get("index") if selected_asset else None,
@@ -5340,10 +5532,18 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "scene_plan": {
                 "main_subject": product,
                 "action": item.get("role", "sales_scene"),
-                "location": "uploaded product visual",
-                "mood": "fast product advertisement",
+                "location": "uploaded product visual" if selected_asset else "context visual",
+                "mood": item.get("mood", "dynamic product advertisement"),
             },
+            "planner_source": sales_script.get("planner_source", "openai_sales_planner"),
         })
+
+    if not scenes:
+        fallback = _fallback_sales_planner(job_config, product_assets=product_assets)
+        return build_sales_scenes(_normalize_sales_plan(fallback, job_config), job_config, product_assets)
+
+    for i, s in enumerate(scenes, start=1):
+        s["scene_id"] = i
     return scenes
 
 
@@ -5400,28 +5600,26 @@ def enrich_sales_scene_text(scene_text: str, sales_script: Dict[str, Any], min_w
 
 
 def _sales_extra_scene_templates(sales_script: Dict[str, Any]) -> List[Dict[str, str]]:
-    product = _sales_clean(sales_script.get("product_name"), "sản phẩm này")
-    price = _sales_clean(sales_script.get("price"))
-    target_user = _sales_clean(sales_script.get("target_user"), "người mua online")
-    pain = _sales_clean(sales_script.get("pain_point"))
-    benefits = [b for b in (sales_script.get("benefits") or []) if _sales_clean(b)]
-    details = _sales_clean(sales_script.get("product_details"))
+    """Extra scene lines from the AI planner only.
 
+    Avoid hard-coded sales copy. If the OpenAI planner already wrote enough scenes,
+    this function is never used. If duration is still short, use planner-provided
+    expansion_lines first and keep them product-safe.
+    """
     rows = []
-    # Details and benefits first because they are user-provided. Generic context later.
-    if details:
-        for i, d in enumerate(_sales_split_sentences(details, max_items=3), start=1):
-            rows.append({"role": f"detail_expand_{i}", "overlay": _sales_make_overlay(d, "Thông tin sản phẩm"), "voice_text": f"Thông tin cần quảng cáo rõ hơn: {d}."})
-    if benefits:
-        for i, b in enumerate(benefits[:4], start=1):
-            rows.append({"role": f"benefit_expand_{i}", "overlay": _sales_make_overlay(b, "Lợi ích nổi bật"), "voice_text": f"Một điểm nổi bật khác là {b}. Hãy để khách hàng nhìn thấy lợi ích này ngay trên sản phẩm thật."})
-    if pain:
-        rows.append({"role": "pain_expand", "overlay": "Đúng vấn đề khách cần", "voice_text": f"Nếu bạn cũng đang gặp vấn đề {pain}, hãy cân nhắc sản phẩm theo đúng nhu cầu của mình."})
-    rows.append({"role": "usage_context", "overlay": "Dễ cân nhắc mua", "voice_text": f"Với {target_user}, sản phẩm cần được nhìn rõ, thông tin cần dễ hiểu, và quyết định mua phải thật nhanh gọn."})
-    if price:
-        rows.append({"role": "offer_expand", "overlay": "Ưu đãi hôm nay", "voice_text": f"Nếu mức {price} phù hợp với ngân sách của bạn, đây là thời điểm tốt để cân nhắc đặt mua {product}."})
+    for i, line in enumerate((sales_script.get("expansion_lines") or [])[:6], start=1):
+        line = sanitize_tts_text(line, max_chars=420)
+        if not line:
+            continue
+        rows.append({
+            "role": f"planner_expand_{i}",
+            "overlay": _sales_make_overlay(line, "Lý do nên mua"),
+            "voice_text": line,
+        })
+    product = _sales_clean(sales_script.get("product_name"), "sản phẩm này")
     shop = _sales_clean(sales_script.get("shop_name"))
-    rows.append({"role": "cta_expand", "overlay": sales_script.get("cta_banner") or "Bấm mua ngay", "voice_text": f"Nếu {product} đúng với nhu cầu của bạn, hãy mua ngay hôm nay" + (f" tại {shop}." if shop else ".")})
+    cta = sales_script.get("cta_banner") or (f"Mua ngay hôm nay {product}" + (f" tại {shop}" if shop else ""))
+    rows.append({"role": "cta_expand", "overlay": cta, "voice_text": cta + "."})
     return rows
 
 
@@ -5705,7 +5903,7 @@ def run_sales_pipeline(job_config, job_id):
     ])
 
     write_status(job_dir, job_id, "running", {"step": "sales_plan", "progress_pct": 10, "eta_sec": 70})
-    sales_script = build_sales_script(job_config)
+    sales_script = build_sales_script(job_config, product_assets=product_assets)
     scene_objects = build_sales_scenes(sales_script, job_config, product_assets)
     scene_objects = ensure_sales_script_length_and_scene_alignment(
         scene_objects,
@@ -5787,7 +5985,7 @@ def run_sales_pipeline(job_config, job_id):
         else:
             vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         vclip = apply_visual_finish(vclip, video_style_preset)
-        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset)
+        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset, overlay_position="top")
         if _safe_bool(job_config.get("enable_sales_bottom_cta", True)):
             vclip = add_sales_bottom_cta_banner(vclip, scene.get("cta_banner") or sales_script.get("cta_banner") or "", width, height)
         audio_clip = AudioFileClip(audio_path)
@@ -5860,7 +6058,7 @@ def run_sales_pipeline(job_config, job_id):
         "video_style_preset": video_style_preset,
         "selected_voice": selected_voice,
         "sales_script": sales_script,
-        "timeline_mode": "sales_video_multi_uploaded_assets_per_scene_audio_aligned_no_unmatched_pexels",
+        "timeline_mode": "sales_video_openai_planner_multi_uploaded_assets_audio_aligned",
         "finished_at": now_str(),
     }
 
