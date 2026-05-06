@@ -3811,8 +3811,11 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         gap = int(font_size * 0.20)
         text_h = line_h * len(lines) + gap * (len(lines) - 1)
 
-        # Place subtitles low but not at the very bottom; avoid covering faces in center.
-        y = int(height * (0.78 if is_vertical else 0.82))
+        # Place the progressive script overlay near the TOP of the video.
+        # Sales/product videos often need the product image and CTA visible at the bottom,
+        # so narration subtitles are intentionally placed above the main product area.
+        top_margin = int(height * (0.075 if is_vertical else 0.065))
+        y = max(top_margin, int(font_size * 0.7))
         y = min(y, height - text_h - int(font_size * 0.8))
 
         yy = y
@@ -5029,14 +5032,77 @@ def prepare_product_image(src_path: str, out_path: str, width: int, height: int)
     return out_path
 
 
-def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a product-faithful sales script from ALL user input fields.
 
-    Important design rule:
-    - Do not crawl product links and do not invent unknown specs.
-    - Use product_name, price/offer, target_user, pain_point, benefits,
-      and product_details/ad_notes exactly as provided by the user.
-    - Keep every narration segment short so per-scene TTS can align with visuals.
+def _sales_unique_list(items, max_items: int = 8):
+    """Return short unique strings while preserving order."""
+    out = []
+    seen = set()
+    for item in items or []:
+        text = sanitize_tts_text(str(item or ""), max_chars=180).strip(" .,:;|-–")
+        if not text:
+            continue
+        key = re.sub(r"\s+", " ", text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _sales_split_sentences(text: str, max_items: int = 8):
+    text = sanitize_tts_text(text or "", max_chars=900)
+    if not text:
+        return []
+    # Split on punctuation and common separators. Keep user wording, but remove duplicates.
+    parts = re.split(r"(?<=[\.\!\?…])\s+|[\n\r]+|[;；•]+", text)
+    return _sales_unique_list(parts, max_items=max_items)
+
+
+def _sales_compact_sentence(text: str, max_chars: int = 220) -> str:
+    return sanitize_tts_text(text or "", max_chars=max_chars).strip(" .")
+
+
+def _sales_dedupe_sentence_text(text: str) -> str:
+    """Remove repeated sentences and near-identical short fragments."""
+    text = sanitize_tts_text(text or "", max_chars=1800)
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[\.\!\?…])\s+", text)
+    out = []
+    seen = set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        key = re.sub(r"[^\wÀ-ỹ]+", " ", p.lower(), flags=re.UNICODE).strip()
+        key_words = key.split()
+        # Avoid treating very short CTA fragments as unique if they repeat the same product words.
+        key = " ".join(key_words[:18])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return " ".join(out).strip()
+
+
+def _sales_make_overlay(text: str, fallback: str = "") -> str:
+    text = sanitize_tts_text(text or fallback, max_chars=70).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:70].strip(" .,:;|-–")
+
+
+def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a smarter product-faithful sales script from frontend input.
+
+    V3.1 rules:
+    - The beginning of the video must use what the user typed first: product name,
+      detailed features/ad notes, benefits, pain point, price, and shop.
+    - Expansion lines are added only after the user-provided points are used.
+    - Do not invent concrete specs such as materials, ingredients, warranty, SPF,
+      battery life, certifications, origin, or discounts unless the user provided them.
+    - Avoid repetitive openings like "Bạn đang... Bạn đang...".
     """
     product_name = _sales_clean(
         _sales_nested(job_config, "product_name")
@@ -5066,8 +5132,7 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
     pain_point = _sales_clean(
         _sales_nested(job_config, "pain_point")
         or _sales_nested(job_config, "sales_pain_point")
-        or _sales_nested(job_config, "problem"),
-        "mất thời gian và khó chọn đúng sản phẩm"
+        or _sales_nested(job_config, "problem")
     )
     benefits_raw = (
         _sales_nested(job_config, "benefits")
@@ -5081,40 +5146,65 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
         or _sales_nested(job_config, "selling_points")
         or _sales_nested(job_config, "product_features")
     )
-    benefits = _sales_split_benefits(benefits_raw)
-    detail_points = _sales_split_benefits(details)
 
-    # Ensure the detailed product input is not lost.
-    # If user writes a paragraph, keep it as a short script sentence too.
-    compact_details = sanitize_tts_text(details, max_chars=420)
-    compact_benefits = ", ".join(benefits[:4]) if benefits else "tiện hơn, nhanh hơn, dễ dùng hơn"
+    benefits = _sales_unique_list(_sales_split_benefits(benefits_raw), max_items=6)
+    detail_points = _sales_unique_list(_sales_split_benefits(details) + _sales_split_sentences(details, max_items=6), max_items=7)
+    compact_details = sanitize_tts_text(details, max_chars=520)
 
-    # Smarter, less repetitive sales copy. Still product-faithful: do not invent specs.
-    hook_templates = [
-        f"Bạn đang tìm {product_name} mà vẫn chưa biết chọn loại nào cho đúng?",
-        f"Nếu bạn muốn mua {product_name}, hãy xem nhanh điểm đáng chú ý này.",
-        f"{target_user}, đây là một lựa chọn đáng cân nhắc khi cần {product_name}.",
-        f"Trước khi lướt qua, hãy nhìn kỹ {product_name} này trong vài giây.",
-    ]
-    hook = hook_templates[abs(hash(product_name + target_user)) % len(hook_templates)]
+    # Start from concrete user input first.
+    first_detail = detail_points[0] if detail_points else ""
+    first_benefit = benefits[0] if benefits else ""
+    second_benefit = benefits[1] if len(benefits) > 1 else ""
 
-    pain = f"Nhiều người thường {pain_point}, nên rất dễ mất thời gian và mua không đúng nhu cầu."
-    solution = f"{product_name} tập trung vào sự tiện lợi, dễ dùng và giúp bạn ra quyết định nhanh hơn."
+    if first_detail:
+        hook = f"Đây là {product_name}. Điểm đáng chú ý đầu tiên: {first_detail}."
+    elif first_benefit:
+        hook = f"Đây là {product_name}. Lợi ích nổi bật nhất là {first_benefit}."
+    elif pain_point:
+        hook = f"Nếu bạn đang gặp tình trạng {pain_point}, hãy xem nhanh {product_name}."
+    else:
+        hook = f"Đây là {product_name}. Hãy xem sản phẩm thật trong vài giây trước khi quyết định."
+
+    user_focus_lines = []
+    if first_benefit and first_benefit.lower() not in hook.lower():
+        user_focus_lines.append(f"Sản phẩm nhấn mạnh vào lợi ích {first_benefit}.")
+    if second_benefit:
+        user_focus_lines.append(f"Ngoài ra, còn có điểm đáng chú ý là {second_benefit}.")
+    if pain_point:
+        user_focus_lines.append(f"Nó phù hợp khi bạn muốn xử lý vấn đề {pain_point} một cách gọn hơn.")
+    if target_user:
+        user_focus_lines.append(f"Đặc biệt phù hợp cho {target_user}.")
+    if price:
+        user_focus_lines.append(f"Mức giá hoặc ưu đãi hiện tại: {price}.")
 
     benefit_sentences = []
-    if benefits:
-        for i, b in enumerate(benefits[:4], start=1):
-            b = sanitize_tts_text(b, max_chars=120)
-            if i == 1:
-                benefit_sentences.append(f"Điểm nổi bật đầu tiên là {b}, rất dễ hiểu ngay khi nhìn sản phẩm thật.")
-            elif i == 2:
-                benefit_sentences.append(f"Tiếp theo là {b}, giúp sản phẩm phù hợp hơn với nhu cầu sử dụng hằng ngày.")
-            else:
-                benefit_sentences.append(f"Ngoài ra, sản phẩm còn có điểm đáng chú ý: {b}.")
-    if compact_details:
-        benefit_sentences.append(f"Thông tin cần nhấn mạnh thêm là: {compact_details}")
+    # Use detail/benefit points as the core of the middle video.
+    used_keys = set()
+    for point in detail_points:
+        key = point.lower()
+        if key in used_keys:
+            continue
+        used_keys.add(key)
+        benefit_sentences.append(f"Thông tin cần chú ý: {point}.")
+    for point in benefits:
+        key = point.lower()
+        if key in used_keys:
+            continue
+        used_keys.add(key)
+        benefit_sentences.append(f"Lợi ích nổi bật: {point}.")
+
     if not benefit_sentences:
-        benefit_sentences.append(f"{product_name} phù hợp khi bạn cần một lựa chọn rõ ràng, dễ cân nhắc và thuận tiện hơn trong cuộc sống hằng ngày.")
+        benefit_sentences.append(f"{product_name} giúp người xem nhìn rõ sản phẩm, hiểu nhanh công dụng và dễ cân nhắc hơn.")
+
+    # Expansion is deliberately placed AFTER user input scenes.
+    expansion_lines = []
+    expansion_lines.append(f"Khi mua online, điều quan trọng là nhìn rõ sản phẩm thật và hiểu nhanh lý do nên chọn {product_name}.")
+    if target_user:
+        expansion_lines.append(f"Với {target_user}, một sản phẩm dễ hiểu, dễ cân nhắc và đúng nhu cầu sẽ tạo cảm giác yên tâm hơn.")
+    if pain_point:
+        expansion_lines.append(f"Thay vì mất thời gian so sánh quá nhiều lựa chọn, hãy tập trung vào sản phẩm giải quyết đúng vấn đề bạn đang gặp.")
+    expansion_lines.append("Nếu sản phẩm phù hợp với nhu cầu của bạn, hãy đặt mua khi còn ưu đãi.")
+    expansion_lines = _sales_unique_list(expansion_lines, max_items=4)
 
     cta_banner = f"Mua ngay hôm nay {product_name}" + (f" tại {shop_name}" if shop_name else "")
     cta = cta_banner
@@ -5122,15 +5212,14 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
         cta += f" với {price}"
     cta += "."
 
-    # Short overlays for video text; no long paragraph on screen.
-    short_overlays = [
-        f"Xem nhanh {product_name}"[:52],
-        "Đúng vấn đề bạn cần"[:34],
-        "Sản phẩm thật • Dễ xem"[:34],
-        (benefits[0] if benefits else "Tiện lợi hơn mỗi ngày")[:34],
-        (benefits[1] if len(benefits) > 1 else "Ưu đãi đáng chú ý")[:34],
-        cta_banner[:46],
-    ]
+    short_overlays = _sales_unique_list([
+        f"Xem nhanh {product_name}",
+        first_detail or first_benefit or "Điểm nổi bật",
+        second_benefit or (pain_point if pain_point else "Đúng nhu cầu"),
+        "Sản phẩm thật • Dễ xem",
+        price or "Ưu đãi hôm nay",
+        cta_banner,
+    ], max_items=8)
 
     return {
         "product_name": product_name,
@@ -5142,54 +5231,85 @@ def build_sales_script(job_config: Dict[str, Any]) -> Dict[str, Any]:
         "benefits": benefits,
         "product_details": compact_details,
         "detail_points": detail_points,
-        "hook": hook,
-        "pain": pain,
-        "solution": solution,
-        "benefit_sentences": benefit_sentences,
-        "cta": cta,
-        "short_overlays": short_overlays,
+        "hook": _sales_dedupe_sentence_text(hook),
+        "user_focus_lines": [_sales_dedupe_sentence_text(x) for x in user_focus_lines],
+        "benefit_sentences": [_sales_dedupe_sentence_text(x) for x in benefit_sentences],
+        "expansion_lines": [_sales_dedupe_sentence_text(x) for x in expansion_lines],
+        "cta": _sales_dedupe_sentence_text(cta),
+        "short_overlays": [_sales_make_overlay(x) for x in short_overlays],
         "platform": _sales_clean(job_config.get("sales_platform") or _sales_nested(job_config, "platform"), "TikTok / TikTok Shop"),
         "goal": "conversion",
         "tone": "fast_conversion",
     }
 
-def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build scene list where every scene has matching narration + matching product visual.
 
-    Product assets are the primary visuals. Pexels is only allowed when explicitly enabled
-    and when a scene is marked as lifestyle/pain fallback. This avoids off-topic visuals.
+def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any], product_assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build scene list with user input first, then safe expansion.
+
+    Product assets are the primary visuals. Pexels is disabled by default and only used
+    when explicitly enabled and no uploaded asset exists.
     """
     product = sales_script.get("product_name", "sản phẩm")
-    benefits = sales_script.get("benefits", []) or []
-    benefit_sentences = sales_script.get("benefit_sentences", []) or []
     overlays = sales_script.get("short_overlays", []) or []
     product_assets = [a for a in (product_assets or []) if a.get("path") and os.path.exists(str(a.get("path"))) and a.get("kind") in {"image", "video"}]
     has_product_asset = bool(product_assets)
     allow_pexels = bool(job_config.get("allow_sales_pexels_fallback", False)) and not has_product_asset
 
-    # Base scenes: short, product-faithful, no hallucinated specs.
-    scene_templates = [
-        {"role": "hook", "voice_text": sales_script.get("hook", f"Đừng bỏ qua {product}."), "overlay": overlays[0] if len(overlays) > 0 else f"Đừng bỏ qua {product}", "source": "product"},
-        {"role": "pain", "voice_text": sales_script.get("pain", "Bạn có đang gặp vấn đề này?"), "overlay": overlays[1] if len(overlays) > 1 else "Bạn có gặp vấn đề này?", "source": "product" if has_product_asset else "pexels"},
-        {"role": "solution", "voice_text": sales_script.get("solution", f"{product} là giải pháp tiện lợi hơn."), "overlay": overlays[2] if len(overlays) > 2 else product, "source": "product"},
-    ]
+    scene_templates = []
+    scene_templates.append({
+        "role": "user_product_intro",
+        "voice_text": sales_script.get("hook", f"Đây là {product}."),
+        "overlay": overlays[0] if len(overlays) > 0 else f"Xem nhanh {product}",
+        "source": "product",
+    })
 
-    for i, sentence in enumerate(benefit_sentences[:3], start=1):
-        overlay = overlays[2 + i] if len(overlays) > 2 + i else (benefits[i-1] if len(benefits) >= i else "Lợi ích nổi bật")
+    # Put user-provided focus lines immediately after the opening.
+    for i, line in enumerate(sales_script.get("user_focus_lines", [])[:3], start=1):
         scene_templates.append({
-            "role": f"benefit_{i}",
-            "voice_text": sentence,
-            "overlay": overlay,
+            "role": f"user_focus_{i}",
+            "voice_text": line,
+            "overlay": overlays[i] if len(overlays) > i else _sales_make_overlay(line),
             "source": "product",
         })
 
-    scene_templates.append({"role": "cta", "voice_text": sales_script.get("cta", f"Xem ngay {product} hôm nay."), "overlay": sales_script.get("cta_banner") or (overlays[-1] if overlays else "Mua ngay hôm nay"), "source": "product"})
+    # Then use detailed feature / benefit points.
+    for i, sentence in enumerate((sales_script.get("benefit_sentences", []) or [])[:5], start=1):
+        scene_templates.append({
+            "role": f"user_feature_{i}",
+            "voice_text": sentence,
+            "overlay": overlays[min(len(overlays)-1, i + 1)] if overlays else _sales_make_overlay(sentence),
+            "source": "product",
+        })
 
-    # Respect target duration by keeping enough scenes for longer ads.
+    # Expansion comes only after user input has been covered.
     target_total = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
-    if target_total >= 45 and len(scene_templates) < 7 and benefits:
-        extra_benefit = benefits[min(len(benefits)-1, 2)]
-        scene_templates.insert(-1, {"role": "proof", "voice_text": f"Bạn có thể dùng {product} để tiết kiệm thời gian và thao tác đơn giản hơn.", "overlay": extra_benefit[:34], "source": "product"})
+    expansion_limit = 1 if target_total <= 30 else (2 if target_total <= 45 else 3)
+    for i, line in enumerate((sales_script.get("expansion_lines", []) or [])[:expansion_limit], start=1):
+        scene_templates.append({
+            "role": f"safe_expand_{i}",
+            "voice_text": line,
+            "overlay": _sales_make_overlay(line, fallback="Lý do nên xem"),
+            "source": "product" if has_product_asset else "pexels",
+        })
+
+    scene_templates.append({
+        "role": "cta",
+        "voice_text": sales_script.get("cta", f"Mua ngay hôm nay {product}."),
+        "overlay": sales_script.get("cta_banner") or (overlays[-1] if overlays else "Mua ngay hôm nay"),
+        "source": "product",
+    })
+
+    # Cap scenes by target duration so we do not create a long repetitive ad.
+    max_scenes_by_duration = 5 if target_total <= 20 else (6 if target_total <= 30 else (8 if target_total <= 45 else 10))
+    if len(scene_templates) > max_scenes_by_duration:
+        # Always keep first user-input scene and CTA. Trim expansion first.
+        intro = scene_templates[:1]
+        cta = scene_templates[-1:]
+        middle = scene_templates[1:-1]
+        middle_user = [x for x in middle if not str(x.get("role", "")).startswith("safe_expand")]
+        middle_expand = [x for x in middle if str(x.get("role", "")).startswith("safe_expand")]
+        keep_n = max_scenes_by_duration - len(intro) - len(cta)
+        scene_templates = intro + (middle_user + middle_expand)[:keep_n] + cta
 
     product_asset_counter = 0
     scenes = []
@@ -5200,9 +5320,8 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             selected_asset = product_assets[product_asset_counter % len(product_assets)]
             product_asset_counter += 1
 
-        # Stock only if explicitly allowed and no uploaded product asset is available.
         allow_scene_pexels = bool(allow_pexels and item.get("source") == "pexels")
-        voice_text = sanitize_tts_text(item.get("voice_text", ""), max_chars=520)
+        voice_text = _sales_dedupe_sentence_text(sanitize_tts_text(item.get("voice_text", ""), max_chars=560))
         overlay = sanitize_tts_text(item.get("overlay", ""), max_chars=70)
         scenes.append({
             "scene_id": idx,
@@ -5238,12 +5357,7 @@ def _sales_join_nonempty(parts: List[str]) -> str:
 
 
 def _sales_safe_context_phrases(sales_script: Dict[str, Any]) -> List[str]:
-    """Create safe, attractive filler lines without inventing product specifications.
-
-    These lines can expand short sales inputs while staying faithful to user-provided fields.
-    They may talk about pain, convenience, purchase confidence, and CTA, but they must not
-    invent exact materials, ingredients, warranty, certifications, SPF, battery life, etc.
-    """
+    """Safe expansion lines used only after user-provided content is already covered."""
     product = _sales_clean(sales_script.get("product_name"), "sản phẩm này")
     price = _sales_clean(sales_script.get("price"))
     target_user = _sales_clean(sales_script.get("target_user"), "người mua online")
@@ -5252,30 +5366,33 @@ def _sales_safe_context_phrases(sales_script: Dict[str, Any]) -> List[str]:
     details = _sales_clean(sales_script.get("product_details"))
 
     phrases = []
-    phrases.append(f"Nếu bạn đang tìm một lựa chọn nhanh gọn và dễ cân nhắc, {product} là sản phẩm rất đáng xem.")
-    if target_user:
-        phrases.append(f"Đặc biệt phù hợp cho {target_user}, nhất là khi bạn muốn tiết kiệm thời gian trước khi quyết định mua.")
-    if pain:
-        phrases.append(f"Điểm hay là sản phẩm nhắm đúng vào vấn đề {pain}, nên thông điệp rất dễ chạm đến nhu cầu thật của người xem.")
-    if benefits:
-        phrases.append("Những điểm nổi bật cần nhớ là " + ", ".join(benefits[:3]) + ".")
+    # Do NOT repeat the opening/product intro here.
     if details:
-        phrases.append(f"Theo phần mô tả bạn cung cấp, điểm cần quảng cáo rõ nhất là: {details}")
-    phrases.append(f"Khi xem video, khách hàng nên thấy ngay sản phẩm, hiểu nhanh lợi ích, rồi có lý do để bấm mua {product}.")
+        phrases.append(f"Hãy nhìn kỹ phần mô tả sản phẩm: {details}")
+    if benefits:
+        phrases.append("Các điểm nên nhớ: " + ", ".join(benefits[:3]) + ".")
+    if pain:
+        phrases.append(f"Nếu vấn đề của bạn là {pain}, hãy cân nhắc sản phẩm theo đúng nhu cầu thực tế.")
+    if target_user:
+        phrases.append(f"Với {target_user}, điều quan trọng là sản phẩm dễ hiểu, dễ chọn và phù hợp với cách sử dụng hằng ngày.")
     if price:
-        phrases.append(f"Với mức {price}, hãy làm nổi bật cảm giác đáng thử và dễ ra quyết định ngay hôm nay.")
-    phrases.append("Hãy kiểm tra kỹ thông tin sản phẩm, chọn đúng nhu cầu của bạn và đặt mua khi còn ưu đãi.")
-    return [sanitize_tts_text(p, max_chars=360) for p in phrases if sanitize_tts_text(p, max_chars=360)]
+        phrases.append(f"Mức {price} giúp người xem dễ cân nhắc hơn trước khi đặt mua.")
+    phrases.append(f"Nếu {product} đúng với nhu cầu của bạn, hãy lưu lại hoặc đặt mua ngay hôm nay.")
+    return _sales_unique_list([sanitize_tts_text(p, max_chars=360) for p in phrases], max_items=8)
 
 
-def enrich_sales_scene_text(scene_text: str, sales_script: Dict[str, Any], min_words: int = 22, max_chars: int = 620) -> str:
-    """Make one scene narration more engaging if it is too short."""
-    text = sanitize_tts_text(scene_text, max_chars=max_chars)
-    if _sales_word_count(text) >= int(min_words):
+def enrich_sales_scene_text(scene_text: str, sales_script: Dict[str, Any], min_words: int = 22, max_chars: int = 620, allow_generic_expand: bool = True) -> str:
+    """Make one scene narration more engaging if it is too short.
+
+    For early scenes, allow_generic_expand should be False so the beginning stays faithful
+    to the exact frontend input and does not repeat broad filler.
+    """
+    text = _sales_dedupe_sentence_text(sanitize_tts_text(scene_text, max_chars=max_chars))
+    if _sales_word_count(text) >= int(min_words) or not allow_generic_expand:
         return text
 
     for phrase in _sales_safe_context_phrases(sales_script):
-        candidate = sanitize_tts_text(_sales_join_nonempty([text, phrase]), max_chars=max_chars)
+        candidate = _sales_dedupe_sentence_text(sanitize_tts_text(_sales_join_nonempty([text, phrase]), max_chars=max_chars))
         text = candidate
         if _sales_word_count(text) >= int(min_words):
             break
@@ -5291,18 +5408,20 @@ def _sales_extra_scene_templates(sales_script: Dict[str, Any]) -> List[Dict[str,
     details = _sales_clean(sales_script.get("product_details"))
 
     rows = []
-    if pain:
-        rows.append({"role": "pain_expand", "overlay": "Đúng vấn đề khách cần", "voice_text": f"Thay vì mất thời gian tìm kiếm nhiều lựa chọn, hãy tập trung vào sản phẩm có thể giải quyết đúng vấn đề {pain}."})
+    # Details and benefits first because they are user-provided. Generic context later.
+    if details:
+        for i, d in enumerate(_sales_split_sentences(details, max_items=3), start=1):
+            rows.append({"role": f"detail_expand_{i}", "overlay": _sales_make_overlay(d, "Thông tin sản phẩm"), "voice_text": f"Thông tin cần quảng cáo rõ hơn: {d}."})
     if benefits:
         for i, b in enumerate(benefits[:4], start=1):
-            rows.append({"role": f"benefit_expand_{i}", "overlay": b[:34], "voice_text": f"Lợi ích nổi bật tiếp theo là {b}. Đây là điểm nên nhấn mạnh để khách hàng hiểu nhanh giá trị của {product}."})
-    if details:
-        rows.append({"role": "detail_expand", "overlay": "Thông tin đáng chú ý", "voice_text": f"Thông tin cần quảng cáo thêm là: {details}. Hãy để khách hàng nhìn thấy sản phẩm thật và hiểu vì sao nó phù hợp với nhu cầu của họ."})
-    rows.append({"role": "usage_context", "overlay": "Dễ cân nhắc mua", "voice_text": f"Với {target_user}, video cần cho thấy tình huống sử dụng rõ ràng, lợi ích dễ hiểu và cảm giác mua hàng an tâm hơn."})
+            rows.append({"role": f"benefit_expand_{i}", "overlay": _sales_make_overlay(b, "Lợi ích nổi bật"), "voice_text": f"Một điểm nổi bật khác là {b}. Hãy để khách hàng nhìn thấy lợi ích này ngay trên sản phẩm thật."})
+    if pain:
+        rows.append({"role": "pain_expand", "overlay": "Đúng vấn đề khách cần", "voice_text": f"Nếu bạn cũng đang gặp vấn đề {pain}, hãy cân nhắc sản phẩm theo đúng nhu cầu của mình."})
+    rows.append({"role": "usage_context", "overlay": "Dễ cân nhắc mua", "voice_text": f"Với {target_user}, sản phẩm cần được nhìn rõ, thông tin cần dễ hiểu, và quyết định mua phải thật nhanh gọn."})
     if price:
-        rows.append({"role": "offer_expand", "overlay": "Ưu đãi hôm nay", "voice_text": f"Nếu mức {price} đang phù hợp với ngân sách của bạn, đây là thời điểm tốt để cân nhắc đặt mua {product}."})
+        rows.append({"role": "offer_expand", "overlay": "Ưu đãi hôm nay", "voice_text": f"Nếu mức {price} phù hợp với ngân sách của bạn, đây là thời điểm tốt để cân nhắc đặt mua {product}."})
     shop = _sales_clean(sales_script.get("shop_name"))
-    rows.append({"role": "cta_expand", "overlay": sales_script.get("cta_banner") or "Bấm mua ngay", "voice_text": f"Đừng chỉ xem rồi lướt qua. Nếu {product} đúng với nhu cầu của bạn, hãy mua ngay hôm nay" + (f" tại {shop}." if shop else ".")})
+    rows.append({"role": "cta_expand", "overlay": sales_script.get("cta_banner") or "Bấm mua ngay", "voice_text": f"Nếu {product} đúng với nhu cầu của bạn, hãy mua ngay hôm nay" + (f" tại {shop}." if shop else ".")})
     return rows
 
 
@@ -5312,63 +5431,60 @@ def ensure_sales_script_length_and_scene_alignment(
     job_config: Dict[str, Any],
     product_assets: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Expand sales narration when user input is sparse and target duration is longer.
+    """Expand sparse sales narration without repeating the first scenes.
 
-    The pipeline later uses per-scene TTS duration as the exact scene duration, so matching
-    words to the requested duration is the safest way to avoid scenes continuing after the
-    narration ends. This function expands text and, if needed, adds extra product-faithful
-    scenes. It never invents concrete product specs not provided by the user.
+    The first part of the video stays faithful to user input. Extra persuasive copy is
+    inserted later and only when the requested duration needs more narration.
     """
     if not scenes:
         return scenes
 
     try:
-        target_total_sec = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
+        target_total_sec = float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30)
     except Exception:
-        target_total_sec = 30
+        target_total_sec = 30.0
+    target_total_sec = max(12.0, min(target_total_sec, 75.0))
 
-    # Fast Vietnamese sales voice usually lands around 2.5-3.0 words/sec after speed-up.
-    # Use a conservative target so we do not over-generate narration.
     words_per_sec = float(os.getenv("SALES_TARGET_WORDS_PER_SEC", "2.55"))
-    target_words = max(55, int(target_total_sec * words_per_sec))
-    min_scene_words = 18 if target_total_sec <= 30 else 22
+    target_words = max(45, int(target_total_sec * words_per_sec))
+    min_scene_words = 10 if target_total_sec <= 30 else 13
 
-    # 1) Enrich existing scene narration so no scene feels empty.
-    for scene in scenes:
+    # 1) Clean and lightly enrich existing scenes.
+    # Early scenes do not receive generic filler; they should speak the exact user input first.
+    for idx, scene in enumerate(scenes):
+        role = str(scene.get("scene_plan", {}).get("action", scene.get("role", "")) or "")
+        allow_generic = idx >= 3 or role.startswith("safe_expand")
         scene["voice_text"] = enrich_sales_scene_text(
             scene.get("voice_text", ""),
             sales_script,
-            min_words=min_scene_words,
-            max_chars=680,
+            min_words=(min_scene_words if allow_generic else 6),
+            max_chars=620,
+            allow_generic_expand=allow_generic,
         )
         scene["source_chunk"] = scene["voice_text"]
 
     current_words = sum(_sales_word_count(s.get("voice_text", "")) for s in scenes)
-    if current_words >= int(target_words * 0.88):
+    if current_words >= int(target_words * 0.84):
         return scenes
 
     # 2) Add extra scenes only when narration is still too short for requested duration.
     product_assets = [a for a in (product_assets or []) if a.get("path")]
-    product_asset_counter = 0
-    if product_assets:
-        used = [s.get("product_asset_index") for s in scenes if s.get("product_asset_index")]
-        product_asset_counter = len(used)
-
-    max_scenes_by_duration = 6 if target_total_sec <= 30 else (8 if target_total_sec <= 45 else 10)
+    product_asset_counter = len([s for s in scenes if s.get("product_asset_index") is not None])
+    max_scenes_by_duration = 5 if target_total_sec <= 20 else (6 if target_total_sec <= 30 else (8 if target_total_sec <= 45 else 10))
     extra_rows = _sales_extra_scene_templates(sales_script)
 
-    while current_words < int(target_words * 0.92) and len(scenes) < max_scenes_by_duration and extra_rows:
+    while current_words < int(target_words * 0.90) and len(scenes) < max_scenes_by_duration and extra_rows:
         row = extra_rows.pop(0)
         selected_asset = None
         if product_assets:
             selected_asset = product_assets[product_asset_counter % len(product_assets)]
             product_asset_counter += 1
 
-        voice_text = enrich_sales_scene_text(row.get("voice_text", ""), sales_script, min_words=min_scene_words, max_chars=680)
-        new_idx = len(scenes) + 1
+        voice_text = enrich_sales_scene_text(row.get("voice_text", ""), sales_script, min_words=min_scene_words, max_chars=640, allow_generic_expand=True)
         product = _sales_clean(sales_script.get("product_name"), "sản phẩm")
-        scenes.insert(-1 if len(scenes) >= 2 else len(scenes), {
-            "scene_id": new_idx,
+        insert_at = max(1, len(scenes) - 1)  # before CTA, after user-input scenes
+        scenes.insert(insert_at, {
+            "scene_id": len(scenes) + 1,
             "voice_text": voice_text,
             "source_chunk": voice_text,
             "text_overlay": sanitize_tts_text(row.get("overlay", ""), max_chars=70),
@@ -5386,27 +5502,26 @@ def ensure_sales_script_length_and_scene_alignment(
                 "location": "uploaded product visual",
                 "mood": "fast product advertisement",
             },
-            "enriched_by": "safe_sales_duration_expansion",
+            "enriched_by": "safe_sales_duration_expansion_after_user_input",
         })
-        # re-number scenes after insert before CTA
         for i, s in enumerate(scenes, start=1):
             s["scene_id"] = i
         current_words = sum(_sales_word_count(s.get("voice_text", "")) for s in scenes)
 
-    # 3) If still short, distribute a final safe CTA/context line across existing scenes.
-    if current_words < int(target_words * 0.82):
-        safe_phrases = _sales_safe_context_phrases(sales_script)
-        pi = 0
-        for scene in scenes:
-            if current_words >= int(target_words * 0.88):
-                break
-            if not safe_phrases:
-                break
-            add = safe_phrases[pi % len(safe_phrases)]
-            scene["voice_text"] = sanitize_tts_text(_sales_join_nonempty([scene.get("voice_text", ""), add]), max_chars=760)
-            scene["source_chunk"] = scene["voice_text"]
-            current_words = sum(_sales_word_count(s.get("voice_text", "")) for s in scenes)
-            pi += 1
+    # 3) Final de-dup across neighboring scenes so the opening does not repeat.
+    seen_prefixes = set()
+    for scene in scenes:
+        text = _sales_dedupe_sentence_text(scene.get("voice_text", ""))
+        prefix = " ".join(re.sub(r"[^\wÀ-ỹ]+", " ", text.lower(), flags=re.UNICODE).split()[:10])
+        if prefix and prefix in seen_prefixes:
+            # Keep the scene, but trim duplicated intro-like wording.
+            parts = _sales_split_sentences(text, max_items=4)
+            if len(parts) > 1:
+                text = " ".join(parts[1:])
+        if prefix:
+            seen_prefixes.add(prefix)
+        scene["voice_text"] = sanitize_tts_text(text, max_chars=700)
+        scene["source_chunk"] = scene["voice_text"]
 
     return scenes
 
