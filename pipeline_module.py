@@ -307,12 +307,17 @@ def normalize_job_config(job_config, fallback_job_id=None):
         "target_user": _safe_str(job_config.get("target_user")),
         "pain_point": _safe_str(job_config.get("pain_point")),
         "benefits": job_config.get("benefits"),
+        # New production asset flow:
+        # Frontend uploads product images/videos to Cloudflare R2 first, then sends
+        # product_assets: [{url, r2_key/key, name, mime_type, size_bytes, source:"r2"}].
+        # Keep legacy data_url fields only as fallback for old clients.
         "product_assets": job_config.get("product_assets") if isinstance(job_config.get("product_assets"), list) else [],
         "product_asset": job_config.get("product_asset") if isinstance(job_config.get("product_asset"), dict) else {},
         "product_asset_data_url": _safe_str(job_config.get("product_asset_data_url")),
         "product_asset_name": _safe_str(job_config.get("product_asset_name")),
         "product_asset_mime_type": _safe_str(job_config.get("product_asset_mime_type")),
         "product_asset_url": _safe_str(job_config.get("product_asset_url")),
+        "product_asset_r2_key": _safe_str(job_config.get("product_asset_r2_key") or job_config.get("product_asset_key")),
 
         "created_at": _safe_str(job_config.get("created_at"), now_str()),
         "meta": meta,
@@ -4967,16 +4972,21 @@ def normalize_sales_job_config(job_config: Dict[str, Any]) -> Dict[str, Any]:
 def _get_product_asset_payload(job_config: Dict[str, Any]) -> Dict[str, Any]:
     """Backward-compatible single-asset reader."""
     assets = _get_product_asset_payloads(job_config)
-    return assets[0] if assets else {"data_url": "", "name": "product_asset", "mime_type": "", "url": ""}
+    return assets[0] if assets else {"data_url": "", "name": "product_asset", "mime_type": "", "url": "", "r2_key": "", "source": ""}
 
 
 def _get_product_asset_payloads(job_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Read multiple uploaded product assets from product_assets[].
+    """Read uploaded product assets from the new R2-first payload.
 
-    Supports both the new payload:
-      product_assets: [{data_url, name, mime_type, size_bytes}, ...]
-    and the legacy single asset fields:
-      product_asset / product_asset_data_url / product_asset_url.
+    Preferred production payload from frontend / Cloudflare Worker:
+      product_assets: [{
+        url: "https://pub-xxx.r2.dev/uploads/product-assets/job_xxx/file.png",
+        key or r2_key: "uploads/product-assets/job_xxx/file.png",
+        name, mime_type, size_bytes, source: "r2"
+      }]
+
+    Legacy fallback is still supported:
+      product_asset / product_asset_url / product_asset_data_url.
     """
     out = []
     raw_assets = job_config.get("product_assets") or []
@@ -4985,31 +4995,41 @@ def _get_product_asset_payloads(job_config: Dict[str, Any]) -> List[Dict[str, An
             if not isinstance(a, dict):
                 continue
             data_url = a.get("data_url") or a.get("dataUrl") or ""
-            url = a.get("url") or a.get("asset_url") or ""
-            name = a.get("name") or a.get("filename") or f"product_asset_{i+1}"
-            mime_type = a.get("mime_type") or a.get("mimeType") or ""
+            url = a.get("url") or a.get("asset_url") or a.get("public_url") or a.get("r2_url") or ""
+            name = a.get("name") or a.get("filename") or a.get("original_name") or f"product_asset_{i+1}"
+            mime_type = a.get("mime_type") or a.get("mimeType") or a.get("content_type") or ""
+            r2_key = a.get("r2_key") or a.get("key") or a.get("object_key") or ""
+            size_bytes = a.get("size_bytes") or a.get("size") or 0
+            source = a.get("source") or ("r2" if (url and r2_key) else "")
             if data_url or url:
                 out.append({
                     "data_url": _sales_clean(data_url),
                     "name": _sales_clean(name, f"product_asset_{i+1}"),
                     "mime_type": _sales_clean(mime_type),
                     "url": _sales_clean(url),
+                    "r2_key": _sales_clean(r2_key),
+                    "size_bytes": size_bytes,
+                    "source": _sales_clean(source),
                 })
 
-    # Legacy single asset support.
+    # Legacy single asset support. This lets old frontend versions keep working,
+    # but new frontend should not send base64 data_url anymore.
     legacy = job_config.get("product_asset") or {}
     if not isinstance(legacy, dict):
         legacy = {}
     legacy_data_url = legacy.get("data_url") or job_config.get("product_asset_data_url") or ""
-    legacy_url = legacy.get("url") or job_config.get("product_asset_url") or ""
+    legacy_url = legacy.get("url") or legacy.get("asset_url") or job_config.get("product_asset_url") or ""
+    legacy_r2_key = legacy.get("r2_key") or legacy.get("key") or job_config.get("product_asset_r2_key") or job_config.get("product_asset_key") or ""
     if legacy_data_url or legacy_url:
         legacy_payload = {
             "data_url": _sales_clean(legacy_data_url),
-            "name": _sales_clean(legacy.get("name") or job_config.get("product_asset_name") or "product_asset"),
-            "mime_type": _sales_clean(legacy.get("mime_type") or job_config.get("product_asset_mime_type") or ""),
+            "name": _sales_clean(legacy.get("name") or legacy.get("original_name") or job_config.get("product_asset_name") or "product_asset"),
+            "mime_type": _sales_clean(legacy.get("mime_type") or legacy.get("mimeType") or job_config.get("product_asset_mime_type") or ""),
             "url": _sales_clean(legacy_url),
+            "r2_key": _sales_clean(legacy_r2_key),
+            "size_bytes": legacy.get("size_bytes") or legacy.get("size") or 0,
+            "source": _sales_clean(legacy.get("source") or ("r2" if legacy_url and legacy_r2_key else "legacy")),
         }
-        # Avoid exact duplicate if frontend also included first asset in both places.
         key = (legacy_payload["data_url"][:80], legacy_payload["url"], legacy_payload["name"])
         existing = {(x.get("data_url", "")[:80], x.get("url", ""), x.get("name", "")) for x in out}
         if key not in existing:
@@ -5030,12 +5050,62 @@ def _guess_ext_from_mime(mime_type: str, fallback: str = ".bin") -> str:
     return ext or fallback
 
 
+def _safe_asset_filename(name: str, default: str = "asset") -> str:
+    name = _sales_clean(name, default)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-._")
+    return name[:120] or default
+
+
+def _is_allowed_product_asset_url(url: str) -> bool:
+    """Only allow http(s) URLs for product assets. R2 public URLs work here."""
+    try:
+        u = urlparse(str(url or ""))
+        return u.scheme in {"http", "https"} and bool(u.netloc)
+    except Exception:
+        return False
+
+
+def _download_url_to_file(url: str, out_path: str, max_mb: float = None, timeout: int = 90) -> Dict[str, Any]:
+    """Streaming download for R2 assets to avoid loading large videos fully into RAM."""
+    if max_mb is None:
+        max_mb = float(os.getenv("MAX_PRODUCT_ASSET_DOWNLOAD_MB", "120"))
+    max_bytes = int(float(max_mb) * 1024 * 1024)
+    headers = {"User-Agent": "FlozenAI-RunPod/1.0"}
+
+    with requests.get(url, timeout=timeout, headers=headers, stream=True, allow_redirects=True) as resp:
+        resp.raise_for_status()
+        ctype = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        clen = resp.headers.get("content-length")
+        if clen and int(clen) > max_bytes:
+            raise RuntimeError(f"Product asset too large: {int(clen)} bytes > {max_bytes} bytes")
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        total = 0
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(f"Product asset exceeded max download size: {total} bytes > {max_bytes} bytes")
+                f.write(chunk)
+
+    return {"content_type": ctype, "bytes": total}
+
+
 def _materialize_one_product_asset(asset: Dict[str, Any], asset_dir: str, index: int = 1) -> Dict[str, Any]:
+    """Convert one product asset payload into a local temp file.
+
+    New production flow prefers R2/public URL download. Base64 data_url remains only
+    as a compatibility fallback for old jobs.
+    """
     os.makedirs(asset_dir, exist_ok=True)
-    data_url = asset.get("data_url", "")
-    url = asset.get("url", "")
-    mime_type = asset.get("mime_type", "")
-    name = asset.get("name", f"product_asset_{index}")
+    data_url = _sales_clean(asset.get("data_url", ""))
+    url = _sales_clean(asset.get("url", ""))
+    mime_type = _sales_clean(asset.get("mime_type", ""))
+    name = _safe_asset_filename(asset.get("name", f"product_asset_{index}"), f"product_asset_{index}")
+    r2_key = _sales_clean(asset.get("r2_key") or asset.get("key") or "")
+    source_hint = _sales_clean(asset.get("source") or ("r2" if r2_key or "r2" in url.lower() else ""))
 
     def _kind_from(ext: str, mime: str) -> str:
         ext = (ext or "").lower()
@@ -5046,6 +5116,44 @@ def _materialize_one_product_asset(asset: Dict[str, Any], asset_dir: str, index:
             return "image"
         return "unknown"
 
+    # 1) Preferred production path: download from R2/public URL.
+    if url:
+        try:
+            if not _is_allowed_product_asset_url(url):
+                raise ValueError(f"Invalid product asset URL: {url[:120]}")
+            parsed_ext = os.path.splitext(urlparse(url).path)[1].lower()
+            name_ext = os.path.splitext(name)[1].lower()
+            ext = name_ext or parsed_ext or _guess_ext_from_mime(mime_type)
+            out_path = os.path.join(asset_dir, f"r2_product_asset_{index:02d}{ext}")
+            meta = _download_url_to_file(url, out_path)
+            if not mime_type:
+                mime_type = meta.get("content_type", "")
+            if ext == ".bin":
+                fixed_ext = _guess_ext_from_mime(mime_type, fallback=".bin")
+                if fixed_ext != ".bin":
+                    fixed_path = os.path.join(asset_dir, f"r2_product_asset_{index:02d}{fixed_ext}")
+                    os.replace(out_path, fixed_path)
+                    out_path = fixed_path
+                    ext = fixed_ext
+            kind = _kind_from(ext, mime_type)
+            if kind not in {"image", "video"}:
+                raise RuntimeError(f"Unsupported downloaded product asset type: ext={ext}, mime={mime_type}")
+            return {
+                "path": out_path,
+                "kind": kind,
+                "mime_type": mime_type,
+                "name": name,
+                "source": source_hint or "downloaded_url",
+                "url": url,
+                "r2_key": r2_key,
+                "size_bytes": meta.get("bytes", 0),
+                "index": index,
+            }
+        except Exception as e:
+            print(f"WARN: cannot download product_assets[{index}] from URL:", repr(e))
+
+    # 2) Legacy fallback: base64 data URL. Avoid this for production because it makes
+    # Worker payloads large and can increase memory usage.
     if data_url:
         try:
             header, b64 = data_url.split(",", 1) if "," in data_url else ("", data_url)
@@ -5053,49 +5161,51 @@ def _materialize_one_product_asset(asset: Dict[str, Any], asset_dir: str, index:
             if m:
                 mime_type = m.group(1).strip()
             raw = base64.b64decode(b64, validate=False)
+            max_bytes = int(float(os.getenv("MAX_PRODUCT_ASSET_DATA_URL_MB", "35")) * 1024 * 1024)
+            if len(raw) > max_bytes:
+                raise RuntimeError(f"data_url product asset too large: {len(raw)} bytes > {max_bytes} bytes")
             ext = os.path.splitext(name)[1].lower() or _guess_ext_from_mime(mime_type)
-            out_path = os.path.join(asset_dir, f"uploaded_product_asset_{index:02d}{ext}")
+            out_path = os.path.join(asset_dir, f"legacy_product_asset_{index:02d}{ext}")
             with open(out_path, "wb") as f:
                 f.write(raw)
             kind = _kind_from(ext, mime_type)
-            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "uploaded_data_url", "index": index}
+            return {
+                "path": out_path,
+                "kind": kind,
+                "mime_type": mime_type,
+                "name": name,
+                "source": "uploaded_data_url_legacy",
+                "url": url,
+                "r2_key": r2_key,
+                "size_bytes": len(raw),
+                "index": index,
+            }
         except Exception as e:
-            print(f"WARN: cannot decode product_assets[{index}]:", repr(e))
+            print(f"WARN: cannot decode legacy product_assets[{index}] data_url:", repr(e))
 
-    if url:
-        try:
-            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            ctype = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            mime_type = mime_type or ctype
-            parsed_ext = os.path.splitext(urlparse(url).path)[1].lower()
-            ext = parsed_ext or _guess_ext_from_mime(mime_type)
-            out_path = os.path.join(asset_dir, f"downloaded_product_asset_{index:02d}{ext}")
-            with open(out_path, "wb") as f:
-                f.write(resp.content)
-            kind = _kind_from(ext, mime_type)
-            return {"path": out_path, "kind": kind, "mime_type": mime_type, "name": name, "source": "downloaded_url", "index": index}
-        except Exception as e:
-            print(f"WARN: cannot download product_assets[{index}]:", repr(e))
-
-    return {"path": "", "kind": "none", "mime_type": mime_type, "name": name, "source": "none", "index": index}
+    return {"path": "", "kind": "none", "mime_type": mime_type, "name": name, "source": "none", "url": url, "r2_key": r2_key, "size_bytes": 0, "index": index}
 
 
 def materialize_product_assets(job_config: Dict[str, Any], asset_dir: str) -> List[Dict[str, Any]]:
-    """Materialize all uploaded product assets into local temp files."""
+    """Materialize all uploaded product assets into local temp files.
+
+    With the new R2 flow this downloads product_assets[].url from R2 to RunPod temp storage.
+    """
     payloads = _get_product_asset_payloads(job_config)
     assets = []
     for idx, payload in enumerate(payloads, start=1):
         asset = _materialize_one_product_asset(payload, asset_dir, idx)
         if asset.get("path") and os.path.exists(str(asset.get("path"))) and asset.get("kind") in {"image", "video"}:
             assets.append(asset)
+    if not assets and payloads:
+        print("WARN: product asset payloads were provided but none could be materialized. Check R2_PUBLIC_BASE_URL/public access and RunPod network access.")
     return assets[:10]
 
 
 def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dict[str, Any]:
     """Backward-compatible single-asset wrapper."""
     assets = materialize_product_assets(job_config, asset_dir)
-    return assets[0] if assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "index": 0}
+    return assets[0] if assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "url": "", "r2_key": "", "size_bytes": 0, "index": 0}
 
 
 def prepare_product_image(src_path: str, out_path: str, width: int, height: int) -> str:
@@ -5611,6 +5721,9 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "product_asset_index": selected_asset.get("index") if selected_asset else None,
             "product_asset_path": selected_asset.get("path") if selected_asset else "",
             "product_asset_kind": selected_asset.get("kind") if selected_asset else "",
+            "product_asset_source": selected_asset.get("source") if selected_asset else "",
+            "product_asset_url": selected_asset.get("url") if selected_asset else "",
+            "product_asset_r2_key": selected_asset.get("r2_key") if selected_asset else "",
             "scene_plan": {
                 "main_subject": product,
                 "action": item.get("role", "sales_scene"),
@@ -5654,6 +5767,9 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "product_asset_index": asset.get("index"),
             "product_asset_path": asset.get("path"),
             "product_asset_kind": asset.get("kind"),
+            "product_asset_source": asset.get("source"),
+            "product_asset_url": asset.get("url"),
+            "product_asset_r2_key": asset.get("r2_key"),
             "scene_plan": {
                 "main_subject": product_name,
                 "action": "ai_planner_asset_support_scene",
@@ -5818,6 +5934,9 @@ def ensure_sales_script_length_and_scene_alignment(
             "product_asset_index": selected_asset.get("index") if selected_asset else None,
             "product_asset_path": selected_asset.get("path") if selected_asset else "",
             "product_asset_kind": selected_asset.get("kind") if selected_asset else "",
+            "product_asset_source": selected_asset.get("source") if selected_asset else "",
+            "product_asset_url": selected_asset.get("url") if selected_asset else "",
+            "product_asset_r2_key": selected_asset.get("r2_key") if selected_asset else "",
             "scene_plan": {
                 "main_subject": product,
                 "action": row.get("role", "sales_expand"),
@@ -5857,6 +5976,9 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
             "path": scene.get("product_asset_path"),
             "kind": scene.get("product_asset_kind") or product_asset.get("kind"),
             "index": scene.get("product_asset_index"),
+            "source": scene.get("product_asset_source") or product_asset.get("source", ""),
+            "url": scene.get("product_asset_url") or product_asset.get("url", ""),
+            "r2_key": scene.get("product_asset_r2_key") or product_asset.get("r2_key", ""),
         }
 
     if scene.get("prefer_product_asset") and selected_product_asset.get("path") and os.path.exists(str(selected_product_asset.get("path"))):
@@ -5870,6 +5992,8 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
                 scene["visual_used"] = "uploaded_product_video"
                 scene["visual_video_path"] = product_video_path
                 scene["visual_source"] = "product_asset"
+                scene["product_asset_source"] = selected_product_asset.get("source", scene.get("product_asset_source", ""))
+                scene["product_asset_r2_key"] = selected_product_asset.get("r2_key", scene.get("product_asset_r2_key", ""))
                 scene["visual_file"] = os.path.basename(img_path)
                 create_fast_placeholder_image(img_path, width, height, title="Product Video")
                 return img_path
@@ -5877,6 +6001,8 @@ def _download_sales_visual(scene: Dict[str, Any], img_path: str, width: int, hei
                 prepare_product_image(selected_product_asset["path"], img_path, width, height)
                 scene["visual_used"] = "uploaded_product_image"
                 scene["visual_source"] = "product_asset"
+                scene["product_asset_source"] = selected_product_asset.get("source", scene.get("product_asset_source", ""))
+                scene["product_asset_r2_key"] = selected_product_asset.get("r2_key", scene.get("product_asset_r2_key", ""))
                 scene["visual_file"] = os.path.basename(img_path)
                 return img_path
         except Exception as e:
@@ -6020,9 +6146,21 @@ def run_sales_pipeline(job_config, job_id):
 
     write_status(job_dir, job_id, "running", {"step": "sales_prepare_product_asset", "progress_pct": 5, "eta_sec": 80})
     product_assets = materialize_product_assets(job_config, ASSET_DIR)
-    product_asset = product_assets[0] if product_assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "index": 0}
+    product_asset = product_assets[0] if product_assets else {"path": "", "kind": "none", "mime_type": "", "name": "product_asset", "source": "none", "url": "", "r2_key": "", "size_bytes": 0, "index": 0}
+    write_status(job_dir, job_id, "running", {
+        "step": "sales_product_asset_ready",
+        "progress_pct": 8,
+        "eta_sec": 75,
+        "product_asset_count": len(product_assets),
+        "r2_asset_count": len([a for a in product_assets if a.get("r2_key") or str(a.get("source", "")).lower() == "r2"]),
+    })
     write_json(os.path.join(META_DIR, "product_assets.json"), [
-        ({k: v for k, v in a.items() if k != "path"} | {"has_path": bool(a.get("path")), "kind": a.get("kind")})
+        ({k: v for k, v in a.items() if k != "path"} | {
+            "has_path": bool(a.get("path")),
+            "kind": a.get("kind"),
+            "local_filename": os.path.basename(str(a.get("path") or "")),
+            "is_r2_asset": bool(a.get("r2_key") or str(a.get("source", "")).lower() == "r2"),
+        })
         for a in product_assets
     ])
 
