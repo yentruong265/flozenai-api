@@ -3614,7 +3614,11 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
         x = 0.5 + drift * math.sin(2 * math.pi * (0.35 * p + 0.10))
         y = 0.5 + drift * math.cos(2 * math.pi * (0.28 * p + 0.18))
 
-        frame = _crop_resized(base, scale=scale, x=x, y=y, out_w=width, out_h=height)
+        if int(height) > int(width):
+            # For vertical 9:16 non-sales videos, keep the contained frame stable to avoid over-zoom/cut-off.
+            frame = base.copy()
+        else:
+            frame = _crop_resized(base, scale=scale, x=x, y=y, out_w=width, out_h=height)
 
         if video_style and video_style.get("name") in {"cinematic_realistic", "dramatic_cinematic"}:
             h, w = frame.shape[:2]
@@ -3769,6 +3773,34 @@ def _wrap_overlay_text(text: str, max_chars_per_line: int = 28, max_lines: int =
     return "\n".join(lines[:max_lines]).strip()
 
 
+
+
+def _wrap_overlay_text_no_cut(text: str, max_chars_per_line: int = 26, max_lines: int = 9, max_chars_total: int = 520) -> str:
+    """Wrap sales overlay without the old short hard-cut.
+
+    This keeps the full scene overlay when possible and only truncates as a last
+    resort when the text would physically exceed the video frame.
+    """
+    text = sanitize_tts_text(text or "", max_chars=max_chars_total).strip()
+    if not text:
+        return ""
+    words = text.split()
+    lines, current = [], []
+    for w in words:
+        candidate = " ".join(current + [w])
+        if len(candidate) > max_chars_per_line and current:
+            lines.append(" ".join(current))
+            current = [w]
+        else:
+            current.append(w)
+    if current:
+        lines.append(" ".join(current))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        # Avoid mid-word ellipsis; this is a physical frame safety only.
+        lines[-1] = lines[-1].rstrip(" .,:;|-–") + "…"
+    return "\n".join(lines).strip()
+
 def _current_progressive_subtitle(text: str, t: float, duration: float) -> str:
     """Return the subtitle chunk that should be visible at time t."""
     units = _split_overlay_sentences(text)
@@ -3806,11 +3838,13 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
     duration = float(getattr(clip, "duration", 0) or 0)
 
     is_vertical = height > width
-    font_size = max(18, int(min(width, height) * (0.041 if is_vertical else 0.043)))
     if overlay_position == "sales_top":
-        max_chars = 26 if is_vertical else 42
-        max_lines = 5 if is_vertical else 4
+        # Smaller font + more lines for sales so full overlay text can fit near the top.
+        font_size = max(14, int(min(width, height) * (0.032 if is_vertical else 0.036)))
+        max_chars = 24 if is_vertical else 42
+        max_lines = 9 if is_vertical else 6
     else:
+        font_size = max(18, int(min(width, height) * (0.041 if is_vertical else 0.043)))
         max_chars = 22 if is_vertical else 34
         max_lines = 2
 
@@ -3823,8 +3857,13 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
 
     def make_frame(t):
         frame = clip.get_frame(t).astype(np.uint8)
-        current_text = _current_progressive_subtitle(text, t, duration)
-        overlay_text = _wrap_overlay_text(current_text, max_chars_per_line=max_chars, max_lines=max_lines)
+        if overlay_position == "sales_top":
+            # Sales videos: show the full scene overlay at the top, not only a tiny progressive chunk.
+            current_text = sanitize_tts_text(text, max_chars=520)
+            overlay_text = _wrap_overlay_text_no_cut(current_text, max_chars_per_line=max_chars, max_lines=max_lines, max_chars_total=520)
+        else:
+            current_text = _current_progressive_subtitle(text, t, duration)
+            overlay_text = _wrap_overlay_text(current_text, max_chars_per_line=max_chars, max_lines=max_lines)
         if not overlay_text:
             return frame
 
@@ -3849,8 +3888,9 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         # - Sales/product videos: TOP, so product CTA/banner can stay visible at the bottom.
         # - Entertainment/story videos: BOTTOM, like classic subtitles.
         if overlay_position in {"top", "sales_top"}:
-            top_margin = int(height * (0.035 if overlay_position == "sales_top" else (0.075 if is_vertical else 0.065)))
-            y = max(top_margin, int(font_size * 0.45))
+            # Sales overlay sits higher than normal top captions.
+            top_margin = int(height * (0.018 if overlay_position == "sales_top" else (0.075 if is_vertical else 0.065)))
+            y = max(top_margin, int(font_size * 0.30))
         else:
             bottom_margin = int(height * (0.105 if is_vertical else 0.085))
             y = height - text_h - bottom_margin
@@ -4973,7 +5013,7 @@ def _get_product_asset_payloads(job_config: Dict[str, Any]) -> List[Dict[str, An
         if key not in existing:
             out.append(legacy_payload)
 
-    return out[:8]
+    return out[:10]
 
 
 def _guess_ext_from_mime(mime_type: str, fallback: str = ".bin") -> str:
@@ -5126,9 +5166,11 @@ def _sales_dedupe_sentence_text(text: str) -> str:
 
 
 def _sales_make_overlay(text: str, fallback: str = "") -> str:
-    text = sanitize_tts_text(text or fallback, max_chars=70).strip()
+    # Sales overlay should keep the full planner caption when possible.
+    # Do not hard cut to 70 chars; the renderer wraps it across multiple top lines.
+    text = sanitize_tts_text(text or fallback, max_chars=360).strip()
     text = re.sub(r"\s+", " ", text)
-    return text[:70].strip(" .,:;|-–")
+    return text.strip(" .,:;|-–")
 
 
 
@@ -5505,7 +5547,9 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
         target_total = int(float(job_config.get("target_total_video_sec") or job_config.get("target_total_sec") or 30))
     except Exception:
         target_total = 30
-    max_scenes_by_duration = 4 if target_total <= 18 else (6 if target_total <= 30 else (8 if target_total <= 45 else 10))
+    base_max_scenes = 4 if target_total <= 18 else (6 if target_total <= 30 else (8 if target_total <= 45 else 10))
+    # If user uploaded many product images/videos, use more of them. Short sales scenes are acceptable.
+    max_scenes_by_duration = min(10, max(base_max_scenes, min(len(product_assets), 10)))
 
     planner_scenes = sales_script.get("scenes") or []
     if len(planner_scenes) > max_scenes_by_duration:
@@ -5535,7 +5579,7 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
 
         allow_scene_pexels = bool(wants_pexels and not selected_asset)
         voice_text = _sales_dedupe_sentence_text(sanitize_tts_text(item.get("voice_text", ""), max_chars=760))
-        overlay = sanitize_tts_text(item.get("text_overlay", ""), max_chars=260)
+        overlay = sanitize_tts_text(item.get("text_overlay", ""), max_chars=520)
         if not voice_text:
             continue
         if not overlay:
@@ -5572,6 +5616,47 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
     if not scenes:
         fallback = _fallback_sales_planner(job_config, product_assets=product_assets)
         return build_sales_scenes(_normalize_sales_plan(fallback, job_config), job_config, product_assets)
+
+    # Ensure uploaded product assets are actually used. If planner produced fewer scenes than assets,
+    # add short product-detail scenes before CTA, rotating through unused assets.
+    used_asset_indexes = {s.get("product_asset_index") for s in scenes if s.get("product_asset_index") is not None}
+    unused_assets = [a for a in product_assets if a.get("index") not in used_asset_indexes]
+    product_details = sales_script.get("detail_points") or sales_script.get("benefits") or []
+    product_details = [sanitize_tts_text(x, max_chars=160) for x in product_details if sanitize_tts_text(x, max_chars=160)]
+    product_name = sales_script.get("product_name", product)
+    cta_idx = next((i for i, s in enumerate(scenes) if str(s.get("scene_plan", {}).get("action", s.get("role", ""))).lower() == "cta"), len(scenes))
+    detail_counter = 0
+    while unused_assets and len(scenes) < max_scenes_by_duration:
+        asset = unused_assets.pop(0)
+        detail = product_details[detail_counter % len(product_details)] if product_details else "hình ảnh thật của sản phẩm"
+        detail_counter += 1
+        voice = f"Bạn có thể xem trực tiếp {product_name} qua hình ảnh sản phẩm thật này. {detail}."
+        overlay = f"{product_name} — {detail}"
+        new_scene = {
+            "scene_id": 0,
+            "voice_text": sanitize_tts_text(voice, max_chars=520),
+            "source_chunk": sanitize_tts_text(voice, max_chars=520),
+            "text_overlay": sanitize_tts_text(overlay, max_chars=520),
+            "visual_prompt": f"real uploaded product visual for {product_name}",
+            "stock_query": "",
+            "visual_source": "product_asset",
+            "prefer_product_asset": True,
+            "cta_banner": sales_script.get("cta_banner", ""),
+            "allow_pexels_fallback": False,
+            "product_asset_index": asset.get("index"),
+            "product_asset_path": asset.get("path"),
+            "product_asset_kind": asset.get("kind"),
+            "scene_plan": {
+                "main_subject": product_name,
+                "action": "uploaded_product_asset_showcase",
+                "location": "uploaded product visual",
+                "mood": "product detail showcase",
+            },
+            "planner_source": sales_script.get("planner_source", "openai_sales_planner") + "+asset_usage_guardrail",
+        }
+        insert_at = max(1, min(cta_idx, len(scenes)))
+        scenes.insert(insert_at, new_scene)
+        cta_idx += 1
 
     for i, s in enumerate(scenes, start=1):
         s["scene_id"] = i
