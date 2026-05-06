@@ -3839,10 +3839,11 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
 
     is_vertical = height > width
     if overlay_position == "sales_top":
-        # Smaller font + more lines for sales so full overlay text can fit near the top.
-        font_size = max(14, int(min(width, height) * (0.032 if is_vertical else 0.036)))
-        max_chars = 24 if is_vertical else 42
-        max_lines = 9 if is_vertical else 6
+        # Sales captions should follow the spoken script, not a tiny fixed hook.
+        # Keep them readable and slightly lower than the very top edge.
+        font_size = max(17, int(min(width, height) * (0.041 if is_vertical else 0.043)))
+        max_chars = 22 if is_vertical else 36
+        max_lines = 3 if is_vertical else 2
     else:
         font_size = max(18, int(min(width, height) * (0.041 if is_vertical else 0.043)))
         max_chars = 22 if is_vertical else 34
@@ -3858,9 +3859,10 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
     def make_frame(t):
         frame = clip.get_frame(t).astype(np.uint8)
         if overlay_position == "sales_top":
-            # Sales videos: show the full scene overlay at the top, not only a tiny progressive chunk.
-            current_text = sanitize_tts_text(text, max_chars=520)
-            overlay_text = _wrap_overlay_text_no_cut(current_text, max_chars_per_line=max_chars, max_lines=max_lines, max_chars_total=520)
+            # Sales videos: display the current spoken phrase progressively.
+            # This prevents the old issue where only a short overlay caption was shown.
+            current_text = _current_progressive_subtitle(text, t, duration)
+            overlay_text = _wrap_overlay_text(current_text, max_chars_per_line=max_chars, max_lines=max_lines)
         else:
             current_text = _current_progressive_subtitle(text, t, duration)
             overlay_text = _wrap_overlay_text(current_text, max_chars_per_line=max_chars, max_lines=max_lines)
@@ -3888,8 +3890,8 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         # - Sales/product videos: TOP, so product CTA/banner can stay visible at the bottom.
         # - Entertainment/story videos: BOTTOM, like classic subtitles.
         if overlay_position in {"top", "sales_top"}:
-            # Sales overlay sits higher than normal top captions.
-            top_margin = int(height * (0.018 if overlay_position == "sales_top" else (0.075 if is_vertical else 0.065)))
+            # Sales overlay is top-positioned but lowered a little for safe margins.
+            top_margin = int(height * (0.075 if overlay_position == "sales_top" else (0.075 if is_vertical else 0.065)))
             y = max(top_margin, int(font_size * 0.30))
         else:
             bottom_margin = int(height * (0.105 if is_vertical else 0.085))
@@ -5296,7 +5298,10 @@ def call_openai_sales_planner(job_config: Dict[str, Any], product_assets: List[D
         }
         for a in product_assets[:10]
     ]
-    target_scene_count = _sales_planner_scene_count(ctx["target_total_sec"])
+    # Let ChatGPT plan enough distinct scenes to use uploaded assets naturally,
+    # while still respecting short-form duration.
+    target_scene_count = max(_sales_planner_scene_count(ctx["target_total_sec"]), min(len(product_assets), 10))
+    target_scene_count = min(target_scene_count, 10)
     target_words = max(40, int(ctx["target_total_sec"] * float(os.getenv("SALES_TARGET_WORDS_PER_SEC", "2.55"))))
 
     system_prompt = (
@@ -5321,7 +5326,9 @@ def call_openai_sales_planner(job_config: Dict[str, Any], product_assets: List[D
             "scene_rules": [
                 "Mỗi scene có voice_text riêng, không trùng ý với scene trước.",
                 "voice_text phải là lời đọc tự nhiên, không phải bullet list.",
-                "text_overlay tối đa 8 từ, đặt phía trên video.",
+                "voice_text là script chính hiển thị theo từng đoạn trên video; viết tự nhiên, không lặp, không dùng câu máy móc.",
+                "text_overlay chỉ là caption ngắn phụ trợ; renderer sẽ ưu tiên hiển thị voice_text theo thời gian đọc ở phía trên video.",
+                "Nếu người dùng upload nhiều asset sản phẩm, hãy tạo đủ scene khác nhau để dùng các asset đó một cách tự nhiên, không lặp ý.",
                 "visual_prompt phải mô tả hình/video cần dùng cho scene, ưu tiên uploaded product asset.",
                 "Chỉ đề xuất pexels nếu scene cần lifestyle/pain context và thật sự phù hợp.",
                 "CTA cuối phải chứa: Mua ngay hôm nay + tên sản phẩm + tại + tên shop nếu có."
@@ -5626,18 +5633,19 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
     product_name = sales_script.get("product_name", product)
     cta_idx = next((i for i, s in enumerate(scenes) if str(s.get("scene_plan", {}).get("action", s.get("role", ""))).lower() == "cta"), len(scenes))
     detail_counter = 0
-    while unused_assets and len(scenes) < max_scenes_by_duration:
+    planner_expansions = [sanitize_tts_text(x, max_chars=520) for x in (sales_script.get("expansion_lines") or [])]
+    planner_expansions = [x for x in planner_expansions if x]
+    while unused_assets and len(scenes) < max_scenes_by_duration and planner_expansions:
         asset = unused_assets.pop(0)
-        detail = product_details[detail_counter % len(product_details)] if product_details else "hình ảnh thật của sản phẩm"
+        voice = planner_expansions[detail_counter % len(planner_expansions)]
         detail_counter += 1
-        voice = f"Bạn có thể xem trực tiếp {product_name} qua hình ảnh sản phẩm thật này. {detail}."
-        overlay = f"{product_name} — {detail}"
+        overlay = _sales_make_overlay(voice, sales_script.get("cta_banner", ""))
         new_scene = {
             "scene_id": 0,
-            "voice_text": sanitize_tts_text(voice, max_chars=520),
-            "source_chunk": sanitize_tts_text(voice, max_chars=520),
+            "voice_text": sanitize_tts_text(voice, max_chars=620),
+            "source_chunk": sanitize_tts_text(voice, max_chars=620),
             "text_overlay": sanitize_tts_text(overlay, max_chars=520),
-            "visual_prompt": f"real uploaded product visual for {product_name}",
+            "visual_prompt": sanitize_tts_text(f"uploaded product asset supporting this sales line: {voice}", max_chars=260),
             "stock_query": "",
             "visual_source": "product_asset",
             "prefer_product_asset": True,
@@ -5648,11 +5656,11 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
             "product_asset_kind": asset.get("kind"),
             "scene_plan": {
                 "main_subject": product_name,
-                "action": "uploaded_product_asset_showcase",
+                "action": "ai_planner_asset_support_scene",
                 "location": "uploaded product visual",
-                "mood": "product detail showcase",
+                "mood": "dynamic product advertisement",
             },
-            "planner_source": sales_script.get("planner_source", "openai_sales_planner") + "+asset_usage_guardrail",
+            "planner_source": sales_script.get("planner_source", "openai_sales_planner") + "+planner_expansion_asset_scene",
         }
         insert_at = max(1, min(cta_idx, len(scenes)))
         scenes.insert(insert_at, new_scene)
@@ -6101,7 +6109,9 @@ def run_sales_pipeline(job_config, job_id):
         else:
             vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         vclip = apply_visual_finish(vclip, video_style_preset)
-        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset, overlay_position="sales_top")
+        # Sales overlay should match the spoken narration. Use voice_text, not the short planner caption.
+        sales_overlay_source = scene.get("voice_text") or scene.get("text_overlay") or ""
+        vclip = add_pippit_text_overlay(vclip, sales_overlay_source, width, height, video_style_preset, overlay_position="sales_top")
         if _safe_bool(job_config.get("enable_sales_bottom_cta", True)):
             vclip = add_sales_bottom_cta_banner(vclip, scene.get("cta_banner") or sales_script.get("cta_banner") or "", width, height)
         audio_clip = AudioFileClip(audio_path)
