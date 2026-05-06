@@ -3558,6 +3558,16 @@ def get_scene_duration(audio_duration, scene_profile="standard", video_length_mo
 
 def _load_image_rgb(image_path, width, height):
     img = Image.open(image_path).convert("RGB")
+    # For 9:16 videos, avoid over-cropping / stretching by containing the image
+    # inside the target frame with a soft neutral background. This fixes vertical
+    # outputs where visuals previously looked oversized or outside the frame.
+    if int(height) > int(width):
+        bg = Image.new("RGB", (int(width), int(height)), (18, 21, 40))
+        img.thumbnail((int(width * 0.96), int(height * 0.96)), Image.Resampling.LANCZOS)
+        x = (int(width) - img.width) // 2
+        y = (int(height) - img.height) // 2
+        bg.paste(img, (x, y))
+        return np.array(bg)
     img = img.resize((width, height), Image.LANCZOS)
     return np.array(img)
 
@@ -3621,14 +3631,31 @@ def make_motion_clip(image_path, duration, width, height, scene_profile="gentle"
 
 
 def _resize_crop_frame_array(frame, out_w, out_h):
-    """Resize/crop BGR/RGB frame array to target size, return RGB uint8."""
+    """Resize frame to target size, return RGB uint8.
+
+    Vertical 9:16 output uses contain-fit instead of aggressive center-crop so
+    people/products do not overflow the frame. Landscape keeps crop-fit for a
+    full cinematic frame.
+    """
     if frame is None:
         return np.zeros((out_h, out_w, 3), dtype=np.uint8)
-    # OpenCV reads BGR; convert if needed by caller before or here.
     if frame.ndim == 3 and frame.shape[2] == 3:
-        # Most frames from cv2 are BGR. Convert to RGB.
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
     h, w = frame.shape[:2]
+    if int(out_h) > int(out_w):
+        # Contain-fit for 9:16. Prevents over-zoom/cut-off from stock/product videos.
+        scale = min(out_w / max(w, 1), out_h / max(h, 1))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        canvas[:, :] = (18, 21, 40)
+        x = (out_w - new_w) // 2
+        y = (out_h - new_h) // 2
+        canvas[y:y + new_h, x:x + new_w] = resized
+        return canvas.astype(np.uint8)
+
     target_ratio = out_w / max(out_h, 1)
     src_ratio = w / max(h, 1)
     if src_ratio > target_ratio:
@@ -3764,7 +3791,7 @@ def _current_progressive_subtitle(text: str, t: float, duration: float) -> str:
 
 def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_style_preset: str = "", overlay_position: str = "bottom"):
     overlay_position = str(overlay_position or "bottom").strip().lower()
-    if overlay_position not in {"top", "bottom"}:
+    if overlay_position not in {"top", "bottom", "sales_top"}:
         overlay_position = "bottom"
     """Draw progressive subtitles: only current sentence/chunk, no background box.
 
@@ -3779,9 +3806,13 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
     duration = float(getattr(clip, "duration", 0) or 0)
 
     is_vertical = height > width
-    font_size = max(18, int(min(width, height) * (0.044 if is_vertical else 0.045)))
-    max_chars = 22 if is_vertical else 34
-    max_lines = 2
+    font_size = max(18, int(min(width, height) * (0.041 if is_vertical else 0.043)))
+    if overlay_position == "sales_top":
+        max_chars = 26 if is_vertical else 42
+        max_lines = 5 if is_vertical else 4
+    else:
+        max_chars = 22 if is_vertical else 34
+        max_lines = 2
 
     try:
         from PIL import ImageDraw, ImageFont
@@ -3817,9 +3848,9 @@ def add_pippit_text_overlay(clip, text: str, width: int, height: int, video_styl
         # Overlay position rule:
         # - Sales/product videos: TOP, so product CTA/banner can stay visible at the bottom.
         # - Entertainment/story videos: BOTTOM, like classic subtitles.
-        if overlay_position == "top":
-            top_margin = int(height * (0.075 if is_vertical else 0.065))
-            y = max(top_margin, int(font_size * 0.7))
+        if overlay_position in {"top", "sales_top"}:
+            top_margin = int(height * (0.035 if overlay_position == "sales_top" else (0.075 if is_vertical else 0.065)))
+            y = max(top_margin, int(font_size * 0.45))
         else:
             bottom_margin = int(height * (0.105 if is_vertical else 0.085))
             y = height - text_h - bottom_margin
@@ -5016,7 +5047,7 @@ def materialize_product_assets(job_config: Dict[str, Any], asset_dir: str) -> Li
         asset = _materialize_one_product_asset(payload, asset_dir, idx)
         if asset.get("path") and os.path.exists(str(asset.get("path"))) and asset.get("kind") in {"image", "video"}:
             assets.append(asset)
-    return assets[:8]
+    return assets[:10]
 
 
 def materialize_product_asset(job_config: Dict[str, Any], asset_dir: str) -> Dict[str, Any]:
@@ -5221,7 +5252,7 @@ def call_openai_sales_planner(job_config: Dict[str, Any], product_assets: List[D
             "name": a.get("name"),
             "mime_type": a.get("mime_type"),
         }
-        for a in product_assets[:8]
+        for a in product_assets[:10]
     ]
     target_scene_count = _sales_planner_scene_count(ctx["target_total_sec"])
     target_words = max(40, int(ctx["target_total_sec"] * float(os.getenv("SALES_TARGET_WORDS_PER_SEC", "2.55"))))
@@ -5504,7 +5535,7 @@ def build_sales_scenes(sales_script: Dict[str, Any], job_config: Dict[str, Any],
 
         allow_scene_pexels = bool(wants_pexels and not selected_asset)
         voice_text = _sales_dedupe_sentence_text(sanitize_tts_text(item.get("voice_text", ""), max_chars=760))
-        overlay = sanitize_tts_text(item.get("text_overlay", ""), max_chars=70)
+        overlay = sanitize_tts_text(item.get("text_overlay", ""), max_chars=260)
         if not voice_text:
             continue
         if not overlay:
@@ -5985,7 +6016,7 @@ def run_sales_pipeline(job_config, job_id):
         else:
             vclip = make_motion_clip(img_path, duration, width, height, scene_profile="standard", fps=fps, video_style=video_style)
         vclip = apply_visual_finish(vclip, video_style_preset)
-        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset, overlay_position="top")
+        vclip = add_pippit_text_overlay(vclip, scene.get("text_overlay") or "", width, height, video_style_preset, overlay_position="sales_top")
         if _safe_bool(job_config.get("enable_sales_bottom_cta", True)):
             vclip = add_sales_bottom_cta_banner(vclip, scene.get("cta_banner") or sales_script.get("cta_banner") or "", width, height)
         audio_clip = AudioFileClip(audio_path)
