@@ -1658,6 +1658,200 @@ def _warm_story_ai_image_score(scene_obj: Dict[str, Any], idx: int, total: int) 
 
     return score
 
+
+
+# ===== Warm Story fixed rule routing (no scoring) =====
+def _warm_story_join_scene_text(scene_obj: Dict[str, Any]) -> str:
+    """Compact text used for deterministic Warm Story routing."""
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+
+    def _val(name: str) -> str:
+        v = scene_plan.get(name, "")
+        if isinstance(v, list):
+            return " ".join(str(x) for x in v)
+        return str(v or "")
+
+    parts = [
+        str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or ""),
+        _val("main_subject"),
+        _val("subject"),
+        _val("action"),
+        _val("location"),
+        _val("background"),
+        _val("emotion"),
+        _val("mood"),
+        _val("time_of_day"),
+        _val("details"),
+        _val("must_show"),
+    ]
+    return " ".join(parts).lower()
+
+
+def _warm_story_main_subject_text(scene_obj: Dict[str, Any]) -> str:
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    subject = str(scene_plan.get("main_subject", "") or scene_plan.get("subject", "") or "").strip().lower()
+    return subject
+
+
+def _warm_story_has_environment_or_object(scene_obj: Dict[str, Any]) -> bool:
+    """Priority Pexels #1: landscape / background / object-focused scenes."""
+    txt = _warm_story_join_scene_text(scene_obj)
+    subject = _warm_story_main_subject_text(scene_obj)
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    location = str(scene_plan.get("location", "") or "").strip().lower()
+
+    environment_terms = {
+        "landscape", "scenery", "nature", "forest", "mountain", "river", "stream", "lake", "sea", "ocean",
+        "sunrise", "sunset", "sky", "cloud", "rain", "mist", "fog", "temple", "pagoda", "monastery",
+        "village", "road", "path", "garden", "field", "home", "room", "window", "door", "street",
+        "cảnh quan", "khung cảnh", "phong cảnh", "thiên nhiên", "rừng", "núi", "suối", "sông", "hồ",
+        "biển", "bầu trời", "mây", "mưa", "sương", "chùa", "thiền viện", "làng", "con đường",
+        "lối đi", "khu vườn", "cánh đồng", "ngôi nhà", "căn phòng", "cửa sổ", "đường phố",
+    }
+    object_terms = {
+        "object", "thing", "item", "book", "bowl", "cup", "tea", "flower", "lotus", "candle", "lamp",
+        "table", "chair", "door", "window", "bag", "cloth", "water jar", "jar", "bottle", "basket",
+        "đồ vật", "vật dụng", "quyển sách", "sách", "bát", "chén", "tách trà", "trà", "hoa",
+        "hoa sen", "nến", "đèn", "bàn", "ghế", "cửa", "cửa sổ", "túi", "túi vải", "bình nước",
+        "chiếc bình", "cái bình", "giỏ", "gậy", "đòn gánh",
+    }
+
+    # Strong subject/location signal is enough; this avoids slow scoring and keeps behavior predictable.
+    if _has_any_term(subject, environment_terms | object_terms):
+        return True
+    if _has_any_term(location, environment_terms):
+        return True
+    if _has_any_term(txt, environment_terms | object_terms):
+        # Avoid routing to Pexels if the scene is clearly about a single character doing/emoting.
+        people_count = estimate_visible_people_count(scene_plan, scene_obj.get("voice_text") or scene_obj.get("source_chunk") or "")
+        if people_count == 0:
+            return True
+        # If location/object dominates and there is no explicit strong action, Pexels is safer/faster.
+        action = str(scene_plan.get("action", "") or "").lower()
+        if not _has_any_term(action, {"cry", "smile", "kneel", "pray", "run", "walk", "carry", "hold", "nhìn", "khóc", "cười", "quỳ", "cầu nguyện", "chạy", "đi", "gánh", "cầm"}):
+            return True
+    return False
+
+
+def _warm_story_is_crowd_or_unclear(scene_obj: Dict[str, Any]) -> bool:
+    """Priority Pexels #3: crowd / multi-person / unclear main character."""
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = scene_obj.get("voice_text") or scene_obj.get("source_chunk") or ""
+    people_count = estimate_visible_people_count(scene_plan, narration)
+    subject = _warm_story_main_subject_text(scene_obj)
+    txt = _warm_story_join_scene_text(scene_obj)
+
+    if people_count >= 2:
+        return True
+
+    vague_subjects = {
+        "", "people", "person", "someone", "crowd", "group", "group of people", "villagers", "children",
+        "mọi người", "nhiều người", "nhóm người", "đám đông", "người dân", "dân làng", "những người",
+        "người", "ai đó", "nhân vật", "các nhân vật", "trẻ em", "các em nhỏ",
+    }
+    if subject in vague_subjects:
+        return True
+
+    crowd_terms = {"crowd", "group of people", "many people", "villagers", "children", "family", "monks", "đám đông", "nhóm người", "nhiều người", "dân làng", "gia đình", "các nhà sư", "trẻ em"}
+    return _has_any_term(txt, crowd_terms)
+
+
+def _warm_story_is_special_ai(scene_obj: Dict[str, Any]) -> bool:
+    """Priority AI #5: Buddha / ancient / specific spiritual or hard-to-find scenes."""
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = scene_obj.get("voice_text") or scene_obj.get("source_chunk") or ""
+    txt = _warm_story_join_scene_text(scene_obj)
+    if scene_requires_ai(narration, scene_plan, scene_obj.get("video_style_preset", "")):
+        return True
+    special_terms = {
+        "buddha", "bodhisattva", "deity", "ancient", "myth", "legend", "dragon", "heaven", "hell",
+        "spiritual vision", "surreal", "magic", "miracle", "symbolic", "monk in ancient robe",
+        "đức phật", "phật", "bồ tát", "quán thế âm", "thần", "cổ trang", "cổ xưa", "truyền thuyết",
+        "rồng", "thiên đường", "địa ngục", "phép màu", "huyền bí", "tâm linh", "ánh sáng huyền diệu",
+        "thiền sư cổ", "nhà sư cổ", "chú tiểu cổ",
+    }
+    return _has_any_term(txt, special_terms)
+
+
+def _warm_story_is_clear_main_character_action_or_emotion(scene_obj: Dict[str, Any]) -> bool:
+    """Priority AI #4: one clear main character doing or feeling something."""
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = scene_obj.get("voice_text") or scene_obj.get("source_chunk") or ""
+    people_count = estimate_visible_people_count(scene_plan, narration)
+    if people_count != 1:
+        return False
+
+    subject = _warm_story_main_subject_text(scene_obj)
+    if not subject or subject in {"person", "people", "someone", "người", "ai đó", "nhân vật"}:
+        return False
+
+    action = str(scene_plan.get("action", "") or "").lower()
+    emotion = str(scene_plan.get("emotion", "") or scene_plan.get("mood", "") or "").lower()
+    txt = _warm_story_join_scene_text(scene_obj)
+
+    action_terms = {
+        "walk", "run", "sit", "stand", "kneel", "pray", "bow", "carry", "hold", "give", "receive",
+        "look", "smile", "cry", "think", "listen", "speak", "drink", "eat", "open", "close",
+        "đi", "bước", "chạy", "ngồi", "đứng", "quỳ", "cầu nguyện", "cúi đầu", "gánh", "cầm",
+        "trao", "nhận", "nhìn", "mỉm cười", "khóc", "suy nghĩ", "lắng nghe", "nói", "uống", "ăn", "mở", "đóng",
+    }
+    emotion_terms = {
+        "sad", "happy", "peaceful", "calm", "angry", "afraid", "surprised", "regret", "compassion",
+        "lonely", "hopeful", "grateful", "touched", "emotional",
+        "buồn", "vui", "bình yên", "an yên", "tức giận", "sợ", "ngạc nhiên", "hối hận", "từ bi",
+        "cô đơn", "hy vọng", "biết ơn", "xúc động", "cảm động", "rơi nước mắt",
+    }
+    return _has_any_term(action, action_terms) or _has_any_term(emotion, emotion_terms) or _has_any_term(txt, action_terms | emotion_terms)
+
+
+def _warm_story_is_ending_emotional(scene_obj: Dict[str, Any], idx: int, total: int) -> bool:
+    """Priority AI #6: emotional ending scene."""
+    if total <= 0 or idx != total - 1:
+        return False
+    txt = _warm_story_join_scene_text(scene_obj)
+    ending_terms = {
+        "lesson", "realize", "understand", "awakening", "forgive", "gratitude", "tears", "smile", "peace",
+        "bài học", "nhận ra", "hiểu ra", "giác ngộ", "tha thứ", "biết ơn", "nước mắt", "mỉm cười", "bình an", "bình yên", "ánh sáng",
+    }
+    # Ending without a visible clear character can still be Pexels if it is only landscape/object/abstract.
+    return _has_any_term(txt, ending_terms) and not _warm_story_is_crowd_or_unclear(scene_obj)
+
+
+def _warm_story_route_by_fixed_rules(scene_obj: Dict[str, Any], idx: int, total: int) -> Dict[str, Any]:
+    """Deterministic Warm Story routing; no score functions, no ranking math.
+
+    User-approved priority:
+    Pexels image:
+      1) scenery/background/object
+      2) abstract ideas
+      3) crowd / unclear main character
+    AI image:
+      4) one clear main character acting or emoting
+      5) Buddha / ancient / very specific spiritual scene
+      6) emotional ending
+    """
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = scene_obj.get("voice_text") or scene_obj.get("source_chunk") or ""
+
+    # Pexels priorities first to save time/cost.
+    if _warm_story_has_environment_or_object(scene_obj):
+        return {"route": "pexels_image", "reason": "warm_story_rule_1_pexels_landscape_background_object"}
+    if scene_is_abstract(narration, scene_plan):
+        return {"route": "pexels_image", "reason": "warm_story_rule_2_pexels_abstract_symbolic"}
+    if _warm_story_is_crowd_or_unclear(scene_obj):
+        return {"route": "pexels_image", "reason": "warm_story_rule_3_pexels_crowd_or_unclear_main_subject"}
+
+    # AI priorities.
+    if _warm_story_is_clear_main_character_action_or_emotion(scene_obj):
+        return {"route": "ai", "reason": "warm_story_rule_4_ai_clear_main_character_action_or_emotion"}
+    if _warm_story_is_special_ai(scene_obj):
+        return {"route": "ai", "reason": "warm_story_rule_5_ai_buddha_ancient_spiritual_specific"}
+    if _warm_story_is_ending_emotional(scene_obj, idx, total):
+        return {"route": "ai", "reason": "warm_story_rule_6_ai_emotional_ending"}
+
+    # Safe default: Pexels image. It is faster and avoids unnecessary SDXL calls.
+    return {"route": "pexels_image", "reason": "warm_story_default_pexels_for_speed_cost"}
+
 def _target_count(total: int, ratio: float) -> int:
     if total <= 0:
         return 0
@@ -1682,33 +1876,46 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     is_warm = is_warm_story_style(style)
 
     pexels_image_indexes = set()
+    warm_story_route_info = {}
     target_pexels_count = 0
 
     if is_warm:
         total = len(scene_objects)
+        # Fixed-rule routing: no score functions, no expensive ranking logic.
+        # Default target remains close to the approved 55% AI / 45% Pexels image budget,
+        # but the rule result is respected first so the decision is predictable and fast.
         try:
             pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.45")))
         except Exception:
             pexels_ratio = 0.45
-        # User-approved Warm Story budget: 55% AI image + 45% Pexels/local stock image.
         pexels_ratio = max(0.0, min(0.80, pexels_ratio))
         target_pexels_count = _target_count(total, pexels_ratio)
 
-        # Select the 45% Pexels-image bucket by rule:
-        # - 2+ visible people first
-        # - nature/temple/road/sky/village/environment next
-        # - avoid taking scenes that are clearly AI-important unless needed for ratio.
-        ranked = []
+        pexels_rule_indexes = []
+        ai_rule_indexes = []
         for idx, scene in enumerate(scene_objects):
-            pexels_score = _warm_story_pexels_image_score(scene, idx, total)
-            ai_score = _warm_story_ai_image_score(scene, idx, total)
-            # High positive value = better Pexels candidate.
-            row = (pexels_score - ai_score, pexels_score, -ai_score, -idx, idx)
-            ranked.append(row)
+            info = _warm_story_route_by_fixed_rules(scene, idx, total)
+            warm_story_route_info[idx] = info
+            if info.get("route") == "pexels_image":
+                pexels_rule_indexes.append(idx)
+            else:
+                ai_rule_indexes.append(idx)
 
-        ranked.sort(reverse=True)
-        selected = [idx for *_rest, idx in ranked[:target_pexels_count]]
+        # Keep Pexels bucket close to 45%, but do not call scoring.
+        # If rule-based Pexels candidates exceed target, take the earliest candidates.
+        # If fewer than target, fill from the tail of AI-rule scenes only when needed.
+        selected = list(pexels_rule_indexes[:target_pexels_count])
+        if len(selected) < target_pexels_count:
+            needed = target_pexels_count - len(selected)
+            # Fill from less-critical AI scenes first. Keep final emotional/special scenes later in the list as AI when possible.
+            selected.extend(ai_rule_indexes[:needed])
         pexels_image_indexes = set(selected)
+
+        for idx in pexels_image_indexes:
+            warm_story_route_info.setdefault(idx, {})["route"] = "pexels_image"
+            warm_story_route_info[idx]["ratio_adjusted"] = True
+        for idx in range(total):
+            warm_story_route_info.setdefault(idx, {"route": "ai", "reason": "warm_story_ratio_fill_ai"})
 
     for idx, s in enumerate(scene_objects):
         scene_plan = s.get("scene_plan", {}) or {}
@@ -1744,10 +1951,12 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 s["force_no_ai_fallback"] = True
                 s["warm_story_stock_kind"] = "pexels_image_only_locked_45pct"
                 s["ai_fallback_allowed"] = False
-                # Pexels-selected scenes must still get a Pexels image. Keep the gate soft;
-                # scene choice already happened through _warm_story_pexels_image_score().
+                # Pexels-selected scenes must still get a Pexels image. Keep the gate soft.
                 s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.0"))
-                s["routing_reason"] = "warm_storybook_locked_45pct_pexels_image_no_video_no_ai_fallback_multi_person_priority"
+                route_info = warm_story_route_info.get(idx, {})
+                s["routing_reason"] = route_info.get("reason", "warm_story_fixed_rule_pexels_image_no_video_no_ai_fallback")
+                if route_info.get("ratio_adjusted"):
+                    s["routing_reason"] += "_ratio_adjusted"
             else:
                 # AI image only. This is the 55% majority route.
                 s["visual_source"] = "ai"
@@ -1758,7 +1967,8 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 s["force_image_only"] = True
                 s["warm_story_stock_kind"] = "ai_image_primary"
                 s["ai_fallback_allowed"] = True
-                s["routing_reason"] = "warm_storybook_55pct_ai_image_primary"
+                route_info = warm_story_route_info.get(idx, {})
+                s["routing_reason"] = route_info.get("reason", "warm_story_fixed_rule_ai_image_primary")
         else:
             # Keep existing non-Warm behavior unchanged.
             s["visual_source"] = "stock"
