@@ -4617,8 +4617,18 @@ def run_job(job_config, job_id):
         raise RuntimeError(f"Full narration TTS output missing or empty: {full_audio_raw_path}")
 
     # Apply one consistent speed factor to the whole narration track.
-    # This keeps the entire voice rhythm uniform, unlike per-scene speed-up.
-    speech_speed = _clamp_float(job_config.get("speech_speed"), 1.18, min_value=0.85, max_value=1.35)
+    # ENTERTAINMENT/TEXT_TO_VIDEO RULE:
+    # Do NOT inherit fast sales-video speech_speed here. Sales can be fast,
+    # but entertainment/story videos must keep natural narration so scene/text
+    # overlays do not move ahead of the spoken voice.
+    # Use ENTERTAINMENT_SPEECH_SPEED only if you intentionally want a tiny global adjustment.
+    entertainment_speed_default = os.getenv("ENTERTAINMENT_SPEECH_SPEED", "1.0")
+    speech_speed = _clamp_float(
+        job_config.get("entertainment_speech_speed", entertainment_speed_default),
+        1.0,
+        min_value=0.85,
+        max_value=1.08,
+    )
     full_audio_path = speed_up_audio_ffmpeg(full_audio_raw_path, speech_speed)
 
     full_audio_clip = AudioFileClip(full_audio_path)
@@ -4640,8 +4650,15 @@ def run_job(job_config, job_id):
             voice_text = sanitize_tts_text(story_text, max_chars=900)
         word_count = max(1, len(voice_text.split()))
         char_count = max(1, len(voice_text))
-        # Blend word and character counts so Vietnamese/English allocation is more stable.
-        weight = max(1.0, (word_count * 1.0) + (char_count / 28.0))
+        # Entertainment timeline guardrail:
+        # Single full narration has no exact word-level timestamps, so scene timing must be
+        # estimated conservatively from the same voice_text used for narration.
+        # Weight punctuation/pauses as extra speaking time so visual scenes do not change
+        # too early while the voice is still finishing the sentence.
+        sentence_pause_count = len(re.findall(r"[\.\!\?…]", voice_text))
+        soft_pause_count = len(re.findall(r"[,;:：]", voice_text))
+        pause_weight = (sentence_pause_count * 2.2) + (soft_pause_count * 0.8)
+        weight = max(1.0, (word_count * 1.0) + (char_count / 34.0) + pause_weight)
         scene_weights.append(weight)
         scene_text_log.append({
             "scene_id": int(scene.get("scene_id", idx)),
@@ -4748,8 +4765,17 @@ def run_job(job_config, job_id):
         vclip = apply_visual_finish(vclip, video_style_preset)
 
         # Lightweight Pippit-like caption layer. Can be disabled by setting enable_text_overlay=False.
+        # ENTERTAINMENT/TEXT_TO_VIDEO RULE:
+        # Overlay must follow the spoken narration, not a short planner caption/hook.
+        # This prevents text from appearing/ending before the voice is speaking it.
         if _safe_bool(job_config.get("enable_text_overlay"), True):
-            overlay_text = str(scene.get("text_overlay") or scene.get("hook_text") or scene.get("voice_text") or "")
+            overlay_text = str(
+                scene.get("voice_text")
+                or scene.get("source_chunk")
+                or scene.get("text_overlay")
+                or scene.get("hook_text")
+                or ""
+            )
             vclip = add_pippit_text_overlay(vclip, overlay_text, width, height, video_style_preset)
 
         if idx < total_scenes:
