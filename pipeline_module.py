@@ -4622,12 +4622,12 @@ def run_job(job_config, job_id):
     # but entertainment/story videos must keep natural narration so scene/text
     # overlays do not move ahead of the spoken voice.
     # Use ENTERTAINMENT_SPEECH_SPEED only if you intentionally want a tiny global adjustment.
-    entertainment_speed_default = os.getenv("ENTERTAINMENT_SPEECH_SPEED", "1.0")
+    entertainment_speed_default = os.getenv("ENTERTAINMENT_SPEECH_SPEED", "1.10")
     speech_speed = _clamp_float(
         job_config.get("entertainment_speech_speed", entertainment_speed_default),
-        1.0,
-        min_value=0.85,
-        max_value=1.08,
+        1.10,
+        min_value=0.90,
+        max_value=1.12,
     )
     full_audio_path = speed_up_audio_ffmpeg(full_audio_raw_path, speech_speed)
 
