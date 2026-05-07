@@ -7,7 +7,6 @@
 import os
 import torch
 from pathlib import Path
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
 DRIVE_ROOT = os.getenv("JOB_ROOT", "/tmp/easyai_jobs")
 PENDING_DIR = os.path.join(DRIVE_ROOT, "pending")
@@ -558,6 +557,10 @@ def _get_num_inference_steps(width: int, height: int, steps: int) -> int:
 
 
 def load_image_pipe(force_reload: bool = False):
+    # Lazy import diffusers only when an AI image is actually needed.
+    # Non-Warm / stock-only jobs should never pay the import/model-load cost.
+    from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+
     global _IMAGE_PIPE, _IMAGE_ACCELERATION_APPLIED
 
     if _IMAGE_PIPE is not None and not force_reload:
@@ -1594,6 +1597,67 @@ def _warm_story_pexels_image_score(scene_obj: Dict[str, Any], idx: int, total: i
 
     return score
 
+
+def _warm_story_ai_image_score(scene_obj: Dict[str, Any], idx: int, total: int) -> float:
+    """Score Warm Story scenes that deserve AI image generation.
+
+    User-approved rule:
+    - AI: Buddha/ancient/symbolic/spiritual hard-to-find scenes, emotional ending,
+      one clear main character, abstract moral concepts when symbolic stock is weak.
+    - Pexels image: 2+ visible people, nature/temple/road/sky/village/environment scenes.
+    """
+    scene_plan = scene_obj.get("scene_plan", {}) or {}
+    narration = str(scene_obj.get("voice_text", "") or scene_obj.get("source_chunk", "") or "")
+    people_count = estimate_visible_people_count(scene_plan, narration)
+    txt = " ".join([
+        narration,
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+        str(scene_plan.get("background", "") or ""),
+        " ".join([str(x) for x in (scene_plan.get("details", []) or [])]),
+        " ".join([str(x) for x in (scene_plan.get("must_show", []) or [])]),
+    ]).lower()
+
+    score = 0.0
+
+    # Hard-to-find spiritual / ancient / symbolic scenes are the strongest AI candidates.
+    if scene_requires_ai(narration, scene_plan, scene_obj.get("video_style_preset", "")):
+        score += 100.0
+    if _has_any_term(txt, {
+        "buddha", "đức phật", "phật", "bodhisattva", "ancient", "cổ trang", "thần", "deity",
+        "myth", "legend", "dragon", "rồng", "heaven", "hell", "thiên đường", "địa ngục",
+        "surreal", "symbolic", "biểu tượng", "spiritual vision", "ánh sáng huyền diệu"
+    }):
+        score += 35.0
+
+    # Emotional ending usually benefits from a coherent AI story image.
+    if idx == total - 1:
+        score += 18.0
+
+    # One clear main character is a reasonable AI target for story continuity.
+    if people_count == 1:
+        score += 12.0
+
+    # Abstract moral concepts may be better as symbolic AI unless routed to stock symbolic.
+    if scene_is_abstract(narration, scene_plan):
+        score += 8.0
+
+    # Multi-person scenes are intentionally bad AI candidates.
+    if people_count >= 2:
+        score -= 80.0
+
+    # Nature/temple/village/road/sky establishing shots are often better as Pexels image.
+    if _has_any_term(txt, {
+        "nature", "forest", "mountain", "river", "stream", "sunrise", "sunset", "sky", "cloud",
+        "temple", "pagoda", "monastery", "village", "road", "path", "garden", "field",
+        "thiên nhiên", "rừng", "núi", "suối", "sông", "bầu trời", "mây", "chùa", "thiền viện",
+        "làng", "con đường", "lối đi", "khu vườn", "cánh đồng"
+    }):
+        score -= 10.0
+
+    return score
+
 def _target_count(total: int, ratio: float) -> int:
     if total <= 0:
         return 0
@@ -1606,7 +1670,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
 
     STRICT WARM STORY RULE:
     - Warm Story / warm_storybook uses IMAGE ONLY: no Pexels video, no local stock video.
-    - Target route ratio: 60% AI images + 40% Pexels/local stock images.
+    - Target route ratio: 55% AI images + 45% Pexels/local stock images.
     - Scenes with 2+ visible people are selected for Pexels image FIRST.
     - Non-Warm styles keep their existing stock/video behavior.
     - Non-Warm styles must NOT call SDXL/AI from this routing layer.
@@ -1623,39 +1687,28 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
     if is_warm:
         total = len(scene_objects)
         try:
-            pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.40")))
+            pexels_ratio = float(job_config.get("warm_story_pexels_image_ratio", os.getenv("WARM_STORY_PEXELS_IMAGE_RATIO", "0.45")))
         except Exception:
-            pexels_ratio = 0.40
-        # Keep it close to the requested 40%, but allow small rounding for short videos.
-        pexels_ratio = 0.40
+            pexels_ratio = 0.45
+        # User-approved Warm Story budget: 55% AI image + 45% Pexels/local stock image.
+        pexels_ratio = max(0.0, min(0.80, pexels_ratio))
         target_pexels_count = _target_count(total, pexels_ratio)
 
-        # 1) Select all 2+ people scenes first, up to the 40% target.
-        multi_people = []
-        others = []
+        # Select the 45% Pexels-image bucket by rule:
+        # - 2+ visible people first
+        # - nature/temple/road/sky/village/environment next
+        # - avoid taking scenes that are clearly AI-important unless needed for ratio.
+        ranked = []
         for idx, scene in enumerate(scene_objects):
-            scene_plan = scene.get("scene_plan", {}) or {}
-            narration = scene.get("voice_text") or scene.get("source_chunk") or ""
-            people_count = estimate_visible_people_count(scene_plan, narration)
-            score = _warm_story_pexels_image_score(scene, idx, total)
-            row = (score, -idx, idx)
-            if people_count >= 2:
-                multi_people.append(row)
-            else:
-                others.append(row)
+            pexels_score = _warm_story_pexels_image_score(scene, idx, total)
+            ai_score = _warm_story_ai_image_score(scene, idx, total)
+            # High positive value = better Pexels candidate.
+            row = (pexels_score - ai_score, pexels_score, -ai_score, -idx, idx)
+            ranked.append(row)
 
-        multi_people.sort(reverse=True)
-        others.sort(reverse=True)
-
-        selected = []
-        for _, _, idx in multi_people:
-            if len(selected) < target_pexels_count:
-                selected.append(idx)
-        for _, _, idx in others:
-            if len(selected) < target_pexels_count:
-                selected.append(idx)
-
-        pexels_image_indexes = set(selected[:target_pexels_count])
+        ranked.sort(reverse=True)
+        selected = [idx for *_rest, idx in ranked[:target_pexels_count]]
+        pexels_image_indexes = set(selected)
 
     for idx, s in enumerate(scene_objects):
         scene_plan = s.get("scene_plan", {}) or {}
@@ -1681,7 +1734,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 # - no Pexels video
                 # - no local stock video
                 # - no AI fallback
-                # This preserves the requested final ratio: top 40% scenes are Pexels image.
+                # This preserves the requested final ratio: about 45% scenes are Pexels image.
                 s["visual_source"] = "pexels_image"
                 s["visual_asset_type"] = "image"
                 s["stock_asset_type"] = "image"
@@ -1689,14 +1742,14 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 s["force_pexels_image_only"] = True
                 s["force_image_only"] = True
                 s["force_no_ai_fallback"] = True
-                s["warm_story_stock_kind"] = "pexels_image_only_locked_40pct"
+                s["warm_story_stock_kind"] = "pexels_image_only_locked_45pct"
                 s["ai_fallback_allowed"] = False
                 # Pexels-selected scenes must still get a Pexels image. Keep the gate soft;
                 # scene choice already happened through _warm_story_pexels_image_score().
                 s["stock_min_match_score"] = float(os.getenv("WARM_STORY_PEXELS_IMAGE_MIN_MATCH", "0.0"))
-                s["routing_reason"] = "warm_storybook_locked_40pct_pexels_image_no_video_no_ai_fallback_multi_person_priority"
+                s["routing_reason"] = "warm_storybook_locked_45pct_pexels_image_no_video_no_ai_fallback_multi_person_priority"
             else:
-                # AI image only. This is the 60% majority route.
+                # AI image only. This is the 55% majority route.
                 s["visual_source"] = "ai"
                 s["visual_asset_type"] = "image"
                 s["stock_asset_type"] = "none"
@@ -1705,7 +1758,7 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
                 s["force_image_only"] = True
                 s["warm_story_stock_kind"] = "ai_image_primary"
                 s["ai_fallback_allowed"] = True
-                s["routing_reason"] = "warm_storybook_60pct_ai_image_primary"
+                s["routing_reason"] = "warm_storybook_55pct_ai_image_primary"
         else:
             # Keep existing non-Warm behavior unchanged.
             s["visual_source"] = "stock"
@@ -1728,9 +1781,10 @@ def enforce_frontend_style_visual_budget(scene_objects: List[Dict[str, Any]], vi
         routed_ai = sum(1 for x in scene_objects if x.get("visual_source") == "ai")
         for x in scene_objects:
             x["warm_story_ratio_summary"] = {
-                "target": "60pct_ai_40pct_pexels_image_no_video",
+                "target": "55pct_ai_45pct_pexels_image_no_video",
                 "total_scenes": total,
                 "target_pexels_image_scenes": target_pexels_count,
+                "target_ai_image_scenes": total - target_pexels_count,
                 "ai_image_scenes": routed_ai,
                 "pexels_image_scenes": routed_pexels,
             }
@@ -1788,7 +1842,7 @@ def decide_image_source(narration: str, scene_plan: Dict[str, Any], video_style_
     """
     Initial style-based source decision.
 
-    Warm Story final 60% AI / 40% Pexels-image routing is applied later by
+    Warm Story final 55% AI / 45% Pexels-image routing is applied later by
     enforce_frontend_style_visual_budget(). Here we keep warm_storybook as AI by default
     so that non-selected Pexels scenes still get the strongest visual matching.
     """
@@ -1910,78 +1964,96 @@ def scene_stock_friendly(narration: str, scene_plan: Dict[str, Any], video_style
 
 
 def build_stock_query(narration: str, scene_plan: Dict[str, Any], is_vertical: bool = False) -> str:
-    """Build a practical Pippit-style stock search query.
+    """Build a short, practical Pexels/local-stock search query.
 
-    Principle:
-    - Do NOT hard-code specific stories.
-    - Prefer the AI planner's structured visual fields.
-    - Query must be short, concrete, English-friendly, and useful for Pexels/local stock.
+    Production rule:
+    - Non-Warm videos are 100% stock/Pexels, so stock_query must be searchable.
+    - Keep query short: subject + action + setting + style.
+    - Avoid abstract/emotional/fantasy words that cause Pexels to fail.
     """
-    def _field(name, max_words=8):
-        value = scene_plan.get(name, "") if isinstance(scene_plan, dict) else ""
+    if not isinstance(scene_plan, dict):
+        scene_plan = {}
+
+    def _clean_part(value, max_words=4):
         if isinstance(value, list):
-            value = " ".join([str(x) for x in value[:4]])
-        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
-        if not value:
-            return ""
+            value = " ".join(str(x) for x in value[:3])
+        value = str(value or "").strip().lower()
+        value = re.sub(r"[\"“”'’`]+", " ", value)
+        value = re.sub(r"[^0-9a-zA-Z\s\-]", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
         words = value.split()
         return " ".join(words[:max_words])
 
-    subject = _field("main_subject", 7)
-    action = _field("action", 8)
-    location = _field("location", 7)
-    background = _field("background", 6)
-    time_of_day = _field("time_of_day", 3)
-    mood = _field("mood", 4)
+    subject = _clean_part(scene_plan.get("main_subject") or scene_plan.get("visual_entity_type"), 4)
+    action = _clean_part(scene_plan.get("action") or scene_plan.get("motion_intent"), 4)
+    location = _clean_part(scene_plan.get("location") or scene_plan.get("background"), 4)
+    time_of_day = _clean_part(scene_plan.get("time_of_day"), 2)
 
-    must_show = scene_plan.get("must_show", []) if isinstance(scene_plan, dict) else []
-    details = scene_plan.get("details", []) if isinstance(scene_plan, dict) else []
-
-    object_terms = []
-    for arr in [must_show, details]:
+    # Use only the strongest concrete detail, not a long list.
+    detail = ""
+    for arr_name in ["must_show", "details"]:
+        arr = scene_plan.get(arr_name, []) or []
         if isinstance(arr, list):
-            for x in arr[:5]:
-                x = re.sub(r"\s+", " ", str(x or "")).strip(" ,.;:")
-                if x and len(x.split()) <= 5:
-                    object_terms.append(x)
+            for x in arr:
+                c = _clean_part(x, 3)
+                if c and len(c) >= 3:
+                    detail = c
+                    break
+        elif isinstance(arr, str):
+            detail = _clean_part(arr, 3)
+        if detail:
+            break
 
-    # Keep only a few concrete elements so Pexels search stays effective.
-    object_text = " ".join(object_terms[:3])
+    # If planner did not provide English/searchable fields, fall back to safe stock categories.
+    joined = " ".join([
+        str(narration or ""),
+        str(scene_plan.get("main_subject", "") or ""),
+        str(scene_plan.get("action", "") or ""),
+        str(scene_plan.get("location", "") or ""),
+    ]).lower()
 
-    # Fallback to narration only if planner fields are weak.
-    narration_short = ""
-    if not any([subject, action, location, object_text]):
-        narration_short = shorten_prompt_for_sdxl(narration or "daily life", max_chars=90, max_words=14)
+    if not any([subject, action, location, detail]):
+        if _has_any_term(joined, {"thiền", "meditation", "calm", "peace", "an yên", "tĩnh lặng"}):
+            subject, action, location = "person", "meditating", "calm room"
+        elif _has_any_term(joined, {"chùa", "temple", "pagoda", "monk", "nhà sư"}):
+            subject, action, location = "temple", "exterior", "peaceful nature"
+        elif _has_any_term(joined, {"office", "work", "làm việc", "business"}):
+            subject, action, location = "person", "working", "office"
+        elif _has_any_term(joined, {"food", "cooking", "ăn", "nấu", "restaurant"}):
+            subject, action, location = "food", "cooking", "kitchen"
+        elif _has_any_term(joined, {"fitness", "exercise", "yoga", "gym", "thể dục", "tập luyện"}):
+            subject, action, location = "person", "exercising", "gym"
+        elif _has_any_term(joined, {"city", "street", "đường phố", "sài gòn", "saigon"}):
+            subject, action, location = "city", "street", "daily life"
+        elif _has_any_term(joined, {"nature", "forest", "mountain", "river", "biển", "núi", "rừng", "suối"}):
+            subject, action, location = "nature", "landscape", "peaceful"
+        else:
+            subject, action, location = "real people", "daily life", "lifestyle"
 
-    query_parts = [
-        subject,
-        action,
-        object_text,
-        location or background,
-        time_of_day,
-        mood,
-        narration_short,
-    ]
-
-    query = " ".join([str(p).strip() for p in query_parts if str(p).strip()])
-    query = re.sub(r"[^0-9a-zA-Z\s\-]", " ", query)
-    query = re.sub(r"\s+", " ", query).strip().lower()
-
-    # Remove common abstract words that usually hurt stock search.
-    abstract_stop = {
+    # Remove stock-unfriendly abstract words.
+    banned = {
         "meaning", "lesson", "wisdom", "karma", "hope", "fear", "success", "failure",
-        "happiness", "suffering", "impermanence", "truth", "destiny", "fate"
+        "happiness", "suffering", "impermanence", "truth", "destiny", "fate", "soul",
+        "magic", "fantasy", "surreal", "mystic", "spiritual", "divine", "heaven", "hell"
     }
-    words = [w for w in query.split() if w not in abstract_stop]
+
+    parts = [subject, action, location, time_of_day]
+    # Include detail only when it is useful and not duplicative.
+    if detail and detail not in " ".join(parts):
+        parts.insert(2, detail)
+
+    query = " ".join(p for p in parts if p).strip().lower()
+    words = [w for w in query.split() if w not in banned]
     query = " ".join(words)
+    query = re.sub(r"\s+", " ", query).strip()
 
     if not query:
-        query = "realistic daily life"
+        query = "real people daily life lifestyle"
 
-    # Orientation hint helps local metadata and sometimes Pexels results.
-    query = query + (" vertical" if is_vertical else " landscape")
-    return shorten_prompt_for_sdxl(query, max_chars=150, max_words=24)
-
+    # Do not over-specify orientation in the query; Pexels has orientation param already.
+    # Keep only a light searchable style hint.
+    query = query + " realistic stock"
+    return shorten_prompt_for_sdxl(query, max_chars=95, max_words=12)
 
 def _load_stock_metadata():
     items = []
@@ -2251,22 +2323,23 @@ def find_stock_video_asset(stock_query: str, scene_plan: Dict[str, Any], is_vert
     return None
 
 
-def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
-    """Fetch one suitable Pexels video URL. Returns metadata dict or None."""
+def fetch_pexels_video(stock_query: str, is_vertical: bool = False, scene_plan: Dict[str, Any] = None):
+    """Fetch one suitable Pexels video URL with a practical query and lightweight scoring."""
     if not ENABLE_STOCK_FETCH or not PEXELS_API_KEY:
         return None
 
-    query = shorten_prompt_for_sdxl(stock_query or "realistic daily life", max_chars=110, max_words=16)
+    query = build_stock_query(stock_query or "realistic daily life", scene_plan or {}, is_vertical=is_vertical)
+    query = shorten_prompt_for_sdxl(query or "real people daily life", max_chars=90, max_words=12)
     orientation = "portrait" if is_vertical else "landscape"
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {
         "query": query,
         "orientation": orientation,
-        "per_page": max(1, min(int(PEXELS_PER_PAGE), 12)),
+        "per_page": max(4, min(int(PEXELS_PER_PAGE), 10)),
     }
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
         if resp.status_code != 200:
             print(f"WARN: Pexels VIDEO API status={resp.status_code} query={query!r}")
             return None
@@ -2275,37 +2348,54 @@ def fetch_pexels_video(stock_query: str, is_vertical: bool = False):
         if not videos:
             return None
 
-        # Deterministic: pick the first result with a downloadable mp4 file.
+        candidates = []
+        target_w = 720 if is_vertical else 1280
+        target_h = 1280 if is_vertical else 720
+
         for video in videos:
+            candidate_text = " ".join([
+                str(video.get("url", "") or ""),
+                str(video.get("duration", "") or ""),
+                query,
+            ])
+            match_score = _score_pexels_candidate(query, scene_plan or {}, candidate_text)
             files = video.get("video_files", []) or []
-            if not files:
-                continue
-            # Prefer HD-ish but not huge. Avoid original 4K files for speed/cost.
-            files = sorted(
-                files,
-                key=lambda f: (
-                    0 if (f.get("file_type") == "video/mp4") else 1,
-                    abs(int(f.get("width") or 0) - (720 if is_vertical else 1280)),
-                    int(f.get("width") or 9999) * int(f.get("height") or 9999),
-                )
-            )
             for vf in files:
                 link = vf.get("link")
-                if link and str(vf.get("file_type", "")).lower() in {"video/mp4", ""}:
-                    return {
-                        "url": link,
-                        "query": query,
-                        "pexels_id": video.get("id", ""),
-                        "duration": video.get("duration", ""),
-                        "width": vf.get("width", ""),
-                        "height": vf.get("height", ""),
-                        "quality": vf.get("quality", ""),
-                    }
-        return None
+                if not link:
+                    continue
+                if str(vf.get("file_type", "") or "").lower() not in {"video/mp4", ""}:
+                    continue
+                w = int(vf.get("width") or 0)
+                h = int(vf.get("height") or 0)
+                if w <= 0 or h <= 0:
+                    continue
+                # Avoid very large files/resolutions. They slow download and frame extraction.
+                if max(w, h) > int(os.getenv("PEXELS_VIDEO_MAX_SIDE", "1920")):
+                    continue
+                orientation_bonus = 0.10 if ((is_vertical and h >= w) or ((not is_vertical) and w >= h)) else -0.10
+                size_penalty = abs(w - target_w) / max(target_w, 1) + abs(h - target_h) / max(target_h, 1)
+                quality_bonus = 0.04 if str(vf.get("quality", "")).lower() in {"hd", "sd"} else 0.0
+                score = float(match_score) + orientation_bonus + quality_bonus - 0.08 * float(size_penalty)
+                candidates.append((score, video, vf))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        score, video, vf = candidates[0]
+        return {
+            "url": vf.get("link"),
+            "query": query,
+            "pexels_id": video.get("id", ""),
+            "duration": video.get("duration", ""),
+            "width": vf.get("width", ""),
+            "height": vf.get("height", ""),
+            "quality": vf.get("quality", ""),
+            "match_score": round(float(score), 3),
+        }
     except Exception as e:
         print("WARN: Pexels video fetch failed:", repr(e))
         return None
-
 
 def prepare_pexels_video(video_url: str, out_path: str):
     """Download Pexels video file. Does not transcode; render stage will crop/resize frames."""
@@ -3033,7 +3123,7 @@ AI IMAGE PROMPT RULES:
 52. For landscape 16:9, use balanced cinematic framing and enough background context.
 
 VISUAL SOURCE RULES:
-53. STRICT: If video_style_preset == "warm_storybook", the final router will enforce image-only routing: about 60% AI images and about 40% Pexels/local stock images. It must not use Pexels video for warm_storybook.
+53. STRICT: If video_style_preset == "warm_storybook", the final router will enforce image-only routing: about 55% AI images and about 45% Pexels/local stock images. It must not use Pexels video for warm_storybook.
 54. STRICT: If video_style_preset is NOT "warm_storybook", every scene must set visual_source="stock".
 55. Do NOT mark non-Warm scenes as AI, even if they are spiritual, mystical, ancient, dramatic, cinematic, or hard to find.
 56. For non-Warm styles, stock_query is the main visual instruction. Make stock_query practical, concrete, and searchable in English.
@@ -3046,7 +3136,7 @@ VIDEO STRUCTURE RULES:
 61. If the user asks for lifestyle/science/life advice, scenes should follow: relatable problem, example situation, explanation/action, benefit/result, closing insight.
 
 STYLE-SPECIFIC RULES:
-62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 60% AI images and 40% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
+62. For warm_storybook ONLY: use WARM STORYBOOK HYBRID IMAGE MODE. Target about 55% AI images and 45% highly suitable Pexels/local stock images. Do not use Pexels video for warm_storybook. Scenes with 2+ visible people should be good candidates for Pexels image. You may merge adjacent narration into fewer, richer story beats only when the visual moment stays coherent, but you must preserve 100% of the original narration content.
 63. For all other styles: visual_source must be "stock" for every scene. Do NOT merge narration to reduce scene count. Keep scene segmentation natural and granular based on the current rough text chunks.
 64. For lifestyle: realistic daily-life Pexels/stock style, natural people, normal homes/offices/streets, simple props.
 65. For cinematic_glow: cinematic but realistic stock photos with soft glow and polished lighting.
@@ -4177,6 +4267,20 @@ def allocate_scene_durations_from_narration(scene_objects, total_audio_duration,
 
 
 
+
+def _get_ai_image_retries(job_config=None) -> int:
+    """Production default: one AI attempt. Retry only when explicitly configured."""
+    raw = None
+    if isinstance(job_config, dict):
+        raw = job_config.get("ai_image_retries") or job_config.get("image_retries")
+    if raw in ("", None):
+        raw = os.getenv("AI_IMAGE_RETRIES", "1")
+    try:
+        retries = int(float(raw))
+    except Exception:
+        retries = 1
+    return max(1, min(retries, 3))
+
 def _get_image_max_workers(job_config=None) -> int:
     """
     Configurable image generation workers.
@@ -4198,7 +4302,7 @@ def _get_image_max_workers(job_config=None) -> int:
     return max(1, min(workers, 3))
 
 
-def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed):
+def _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, ai_image_retries=1):
     generate_image(
         prompt=scene["visual_prompt"],
         out_path=img_path,
@@ -4208,7 +4312,7 @@ def _generate_one_scene_image(scene, img_path, width, height, num_inference_step
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         seed=seed + int(scene["scene_id"]),
-        retries=1 if (_is_turbo_model() or _use_lightning_lora()) else 2,
+        retries=max(1, int(ai_image_retries)),
         scene_id=scene["scene_id"],
     )
     maybe_apply_style_image_grade(img_path, scene.get("video_style_preset", ""))
@@ -4266,7 +4370,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 ok = prepare_pexels_image(pexels["url"], img_path, width, height)
                 if ok:
                     maybe_apply_style_image_grade(img_path, video_style_preset)
-                    scene["visual_used"] = "stock_image_pexels_locked_40pct"
+                    scene["visual_used"] = "stock_image_pexels_locked_45pct"
                     scene["visual_source"] = "pexels_image"
                     scene["stock_query_used"] = pexels.get("query", "")
                     scene["pexels_id"] = pexels.get("pexels_id", "")
@@ -4283,7 +4387,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                     print(f"🖼️ Warm Story locked local stock IMAGE for scene {int(scene.get('scene_id', 0)):02d}: {stock.get('path')} | score={stock.get('match_score')}")
                     prepare_stock_image(stock["path"], img_path, width, height)
                     maybe_apply_style_image_grade(img_path, video_style_preset)
-                    scene["visual_used"] = "stock_image_local_locked_40pct"
+                    scene["visual_used"] = "stock_image_local_locked_45pct"
                     scene["visual_source"] = "pexels_image"
                     scene["stock_asset_path"] = stock.get("path")
                     scene["stock_match_score"] = stock.get("match_score")
@@ -4292,7 +4396,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
 
             # Last-resort placeholder keeps the 40% bucket from becoming AI if Pexels/local stock is unavailable.
             # In normal production, this should be rare if PEXELS_API_KEY is configured.
-            print(f"⚠️ Warm Story locked Pexels-image scene {int(scene.get('scene_id', 0)):02d} found no image; using placeholder instead of AI to preserve 60/40 route")
+            print(f"⚠️ Warm Story locked Pexels-image scene {int(scene.get('scene_id', 0)):02d} found no image; using placeholder instead of AI to preserve 55/45 route")
             create_fast_placeholder_image(img_path, width, height, title="FlozenAI")
             maybe_apply_style_image_grade(img_path, video_style_preset)
             scene["visual_used"] = "placeholder_pexels_locked_missing"
@@ -4302,7 +4406,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
 
         # 60% remaining warm-story scenes: AI image only.
         scene["visual_source"] = "ai"
-        return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
+        return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, ai_image_retries=_get_ai_image_retries(scene))
 
     # ------------------------------------------------------------------
     # NON-WARM EXISTING STOCK-FIRST ROUTING
@@ -4332,7 +4436,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
                 return img_path
 
         # 2) Try Pexels stock VIDEO before still image for non-Warm styles.
-        pexels_video = fetch_pexels_video(stock_query, is_vertical=is_vertical)
+        pexels_video = fetch_pexels_video(stock_query, is_vertical=is_vertical, scene_plan=scene_plan)
         if pexels_video:
             video_path = os.path.splitext(img_path)[0] + ".mp4"
             ok_video = prepare_pexels_video(pexels_video["url"], video_path)
@@ -4385,7 +4489,7 @@ def _prepare_one_scene_visual(scene, img_path, width, height, num_inference_step
         scene["visual_file"] = os.path.basename(img_path)
         return img_path
 
-    return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed)
+    return _generate_one_scene_image(scene, img_path, width, height, num_inference_steps, guidance_scale, seed, ai_image_retries=_get_ai_image_retries(scene))
 
 
 def run_job(job_config, job_id):
